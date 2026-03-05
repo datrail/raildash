@@ -21,10 +21,12 @@ import argparse
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
 import uuid
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -83,6 +85,139 @@ def parse_http_request(data: str) -> Optional[dict]:
     return {"method": method, "path": path, "headers": headers, "body": body}
 
 
+def _try_decompress_chunked_gzip(body: str) -> str:
+    """Try to decompress a chunked+gzip HTTP body.
+
+    Handles two layouts:
+      1. Chunked TE: "hex_size\\r\\nDATA\\r\\n..." — strip framing, concatenate, decompress
+      2. Raw gzip: body starts directly with gzip magic bytes
+
+    sslsniff may truncate large responses, so we use a streaming decompressor
+    that can return partial results.
+    """
+    import zlib
+    try:
+        raw_bytes_latin = body.encode("latin-1", errors="replace")
+
+        # --- strip chunked framing (if present) ---
+        raw_bytes = b""
+        remainder = raw_bytes_latin
+        is_chunked = False
+        while remainder:
+            sep = remainder.find(b"\r\n")
+            if sep < 0:
+                # No more framing; append remaining bytes as-is (truncated chunk)
+                raw_bytes += remainder
+                break
+            size_str = remainder[:sep].decode("ascii", errors="ignore").strip()
+            if not size_str:
+                break
+            try:
+                chunk_size = int(size_str.split(";")[0], 16)
+            except ValueError:
+                break
+            if chunk_size == 0:
+                break
+            is_chunked = True
+            available = remainder[sep + 2:]
+            raw_bytes += available[:chunk_size]
+            if len(available) < chunk_size:
+                # Truncated — take what we have
+                break
+            remainder = available[chunk_size + 2:]  # skip trailing \r\n
+
+        # If not chunked, use body bytes directly
+        if not is_chunked:
+            raw_bytes = raw_bytes_latin
+
+        if not raw_bytes or raw_bytes[:2] != b"\x1f\x8b":
+            return "[gzip binary, decompression failed]"
+
+        # Use streaming decompressor to handle truncated gzip
+        d = zlib.decompressobj(zlib.MAX_WBITS | 16)
+        try:
+            decompressed = d.decompress(raw_bytes)
+        except zlib.error:
+            return "[gzip binary, decompression failed]"
+        text = decompressed.decode("utf-8", errors="replace")
+        truncated = d.eof == 0  # stream not finished = truncated
+
+        if truncated:
+            text += "\n[... truncated by capture buffer]"
+
+        try:
+            parsed = json.loads(text.split("\n[...")[0])
+            if truncated:
+                if isinstance(parsed, dict):
+                    parsed["_truncated"] = True
+                return parsed
+            return parsed
+        except (json.JSONDecodeError, ValueError):
+            return text
+    except (ValueError, zlib.error, UnicodeDecodeError):
+        pass
+    return "[gzip binary, decompression failed]"
+
+
+def _decompress_or_decode(raw_body: bytes, resp: dict) -> object:
+    """Decompress gzip or decode raw body bytes for a finalized SSE stream."""
+    import zlib
+    is_gzip = "gzip" in resp.get("headers", {}).get("content-encoding", "")
+    if is_gzip and raw_body:
+        stripped = _strip_chunked_framing(raw_body)
+        if stripped[:2] == b"\x1f\x8b":
+            try:
+                d = zlib.decompressobj(zlib.MAX_WBITS | 16)
+                text = d.decompress(stripped).decode("utf-8", errors="replace")
+                try:
+                    return json.loads(text)
+                except (json.JSONDecodeError, ValueError):
+                    return text
+            except zlib.error:
+                pass
+    # Not gzip or decompression failed — try as text
+    text = raw_body.decode("utf-8", errors="replace")
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return text
+
+
+def _strip_chunked_framing(data: bytes) -> bytes:
+    """Strip HTTP chunked transfer encoding framing, return concatenated chunk data."""
+    result = b""
+    remainder = data
+    iteration = 0
+    while remainder:
+        sep = remainder.find(b"\r\n")
+        if sep < 0:
+            result += remainder
+            break
+        size_str = remainder[:sep].decode("ascii", errors="ignore").strip()
+        if not size_str:
+            # Empty line between chunks — skip and continue
+            remainder = remainder[sep + 2:]
+            continue
+        try:
+            chunk_size = int(size_str.split(";")[0], 16)
+        except ValueError:
+            if iteration == 0:
+                # First line isn't a chunk size — data is not chunked
+                return data
+            # Mid-stream parse error — append remaining as raw data
+            result += remainder
+            break
+        if chunk_size == 0:
+            break
+        iteration += 1
+        available = remainder[sep + 2:]
+        result += available[:chunk_size]
+        if len(available) < chunk_size:
+            break
+        remainder = available[chunk_size + 2:]
+    return result
+
+
 def parse_http_response(data: str) -> Optional[dict]:
     """Parse a raw HTTP response string into structured dict."""
     m = _HTTP_RESPONSE_RE.match(data)
@@ -103,13 +238,24 @@ def parse_http_response(data: str) -> Optional[dict]:
             headers[k.strip().lower()] = v.strip()
 
     is_sse = "text/event-stream" in headers.get("content-type", "")
+    is_gzip = "gzip" in headers.get("content-encoding", "")
 
     body = body_raw
-    if body_raw and not is_sse:
+    if is_sse and is_gzip:
+        # For SSE+gzip: defer decompression — body will be accumulated
+        # from multiple READ/RECV events and decompressed at finalization.
+        body = body_raw  # keep raw string; caller converts to bytes
+    elif body_raw and is_gzip:
+        body = _try_decompress_chunked_gzip(body_raw)
+    elif body_raw and not is_sse:
         try:
             body = json.loads(body_raw)
         except (json.JSONDecodeError, ValueError):
             pass
+
+    # Sanitize string bodies: PostgreSQL TEXT columns reject null bytes
+    if isinstance(body, str) and "\x00" in body:
+        body = "[binary response, not decodable]"
 
     return {
         "status_code": status_code,
@@ -167,14 +313,28 @@ class SslCollector:
         pid: Optional[int] = None,
         uid: Optional[int] = None,
         comm: Optional[str] = None,
+        agent_version: Optional[str] = None,
     ):
         self.sslsniff_path = sslsniff_path
         self.binary_path = binary_path
         self.pid = pid
         self.uid = uid
         self.comm = comm
+        self.agent_version = agent_version
         self.session_id = str(uuid.uuid4())
         self.capture_start = datetime.now(timezone.utc).isoformat()
+
+    def _batch_metadata(self, mode: str) -> dict:
+        """Common metadata fields for webhook payloads."""
+        return {
+            "session_id": self.session_id,
+            "agent": "claude-code",
+            "uid": os.getuid(),
+            "hostname": socket.gethostname(),
+            "collector_mode": mode,
+            "agent_version": self.agent_version,
+            "capture_start": self.capture_start,
+        }
 
     def _build_cmd(self) -> list[str]:
         cmd = [self.sslsniff_path]
@@ -202,11 +362,11 @@ class SslCollector:
 
         try:
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
             assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.strip()
+            for raw_line in iter(proc.stdout.readline, b""):
+                line = raw_line.decode("latin-1").strip()
                 if not line:
                     continue
                 try:
@@ -223,12 +383,7 @@ class SslCollector:
                 now = time.time()
                 if len(batch) >= batch_size or (now - last_flush) >= flush_interval:
                     if webhook_url and batch:
-                        payload = {
-                            "session_id": self.session_id,
-                            "agent": "claude-code",
-                            "capture_start": self.capture_start,
-                            "events": batch,
-                        }
+                        payload = {**self._batch_metadata("raw"), "events": batch}
                         ok = send_to_webhook(webhook_url, payload)
                         status = "ok" if ok else "FAIL"
                         print(
@@ -241,15 +396,8 @@ class SslCollector:
         except KeyboardInterrupt:
             print("\n[collector] Interrupted", file=sys.stderr)
         finally:
-            # Flush remaining
             if webhook_url and batch:
-                payload = {
-                    "session_id": self.session_id,
-                    "agent": "claude-code",
-                    "capture_start": self.capture_start,
-                    "events": batch,
-                }
-                send_to_webhook(webhook_url, payload)
+                send_to_webhook(webhook_url, {**self._batch_metadata("raw"), "events": batch})
             if out_f:
                 out_f.close()
             if proc.poll() is None:
@@ -263,18 +411,41 @@ class SslCollector:
         print(f"[collector] Session: {self.session_id}", file=sys.stderr)
 
         out_f = open(output_file, "a") if output_file else None
-        # Track pending requests by (pid, tid)
-        pending_requests: dict[tuple[int, int], dict] = {}
+        # Track pending requests by (pid, tid) — use FIFO queue to handle
+        # concurrent requests on the same thread (common in Node.js)
+        pending_requests: dict[tuple[int, int], deque] = defaultdict(deque)
+        # Track SSE streams being accumulated: key → interaction dict
+        # These are responses where is_sse=True; we accumulate subsequent
+        # READ/RECV data until a new request/response starts on the same key.
+        active_streams: dict[tuple[int, int], dict] = {}
         batch: list[dict] = []
         last_flush = time.time()
 
+        def _finalize_stream(key: tuple[int, int]):
+            """Finalize an active SSE stream and add to batch."""
+            if key not in active_streams:
+                return
+            interaction = active_streams.pop(key)
+            resp = interaction.get("response", {})
+            raw_body = resp.get("_raw_body", b"")
+            if raw_body:
+                resp["body"] = _decompress_or_decode(raw_body, resp)
+                resp["is_sse"] = True
+            resp.pop("_raw_body", None)
+
+            if out_f:
+                out_f.write(json.dumps(interaction, default=str) + "\n")
+                out_f.flush()
+            batch.append(interaction)
+            self._print_interaction(interaction)
+
         try:
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
             )
             assert proc.stdout is not None
-            for line in proc.stdout:
-                line = line.strip()
+            for raw_line in iter(proc.stdout.readline, b""):
+                line = raw_line.decode("latin-1").strip()
                 if not line:
                     continue
                 try:
@@ -297,7 +468,9 @@ class SslCollector:
                 if func == "WRITE/SEND":
                     req = parse_http_request(data)
                     if req:
-                        pending_requests[key] = {
+                        # New request on this key — finalize any active stream
+                        _finalize_stream(key)
+                        pending_requests[key].append({
                             "timestamp": ns_to_datetime(event.get("timestamp_ns", 0)),
                             "timestamp_ns": event.get("timestamp_ns", 0),
                             "pid": pid,
@@ -307,12 +480,22 @@ class SslCollector:
                             "request": req,
                             "request_size": event.get("len", 0),
                             "truncated": event.get("truncated", False),
-                        }
+                        })
 
                 elif func == "READ/RECV":
+                    # Check if we're accumulating an SSE stream on this key
+                    if key in active_streams:
+                        # Append raw data to the stream
+                        raw_data = data.encode("latin-1", errors="replace")
+                        active_streams[key]["response"]["_raw_body"] += raw_data
+                        active_streams[key]["response_size"] = (
+                            active_streams[key].get("response_size", 0) + event.get("len", 0)
+                        )
+                        continue
+
                     resp = parse_http_response(data)
-                    if resp and key in pending_requests:
-                        interaction = pending_requests.pop(key)
+                    if resp and pending_requests[key]:
+                        interaction = pending_requests[key].popleft()
                         interaction["response"] = resp
                         interaction["response_size"] = event.get("len", 0)
                         if event.get("truncated"):
@@ -323,22 +506,26 @@ class SslCollector:
                         if req_ns and resp_ns and resp_ns > req_ns:
                             interaction["latency_ms"] = (resp_ns - req_ns) / 1e6
 
-                        if out_f:
-                            out_f.write(json.dumps(interaction, default=str) + "\n")
-                            out_f.flush()
-
-                        batch.append(interaction)
-                        self._print_interaction(interaction)
+                        if resp.get("is_sse"):
+                            # Start accumulating SSE stream data
+                            body_raw = resp.get("body", "")
+                            if isinstance(body_raw, str):
+                                resp["_raw_body"] = body_raw.encode("latin-1", errors="replace")
+                            else:
+                                resp["_raw_body"] = b""
+                            resp["body"] = ""  # will be filled on finalize
+                            active_streams[key] = interaction
+                        else:
+                            if out_f:
+                                out_f.write(json.dumps(interaction, default=str) + "\n")
+                                out_f.flush()
+                            batch.append(interaction)
+                            self._print_interaction(interaction)
 
                 now = time.time()
                 if len(batch) >= batch_size or (now - last_flush) >= flush_interval:
                     if webhook_url and batch:
-                        payload = {
-                            "session_id": self.session_id,
-                            "agent": "claude-code",
-                            "capture_start": self.capture_start,
-                            "interactions": batch,
-                        }
+                        payload = {**self._batch_metadata("http"), "interactions": batch}
                         ok = send_to_webhook(webhook_url, payload)
                         status = "ok" if ok else "FAIL"
                         print(
@@ -351,14 +538,11 @@ class SslCollector:
         except KeyboardInterrupt:
             print("\n[collector] Interrupted", file=sys.stderr)
         finally:
+            # Finalize any active SSE streams
+            for key in list(active_streams.keys()):
+                _finalize_stream(key)
             if webhook_url and batch:
-                payload = {
-                    "session_id": self.session_id,
-                    "agent": "claude-code",
-                    "capture_start": self.capture_start,
-                    "interactions": batch,
-                }
-                send_to_webhook(webhook_url, payload)
+                send_to_webhook(webhook_url, {**self._batch_metadata("http"), "interactions": batch})
             if out_f:
                 out_f.close()
             if proc.poll() is None:
@@ -445,6 +629,12 @@ def main():
         action="store_true",
         help="Auto-detect Claude Code binary path",
     )
+    parser.add_argument(
+        "--agent-version",
+        type=str,
+        default=None,
+        help="Agent version string (e.g. 2.1.61). Auto-detected from binary path if not set.",
+    )
 
     args = parser.parse_args()
 
@@ -469,12 +659,18 @@ def main():
         print(f"[collector] Error: sslsniff not found at {sslsniff}", file=sys.stderr)
         sys.exit(1)
 
+    # Auto-detect agent version from binary path
+    agent_version = args.agent_version
+    if not agent_version and binary_path:
+        agent_version = Path(binary_path).name  # e.g. "2.1.61"
+
     collector = SslCollector(
         sslsniff_path=sslsniff,
         binary_path=binary_path,
         pid=args.pid,
         uid=args.uid,
         comm=args.comm,
+        agent_version=agent_version,
     )
 
     if args.mode == "raw":
