@@ -1,11 +1,11 @@
 openapi: 3.1.0
 info:
-  title: DatRail eBPF Webhook API
+  title: RailDash Webhook API
   description: |
-    Webhook API for receiving HTTP requests and responses captured by eBPF sslsniff.
+    Wave 1 dashboard API for receiving DatRail capture events.
 
-    The eBPF probe intercepts decrypted SSL/TLS traffic at the kernel level,
-    parses it into structured HTTP events, and forwards them to this webhook.
+    RailMon captures and parses runtime traffic, then forwards structured
+    events to this webhook for inspection.
 
     Data flows: Claude Code → Anthropic API (HTTPS) → eBPF sslsniff captures → Python collector parses → POST to this webhook.
   version: 0.1.0

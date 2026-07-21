@@ -25,9 +25,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
 app = FastAPI(
-    title="DatRail eBPF Webhook Demo",
+    title="RailDash Webhook API",
     version="0.1.0",
-    description="Demo webhook server for receiving eBPF-captured SSL/HTTP events",
+    description="Wave 1 dashboard API for receiving DatRail capture events",
 )
 
 # In-memory storage
@@ -166,7 +166,7 @@ def index():
         </tr>"""
 
     return f"""<!DOCTYPE html>
-<html><head><title>DatRail Webhook Demo</title>
+<html><head><title>RailDash</title>
 <style>
 body {{ font-family: monospace; margin: 2em; background: #1a1a2e; color: #e0e0e0; }}
 h1 {{ color: #00d4ff; }}
@@ -176,7 +176,7 @@ th {{ background: #16213e; }}
 a {{ color: #00d4ff; }}
 .status {{ color: #00ff88; }}
 </style></head><body>
-<h1>DatRail eBPF Webhook Demo</h1>
+<h1>RailDash</h1>
 <p class="status">Status: running | Sessions: {len(sessions)}</p>
 <h2>Capture Sessions</h2>
 <table>
