@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RailDash Control Room</title>
+<style>
+  /* ── Tokens ───────────────────────────────────────────────────────────
+     Light is the complete palette on bare :root. Dark redefines only these
+     values, twice: once for prefers-color-scheme (guarded so an explicit
+     light choice still wins) and once for the [data-theme] stamp. Every
+     component below reads tokens only. */
+  :root {
+    --ground:      #F5F6F9;   /* cool white, biased toward the steel accent */
+    --surface:     #FFFFFF;
+    --surface-2:   #EEF0F6;
+    --line:        #DCE0EA;
+    --line-strong: #C3C9D8;
+    --ink:         #131722;
+    --ink-muted:   #5C637A;
+    --ink-faint:   #6E7589;   /* 4.6:1 on surface — carries 11px labels, so AA applies */
+    --accent:      #3355A6;   /* steel — structure and links, never status */
+    --accent-soft: #E4E9F6;
+    /* Signal aspects. Railway vernacular, and the only semantic colours.
+       Always paired with a glyph and a word — the triad is not separable
+       by hue alone under colour-vision deficiency. */
+    --clear:       #12784A;
+    --clear-soft:  #E1F2E8;
+    --caution:     #7E6000;   /* 5.1:1 on caution-soft */
+    --caution-soft:#F6EFD8;
+    --danger:      #C11B45;
+    --danger-soft: #FBE4EA;
+    --shadow: 0 1px 2px rgba(19,23,34,.06), 0 8px 24px -12px rgba(19,23,34,.18);
+
+    --sans: "Segoe UI", system-ui, -apple-system, Roboto, "Helvetica Neue", sans-serif;
+    --mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0E1117;
+      --surface:     #161A22;
+      --surface-2:   #1D222C;
+      --line:        #272D3A;
+      --line-strong: #394153;
+      --ink:         #E6E9F0;
+      --ink-muted:   #949CB0;
+      --ink-faint:   #8A92A8;
+      --accent:      #8AA6EE;
+      --accent-soft: #1C2436;
+      --clear:       #54C58C;
+      --clear-soft:  #14281F;
+      --caution:     #D9B04A;
+      --caution-soft:#2A2314;
+      --danger:      #F2708F;
+      --danger-soft: #2E1721;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:      #0E1117;
+    --surface:     #161A22;
+    --surface-2:   #1D222C;
+    --line:        #272D3A;
+    --line-strong: #394153;
+    --ink:         #E6E9F0;
+    --ink-muted:   #949CB0;
+    --ink-faint:   #8A92A8;
+    --accent:      #8AA6EE;
+    --accent-soft: #1C2436;
+    --clear:       #54C58C;
+    --clear-soft:  #14281F;
+    --caution:     #D9B04A;
+    --caution-soft:#2A2314;
+    --danger:      #F2708F;
+    --danger-soft: #2E1721;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.6);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Every machine-generated value is mono; every human sentence is sans.
+     That single rule tells you what is data and what is chrome. */
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .eyebrow {
+    font-size: 11px; letter-spacing: .09em; text-transform: uppercase;
+    color: var(--ink-faint); font-weight: 600;
+  }
+  h1, h2, h3 { text-wrap: balance; margin: 0; }
+  a { color: var(--accent); }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 0 24px 72px; }
+
+  /* ── Identity bar ─────────────────────────────────────────────────── */
+  .topbar {
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+    position: sticky; top: 0; z-index: 5;
+  }
+  .topbar-in {
+    max-width: 1180px; margin: 0 auto; padding: 14px 24px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: baseline; gap: 10px; }
+  .brand-name { font-size: 17px; font-weight: 650; letter-spacing: -.01em; }
+  .standin {
+    font-size: 12px; color: var(--ink-muted);
+    border-left: 1px solid var(--line-strong); padding-left: 12px;
+  }
+  .spacer { flex: 1 1 auto; }
+  .health {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-size: 12px; color: var(--ink-muted);
+  }
+  .beacon {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--clear); box-shadow: 0 0 0 3px var(--clear-soft);
+  }
+
+  /* ── Hero band ────────────────────────────────────────────────────── */
+  .band {
+    display: grid; gap: 14px; margin: 26px 0 22px;
+    grid-template-columns: 1.5fr 1fr 1fr 1fr;
+  }
+  @media (max-width: 900px) { .band { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 560px) { .band { grid-template-columns: 1fr; } }
+  .tile {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px 18px 18px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .tile.hero { border-color: var(--caution); background: var(--caution-soft); }
+  .tile .num {
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    font-size: 34px; line-height: 1.05; font-weight: 600; letter-spacing: -.02em;
+  }
+  .tile.hero .num { font-size: 44px; }
+  .tile .sub { font-size: 12.5px; color: var(--ink-muted); }
+  .tile .sub strong { color: var(--ink); font-weight: 600; }
+
+  /* Coverage bar — one series, magnitude. No legend needed; the tile names it. */
+  .cover { height: 8px; border-radius: 4px; background: var(--surface); overflow: hidden;
+           border: 1px solid var(--line-strong); display: flex; margin-top: 4px; }
+  .cover i { display: block; height: 100%; }
+  .cover .ok  { background: var(--clear); }
+  .cover .gap { background: repeating-linear-gradient(135deg,
+                  var(--caution) 0 4px, transparent 4px 8px); }
+
+  /* ── Panels ───────────────────────────────────────────────────────── */
+  .panel {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 10px; margin-bottom: 22px; overflow: hidden;
+  }
+  .panel-head {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 14px 18px; border-bottom: 1px solid var(--line);
+  }
+  .panel-head h2 { font-size: 14.5px; font-weight: 650; }
+  .count { font-size: 12px; color: var(--ink-faint); font-family: var(--mono); }
+
+  .scroll { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th {
+    text-align: left; font-size: 11px; letter-spacing: .07em; text-transform: uppercase;
+    color: var(--ink-faint); font-weight: 600; padding: 9px 14px;
+    border-bottom: 1px solid var(--line); white-space: nowrap; background: var(--surface);
+  }
+  td { padding: 11px 14px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody tr.clickable { cursor: pointer; }
+  tbody tr.clickable:hover { background: var(--surface-2); }
+  tbody tr.clickable:focus-visible { background: var(--surface-2); }
+
+  /* ── Signal chips: colour + glyph + word, never colour alone ──────── */
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 12px; font-weight: 600; padding: 3px 9px 3px 7px;
+    border-radius: 999px; white-space: nowrap;
+  }
+  .chip .g { font-family: var(--mono); font-size: 11px; line-height: 1; }
+  .chip.allow  { color: var(--clear);   background: var(--clear-soft); }
+  .chip.warn   { color: var(--caution); background: var(--caution-soft); }
+  .chip.refuse { color: var(--danger);  background: var(--danger-soft); }
+  .chip.none   { color: var(--ink-muted); background: var(--surface-2); }
+
+  .score { display: inline-flex; align-items: center; gap: 8px; }
+  .score .v { font-family: var(--mono); font-variant-numeric: tabular-nums;
+              font-weight: 600; min-width: 2.2ch; text-align: right; }
+  .meter { width: 62px; height: 6px; border-radius: 3px; background: var(--surface-2);
+           border: 1px solid var(--line); overflow: hidden; }
+  .meter i { display: block; height: 100%; }
+
+  .reason { color: var(--ink-muted); font-size: 12.5px; }
+  .dest { font-family: var(--mono); font-size: 12.5px; }
+  .id   { font-family: var(--mono); font-size: 12px; color: var(--ink-muted); }
+
+  .filters { display: flex; gap: 6px; flex-wrap: wrap; }
+  .fbtn {
+    font: inherit; font-size: 12px; font-weight: 600;
+    padding: 4px 11px; border-radius: 999px; cursor: pointer;
+    border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink-muted);
+  }
+  /* Text takes the surface token, not a literal white: the accent is a deep
+     steel in light and a pale blue in dark, so a fixed white fails one of them. */
+  .fbtn[aria-pressed="true"] {
+    background: var(--accent); border-color: var(--accent); color: var(--surface);
+  }
+
+  /* ── Drawer ───────────────────────────────────────────────────────── */
+  .scrim {
+    position: fixed; inset: 0; background: rgba(10,13,20,.42);
+    opacity: 0; pointer-events: none; transition: opacity .18s ease; z-index: 20;
+  }
+  .scrim[data-open="1"] { opacity: 1; pointer-events: auto; }
+  .drawer {
+    position: fixed; top: 0; right: 0; height: 100%; width: min(430px, 92vw);
+    background: var(--surface); border-left: 1px solid var(--line);
+    transform: translateX(100%); transition: transform .22s cubic-bezier(.4,0,.2,1);
+    z-index: 21; overflow-y: auto; box-shadow: var(--shadow);
+  }
+  .drawer[data-open="1"] { transform: none; }
+  @media (prefers-reduced-motion: reduce) {
+    .drawer, .scrim { transition: none; }
+  }
+  .drawer-head { padding: 18px 20px; border-bottom: 1px solid var(--line);
+                 display: flex; align-items: flex-start; gap: 12px; }
+  .xbtn { font: inherit; border: 1px solid var(--line-strong); background: var(--surface);
+          color: var(--ink-muted); border-radius: 7px; cursor: pointer;
+          width: 28px; height: 28px; line-height: 1; flex: 0 0 auto; }
+  .drawer-body { padding: 18px 20px 40px; display: flex; flex-direction: column; gap: 22px; }
+  .kv { display: grid; grid-template-columns: 116px 1fr; gap: 7px 12px; font-size: 13px; }
+  .kv dt { color: var(--ink-faint); }
+  .kv dd { margin: 0; font-family: var(--mono); font-size: 12.5px; word-break: break-all; }
+
+  .dim { display: flex; flex-direction: column; gap: 9px; }
+  .dim-row { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; font-size: 13px; }
+  .dim-row .bar { grid-column: 1 / -1; height: 6px; border-radius: 3px;
+                  background: var(--surface-2); border: 1px solid var(--line); overflow: hidden; }
+  .dim-row .bar i { display: block; height: 100%; }
+  .dim-row .n { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink-muted); }
+
+  .note { font-size: 12.5px; color: var(--ink-muted); }
+
+  /* ── Design notes ─────────────────────────────────────────────────── */
+  .notes { margin-top: 40px; border-top: 1px solid var(--line); padding-top: 26px; }
+  .notes h2 { font-size: 15px; margin-bottom: 4px; }
+  .notes-grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); margin-top: 18px; }
+  .note-card { background: var(--surface); border: 1px solid var(--line);
+               border-radius: 10px; padding: 15px 17px; }
+  .note-card h3 { font-size: 13px; margin-bottom: 6px; }
+  .note-card p { margin: 0; font-size: 13px; color: var(--ink-muted); }
+  .note-card p + p { margin-top: 8px; }
+  .banner {
+    background: var(--accent-soft); border: 1px solid var(--line);
+    border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 12px 15px; font-size: 13px; color: var(--ink-muted);
+    margin: 22px 0 0;
+  }
+  .banner strong { color: var(--ink); }
+</style>
+
+<div class="topbar">
+  <div class="topbar-in">
+    <div class="brand">
+      <span class="brand-name">RailDash</span>
+      <span class="standin">standing in for Rail Center &middot; offline bundle</span>
+    </div>
+    <span class="spacer"></span>
+    <span class="health"><span class="beacon"></span> accepting registrations, tickets, refusals</span>
+    <span class="health mono">since 09:12:04</span>
+    <span class="chip warn" style="margin-left:2px"><span class="g">&#9663;</span>Prototype — invented data</span>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <p class="banner">
+    <strong>Design prototype — nothing here is live.</strong> Every figure is
+    invented; the vocabulary is not. This proposes what
+    <span class="mono">DR-9</span> asks a control-plane stand-in to show. It
+    covers the UI only: <span class="mono">DR-9</span> also absorbed
+    <span class="mono">DR-49</span> and <span class="mono">DR-51</span>, so the
+    feature additionally owns five routes, the client-credential contract, and
+    the Wave-1 keyword scorer with a manual override — none of which are
+    designed here.
+  </p>
+
+  <div class="band">
+    <div class="tile hero">
+      <span class="eyebrow">Attribution</span>
+      <span class="num">94<span style="font-size:22px">%</span></span>
+      <div class="cover" role="img" aria-label="94 percent of interactions carry a resolved agent_id; 6 percent are unattributed">
+        <i class="ok" style="width:94%"></i><i class="gap" style="width:6%"></i>
+      </div>
+      <span class="sub"><strong>17 of 289</strong> interactions carry no <span class="mono">agent_id</span>. Milestone 1 is met only when this is zero.</span>
+    </div>
+    <div class="tile">
+      <span class="eyebrow">Agents</span>
+      <span class="num">4</span>
+      <span class="sub">3 holding a live ticket, 1 expired</span>
+    </div>
+    <div class="tile">
+      <span class="eyebrow">Refused</span>
+      <span class="num">23</span>
+      <span class="sub">since 09:12, across 5 distinct reasons</span>
+    </div>
+    <div class="tile">
+      <span class="eyebrow">Lowest posture</span>
+      <span class="num">44</span>
+      <span class="sub"><span class="mono">openclaw-3</span> — below the 50 gate</span>
+    </div>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Agents</h2>
+      <span class="count">4 registered</span>
+      <span class="spacer"></span>
+      <span class="note">Select a row for its posture breakdown</span>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Sandbox</th><th>Agent</th><th>Host</th><th>Model</th>
+            <th>Posture</th><th>Ticket</th><th>Last seen</th>
+          </tr>
+        </thead>
+        <tbody id="agents"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Decisions</h2>
+      <span class="count" id="dcount"></span>
+      <span class="spacer"></span>
+      <div class="filters" role="group" aria-label="Filter decisions">
+        <button class="fbtn" data-f="all" aria-pressed="true">All</button>
+        <button class="fbtn" data-f="allow" aria-pressed="false">Allowed</button>
+        <button class="fbtn" data-f="refuse" aria-pressed="false">Refused</button>
+        <button class="fbtn" data-f="orphan" aria-pressed="false">Unattributed</button>
+      </div>
+    </div>
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th><th>Decision</th><th>Agent</th>
+            <th>Destination</th><th>Call</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="decisions"></tbody>
+      </table>
+    </div>
+  </section>
+
+
+
+  <section class="notes">
+    <span class="eyebrow">Design notes</span>
+    <h2>Why this is not the dashboard we have</h2>
+    <div class="notes-grid">
+
+      <div class="note-card">
+        <h3>The hero is attribution, not volume</h3>
+        <p>Today's UI leads with session and event counts. Those always go up, so
+          they never tell you anything is wrong.</p>
+        <p>Milestone 1's exit criterion is a captured interaction carrying a real
+          <span class="mono">agent_id</span> instead of null. So the largest number
+          on the page is the share of traffic that is actually attributed, and it
+          turns amber while any interaction is orphaned.</p>
+      </div>
+
+      <div class="note-card">
+        <h3>A refusal without a reason is noise</h3>
+        <p>Borrowed from Cloudflare Zero Trust's access log, where every decision
+          row carries its block reason and the whole log filters by decision.</p>
+        <p>A gateway that says "denied" and nothing else cannot be debugged during
+          a demo. Reason is a first-class column, not something behind a click.</p>
+      </div>
+
+      <div class="note-card">
+        <h3>Summary first, then drill down</h3>
+        <p>The pattern common to Orca and Lansweeper's posture dashboards: one
+          screen of summary, detail on demand, never both at once.</p>
+        <p>The five posture dimensions live in the drawer, because the table needs
+          to answer "who is below the gate" in one glance — not explain why.</p>
+      </div>
+
+      <div class="note-card">
+        <h3>Status is never colour alone</h3>
+        <p>Green, amber and red cluster together for red–green colour blindness;
+          a validator run put the worst pair at &Delta;E&nbsp;4.5. No amount of hex
+          tuning fixes a traffic-light triad.</p>
+        <p>So every chip pairs its colour with a glyph and a word, and the
+          unattributed slice of the coverage bar is hatched rather than merely
+          amber.</p>
+      </div>
+
+      <div class="note-card">
+        <h3>Mono means machine</h3>
+        <p>Every value a machine produced — agent id, host, ticket, destination,
+          timestamp, score — is monospaced. Every sentence a person wrote is not.</p>
+        <p>It costs nothing and lets you tell data from chrome without reading
+          either.</p>
+      </div>
+
+      <div class="note-card">
+        <h3>It says what it is standing in for</h3>
+        <p>RailDash is the control plane in the offline bundle. The header says so,
+          because someone debugging a demo needs to know whether they are looking
+          at the real Rail Center or the stand-in.</p>
+      </div>
+
+    </div>
+  </section>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="dtitle" tabindex="-1">
+  <div class="drawer-head">
+    <div style="flex:1 1 auto">
+      <span class="eyebrow">Agent</span>
+      <h2 id="dtitle" style="font-size:16px">—</h2>
+    </div>
+    <button class="xbtn" id="dclose" aria-label="Close">&times;</button>
+  </div>
+  <div class="drawer-body" id="dbody"></div>
+</aside>
+
+<script>
+  // ── Representative data, in the project's own vocabulary ────────────
+  const AGENTS = [
+    { sandbox:"openclaw-1", id:"550e8400-e29b-41d4-a716-446655440000", host:"vm-7f3c",
+      model:"claude-sonnet-4", provider:"anthropic", posture:82, ticket:"live",
+      expires:"in 47m", seen:"12s ago", fingerprint:"f6e5d4c3b2a1",
+      dims:{ "Host & identity":90, "Secrets hygiene":74, "Model & egress":88,
+             "Tool & MCP reach":80, "Skills":78 },
+      note:"Two API keys present as mounted references rather than plaintext." },
+    { sandbox:"nemoclaw-2", id:"7c9e6679-7425-40de-944b-e07fc1f90ae7", host:"vm-7f3c",
+      model:"tinyllama", provider:"local", posture:61, ticket:"live",
+      expires:"in 12m", seen:"1m ago", fingerprint:"a1b2c3d4e5f6",
+      dims:{ "Host & identity":85, "Secrets hygiene":41, "Model & egress":70,
+             "Tool & MCP reach":55, "Skills":64 },
+      note:"Three secrets sit in plaintext environment variables." },
+    { sandbox:"openclaw-3", id:"3f2504e0-4f89-11d3-9a0c-0305e82c3301", host:"vm-91ab",
+      model:"gemini-2.5-pro", provider:"google", posture:44, ticket:"expired",
+      expires:"18m ago", seen:"4m ago", fingerprint:"9d8c7b6a5e4f",
+      dims:{ "Host & identity":52, "Secrets hygiene":30, "Model & egress":38,
+             "Tool & MCP reach":45, "Skills":58 },
+      note:"Reaches a base URL that matches no known provider — classified unknown_proxy." },
+    { sandbox:"delivery-svc", id:"1b4e28ba-2fa1-11d2-883f-0016d3cca427", host:"vm-91ab",
+      model:"claude-haiku-4.5", provider:"anthropic", posture:76, ticket:"live",
+      expires:"in 51m", seen:"22s ago", fingerprint:"5e4f3a2b1c0d",
+      dims:{ "Host & identity":88, "Secrets hygiene":70, "Model & egress":82,
+             "Tool & MCP reach":66, "Skills":72 },
+      note:"Registered by the sample delivery service." }
+  ];
+
+  const DECISIONS = [
+    { t:"09:58:41", d:"allow",  a:"openclaw-1",  dest:"api.anthropic.com",
+      call:"POST /v1/messages", why:"posture 82, ticket valid" },
+    { t:"09:58:33", d:"refuse", a:"openclaw-3",  dest:"api.anthropic.com",
+      call:"POST /v1/messages", why:"ticket expired 18m ago" },
+    { t:"09:58:20", d:"refuse", a:null,          dest:"telemetry.unknown-proxy.net",
+      call:"POST /collect",     why:"no x-rail header on the request" },
+    { t:"09:57:55", d:"allow",  a:"delivery-svc", dest:"generativelanguage.googleapis.com",
+      call:"POST /v1internal:generateContent", why:"posture 76, ticket valid" },
+    { t:"09:57:31", d:"refuse", a:"openclaw-3",  dest:"api.anthropic.com",
+      call:"POST /v1/messages", why:"posture 44 below the 50 gate" },
+    { t:"09:57:02", d:"allow",  a:"nemoclaw-2",  dest:"localhost:11434",
+      call:"POST /api/chat",    why:"posture 61, ticket valid" },
+    { t:"09:56:44", d:"refuse", a:"nemoclaw-2",  dest:"paste.example.dev",
+      call:"PUT /upload",       why:"destination declared by no skill or MCP server" },
+    { t:"09:56:10", d:"allow",  a:"openclaw-1",  dest:"api.anthropic.com",
+      call:"POST /v1/messages", why:"posture 82, ticket valid" },
+    { t:"09:55:38", d:"refuse", a:null,          dest:"api.anthropic.com",
+      call:"POST /v1/messages", why:"x-rail present but undecodable" }
+  ];
+
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;" }[c]));
+  const postureColour = v => v >= 70 ? "var(--clear)" : v >= 50 ? "var(--caution)" : "var(--danger)";
+  // The same rule the chips follow: never hue alone. A score is the one place
+  // it is tempting to skip, and the one place it matters most.
+  const postureWord = v => v >= 70 ? "pass" : v >= 50 ? "watch" : "below gate";
+
+  function ticketChip(state, expires) {
+    if (state === "live")    return `<span class="chip allow"><span class="g">&#9679;</span>Live</span>
+                                     <span class="id"> ${esc(expires)}</span>`;
+    if (state === "expired") return `<span class="chip refuse"><span class="g">&#9679;</span>Expired</span>
+                                     <span class="id"> ${esc(expires)}</span>`;
+    return `<span class="chip none"><span class="g">&#9675;</span>None</span>`;
+  }
+
+  document.getElementById("agents").innerHTML = AGENTS.map((a, i) => `
+    <tr class="clickable" tabindex="0" data-i="${i}">
+      <td><strong class="mono">${esc(a.sandbox)}</strong></td>
+      <td><span class="id">${esc(a.id.slice(0, 8))}…</span></td>
+      <td><span class="mono" style="font-size:12.5px">${esc(a.host)}</span></td>
+      <td><span class="mono" style="font-size:12.5px">${esc(a.model)}</span></td>
+      <td>
+        <span class="score">
+          <span class="v" style="color:${postureColour(a.posture)}">${a.posture}</span>
+          <span class="meter"><i style="width:${a.posture}%;background:${postureColour(a.posture)}"></i></span>
+          <span class="id" style="color:${postureColour(a.posture)}">${postureWord(a.posture)}</span>
+        </span>
+      </td>
+      <td>${ticketChip(a.ticket, a.expires)}</td>
+      <td><span class="id">${esc(a.seen)}</span></td>
+    </tr>`).join("");
+
+  const decisionChip = d => d === "allow"
+    ? `<span class="chip allow"><span class="g">&#10003;</span>Allowed</span>`
+    : `<span class="chip refuse"><span class="g">&#10005;</span>Refused</span>`;
+
+  function renderDecisions(filter) {
+    const rows = DECISIONS.filter(r =>
+      filter === "all" ? true :
+      filter === "orphan" ? r.a === null : r.d === filter);
+    document.getElementById("decisions").innerHTML = rows.map(r => `
+      <tr>
+        <td><span class="id">${esc(r.t)}</span></td>
+        <td>${decisionChip(r.d)}</td>
+        <td>${r.a
+          ? `<span class="mono" style="font-size:12.5px">${esc(r.a)}</span>`
+          : `<span class="chip warn"><span class="g">&#9663;</span>Unattributed</span>`}</td>
+        <td><span class="dest">${esc(r.dest)}</span></td>
+        <td><span class="dest" style="color:var(--ink-muted)">${esc(r.call)}</span></td>
+        <td><span class="reason">${esc(r.why)}</span></td>
+      </tr>`).join("");
+    document.getElementById("dcount").textContent =
+      `${rows.length} of ${DECISIONS.length} shown`;
+  }
+  renderDecisions("all");
+
+  document.querySelectorAll(".fbtn").forEach(b => b.addEventListener("click", () => {
+    document.querySelectorAll(".fbtn").forEach(o => o.setAttribute("aria-pressed", String(o === b)));
+    renderDecisions(b.dataset.f);
+  }));
+
+  // ── Drawer ──────────────────────────────────────────────────────────
+  const drawer = document.getElementById("drawer");
+  const scrim  = document.getElementById("scrim");
+  let lastFocus = null;
+
+  function openAgent(i) {
+    const a = AGENTS[i];
+    lastFocus = document.activeElement;
+    document.getElementById("dtitle").textContent = a.sandbox;
+    const mine = DECISIONS.filter(r => r.a === a.sandbox);
+    document.getElementById("dbody").innerHTML = `
+      <div>
+        <span class="eyebrow">What it was given</span>
+        <dl class="kv" style="margin-top:8px">
+          <dt>agent_id</dt><dd>${esc(a.id)}</dd>
+          <dt>host_id</dt><dd>${esc(a.host)}</dd>
+          <dt>fingerprint</dt><dd>${esc(a.fingerprint)}</dd>
+          <dt>provider</dt><dd>${esc(a.provider)} / ${esc(a.model)}</dd>
+          <dt>ticket</dt><dd>${a.ticket === "live" ? "valid, expires " + esc(a.expires)
+                                                   : "expired " + esc(a.expires)}</dd>
+        </dl>
+      </div>
+      <div>
+        <span class="eyebrow">Posture — five dimensions</span>
+        <div class="dim" style="margin-top:10px">
+          ${Object.entries(a.dims).map(([k, v]) => `
+            <div class="dim-row">
+              <span>${esc(k)}</span><span class="n">${v}</span>
+              <span class="bar"><i style="width:${v}%;background:${postureColour(v)}"></i></span>
+            </div>`).join("")}
+        </div>
+        <p class="note" style="margin:12px 0 0">${esc(a.note)}</p>
+      </div>
+      <div>
+        <span class="eyebrow">Recent decisions</span>
+        <div style="margin-top:10px;display:flex;flex-direction:column;gap:8px">
+          ${mine.length ? mine.map(r => `
+            <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">
+              ${decisionChip(r.d)}
+              <span class="dest">${esc(r.dest)}</span>
+              <span class="reason">${esc(r.why)}</span>
+            </div>`).join("")
+            : `<p class="note" style="margin:0">No calls in the current window.</p>`}
+        </div>
+      </div>`;
+    drawer.dataset.open = "1"; scrim.dataset.open = "1";
+    drawer.focus();
+  }
+  function closeDrawer() {
+    if (drawer.dataset.open !== "1") return;   // otherwise a later Escape yanks
+    drawer.dataset.open = ""; scrim.dataset.open = "";
+    if (lastFocus) { lastFocus.focus(); lastFocus = null; }
+  }
+  document.getElementById("agents").addEventListener("click", e => {
+    const tr = e.target.closest("tr[data-i]"); if (tr) openAgent(+tr.dataset.i);
+  });
+  document.getElementById("agents").addEventListener("keydown", e => {
+    if (e.key !== "Enter" && e.key !== " ") return;
+    const tr = e.target.closest("tr[data-i]");
+    if (tr) { e.preventDefault(); openAgent(+tr.dataset.i); }
+  });
+  document.getElementById("dclose").addEventListener("click", closeDrawer);
+  scrim.addEventListener("click", closeDrawer);
+  document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+</script>
