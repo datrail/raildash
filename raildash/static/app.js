@@ -33,10 +33,11 @@ function fmtInt(n) {
   return typeof n === "number" ? n.toLocaleString() : "—";
 }
 
-function fmtMs(ms) {
+function fmtMs(ms, compact) {
   if (typeof ms !== "number" || Number.isNaN(ms)) return "—";
-  if (ms < 1000) return `${Math.round(ms)} ms`;
-  return `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s`;
+  const sp = compact ? "" : " ";
+  if (ms < 1000) return `${Math.round(ms)}${sp}ms`;
+  return `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)}${sp}s`;
 }
 
 function fmtBytes(n) {
@@ -168,8 +169,10 @@ async function loadOverview() {
   // Average, not p50: SQLite has no percentile aggregate, and computing one
   // from the visible page would label a page statistic as a total. The tile
   // says avg because that is what it is.
+  // Compact here: "836 ms / 2.41 s" wraps to two lines in a tile this width,
+  // and a wrapped statistic reads as two numbers rather than one pair.
   $("stat-latency").textContent =
-    `${fmtMs(t.avg_latency_ms)} / ${fmtMs(t.max_latency_ms)}`;
+    `${fmtMs(t.avg_latency_ms, true)} / ${fmtMs(t.max_latency_ms, true)}`;
 
   const total = (t.request_bytes || 0) + (t.response_bytes || 0);
   $("stat-bytes").textContent = fmtBytes(total);

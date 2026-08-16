@@ -42,6 +42,24 @@ def main() -> int:
     for name in sorted(ids_in_js - ids_in_html):
         problems.append(f'app.js: $("{name}") has no matching id in index.html')
 
+    # The `hidden` attribute is only the UA stylesheet's `display: none`, which
+    # any author `display` rule outranks. Several elements here are flex or grid
+    # and are toggled by `hidden` from JavaScript, so without an explicit
+    # override the detail panel, its scrim and the active-filter bar all render
+    # on first paint — empty, over half the page. That shipped once and no test
+    # saw it: the markup was right, the script was right, and they disagreed
+    # only once a browser resolved the cascade.
+    hidden_in_html = set(re.findall(r'id="([A-Za-z0-9_-]+)"[^>]*\shidden', html))
+    hidden_in_html |= set(re.findall(r'\shidden[^>]*id="([A-Za-z0-9_-]+)"', html))
+    if hidden_in_html and not re.search(
+        r"\[hidden\]\s*\{[^}]*display:\s*none\s*!important", css
+    ):
+        problems.append(
+            "app.css: needs `[hidden] { display: none !important }` — "
+            f"{len(hidden_in_html)} element(s) rely on the hidden attribute "
+            "and an author display rule silently beats it"
+        )
+
     # Captured traffic is untrusted; the front end must never assign markup.
     for sink in ("innerHTML =", "outerHTML =", "insertAdjacentHTML", "document.write"):
         if sink in js:

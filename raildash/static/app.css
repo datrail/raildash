@@ -100,6 +100,16 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute only works through the UA stylesheet's
+ * `display: none`, which *any* author `display` rule outranks. Several things
+ * here are `display: flex` or `grid` and are toggled by `hidden` from
+ * JavaScript, so without this the detail panel, its scrim and the active-filter
+ * bar all render on first paint — empty, and covering half the page.
+ *
+ * No test caught it: the markup was correct, the script was correct, and the
+ * two disagreed only once a browser resolved the cascade. */
+[hidden] { display: none !important; }
+
 html { -webkit-text-size-adjust: 100%; }
 
 body {
@@ -284,8 +294,12 @@ code { font-family: var(--mono); }
   font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.09em;
   color: var(--ink-faint);
 }
+/* 19px, not 21: the widest tile is the latency pair, and at 21px
+ * "836ms / 2.41s" wraps in a six-across strip on a 1440 viewport — a wrapped
+ * statistic reads as two numbers rather than one pair. Checked rendered, not
+ * assumed. */
 .tile-value {
-  font-family: var(--mono); font-size: 21px; line-height: 1.25;
+  font-family: var(--mono); font-size: 19px; line-height: 1.3;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
