@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "raildash"
+version = "0.2.0"
+description = "Local dashboard for RailMon captures. No control plane required."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+]
+
+[project.optional-dependencies]
+dev = ["httpx>=0.28.0", "pytest>=8.0"]
+
+# So `raildash` is a real command after `pip install -e .`. Without it the
+# documented invocation only works as `python -m raildash.cli`, and a README
+# whose first command does not run is worse than no README.
+[project.scripts]
+raildash = "raildash.cli:main"
+
+[tool.setuptools]
+# Explicit, because the repo root also holds webhook_server.py and tools/,
+# and auto-discovery refuses a layout it cannot classify.
+packages = ["raildash"]
+py-modules = ["webhook_server"]
+
+[tool.setuptools.package-data]
+raildash = ["static/*"]
