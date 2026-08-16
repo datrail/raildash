@@ -1,0 +1,76 @@
+# Test and build on every change, so a break surfaces on the pull request
+# rather than after a release tag exists.
+#
+# RailDash was the one component repository with no CI at all, which is why a
+# 41-test suite could sit in a pull request with nothing running it.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Commit-ish to check out. A called workflow's `github.ref` is the
+          caller's, so a release path must pass the resolved tag explicitly.
+          Empty means "whatever triggered this run".
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# A PR groups by ref, so a new push supersedes the last; everything else groups
+# by SHA, so each commit keeps its own signal and cannot be evicted from the
+# queue by a newer one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # `make test` builds its own virtualenv and installs requirements-dev,
+      # so this needs no separate pip step and the local and CI runs are the
+      # same command. RailDash does have dependencies — FastAPI and uvicorn —
+      # unlike the stdlib-only scanner.
+      - run: make test
+
+      # The front end has no build step, so nothing else would catch a CSS
+      # token that was renamed, an id the script reaches for that no longer
+      # exists, or a code path that assigns markup. All three fail silently in
+      # a browser; this fails the build instead.
+      - run: make lint
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build only — nothing is pushed from a pull request. Single-arch amd64:
+      # this exists to catch a Dockerfile that does not build, and the arm64
+      # leg costs QEMU emulation for a signal amd64 already gives. RailDash is
+      # pure Python, so there is no arch-specific path to miss.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,mode=max,scope=image
