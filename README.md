@@ -8,6 +8,36 @@ back, which calls failed, and where it called a tool. **It needs no control
 plane.** If you have installed only the open-source components, this is the
 thing that shows you the report.
 
+## Quick start
+
+One command from a clean checkout. No cloud, no account, no Rail Center — and
+no other component running, not even RailMon. You need Python 3.10+ with the
+`venv` module, and `make`. On Debian and Ubuntu (WSL included) `venv` is a
+separate package — if the first run fails with *"ensurepip is not
+available"*, install the package that error names (for example
+`sudo apt install python3.14-venv`) and run `make demo` again.
+
+```bash
+git clone https://github.com/datrail/raildash.git
+cd raildash
+make demo
+```
+
+`make demo` builds a virtualenv, installs the two dependencies (FastAPI and
+uvicorn), loads `tests/fixtures/capture.jsonl` — a small capture shaped
+exactly like RailMon's output — into a local `demo.db`, and serves the
+dashboard.
+
+Open <http://127.0.0.1:8000/>. **You should see** a populated dashboard, not
+an empty one: 8 interactions across 4 hosts, 3 failures and 2 tool calls in
+the summary; a host list topped by `api.anthropic.com`; and an interaction
+log whose status codes include a 429, a 403 and a 500 — the 500, against
+`exfil.attacker.net`, is the fixture's deliberately alarming row. Two rows
+are flagged `1 tool` and four are flagged `x-rail`. If that is what you see,
+it works.
+
+## Installing
+
 ```bash
 pip install -e .
 
@@ -86,6 +116,11 @@ docker run --rm -p 8000:8000 -v raildash-data:/data raildash
 
 The image binds `0.0.0.0`, where the network namespace is the boundary and the
 operator chooses what to publish. Without the volume it forgets on restart.
+
+Unlike `make demo`, a fresh container starts empty: the image ships no
+fixture, so a first run shows an empty dashboard until a capture arrives —
+via the webhook, or by mounting a directory with a capture in it and loading
+it with `docker exec <container> python -m raildash.cli load <file>`.
 
 ## Development
 
