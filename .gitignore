@@ -7,3 +7,7 @@ __pycache__/
 *.db-shm
 *.egg-info/
 build/
+
+# `make stack` clones datrail/railmon here (see Makefile). Build input, not
+# source: it is its own repository and must never be committed.
+railmon/

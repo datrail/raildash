@@ -99,23 +99,55 @@ running first.
 
 **You should see**, a few seconds after `docker compose ps` prints: RailMon's
 container ran once and exited 0 (expected — the demo capture finishes and
-stops, it isn't a long-running collector), a `raildash-loader` container that
-also ran once and exited 0, and <http://127.0.0.1:8000> showing three
-interactions against `127.0.0.1:8443` — present **once**, not twice, even
-though both the webhook and the file delivered them. `make stack-test` checks
-that last part automatically rather than by eyeballing the dashboard.
+stops, it isn't a long-running collector), the file-import step reporting
+`6 already present, skipped`, and <http://127.0.0.1:8000> showing **6
+interactions** against `127.0.0.1:8443`, all `POST`, all `200`, across
+`/v1/demo` and `/v1/demo/other`.
 
-Both wirings land on the same three interactions without double-counting only
-because they're told the same session id (RailMon's `RAILMON_SESSION_ID` and
-the loader's `--session-id` share one value in `docker-compose.yml`, via a
-YAML anchor) — the JSONL file carries no session id of its own, and this
-dashboard's dedup index is `(session_id, interaction_id)`, not
+Six, from three requests, is correct and worth understanding before you read
+it as a bug. RailMon's demo taps by process name (`--comm python3`), and both
+ends of the exchange — `demo_server.py` and `demo_client.py` — are `python3`,
+so each request is captured twice: once as the client sent it, once as the
+server received it. They are two genuine observations of one exchange, with
+different `pid`s, not one row written twice. In the interaction log they show
+as pairs sharing a timestamp to the millisecond. See RailMon's
+`tools/local-demo/README.md` for why the demo filters that broadly.
+
+**Double-counting would look like 12, not 6** — and that is what the two
+ingestion paths would produce if they were wired naively. The file-import
+step reporting `6 already present, skipped` is the dedup working: the webhook
+delivered those 6 while RailMon ran, and the import then recognised every one
+rather than adding a second copy. `make stack-test` asserts this
+automatically (stored count == `capture.jsonl` line count) rather than
+leaving it to be eyeballed.
+
+Both wirings land on the same interactions without double-counting only
+because they're told the same session id — `DEMO_SESSION_ID` in the `Makefile`
+is the single source, reaching RailMon as `RAILMON_SESSION_ID` and the import
+step as `--session-id`. The JSONL file carries no session id of its own, and
+this dashboard's dedup index is `(session_id, interaction_id)`, not
 `interaction_id` alone. Wiring the two paths up with mismatched session ids —
 which is what happens if you copy this pattern without also fixing the
 session id — silently doubles every count instead of erroring, so it's worth
 knowing about even outside the stack: the same caveat applies to running a
 manual `railmon collect --output` and `--webhook` against this dashboard at
 the same time, if you ever want both at once by hand.
+
+`make stack` briefly stops the dashboard to run that import, then starts it
+again — you will see it in the output. That is not incidental. Only one
+process can hold this SQLite database open: it lives on a named volume, where
+WAL's `-shm` file is not shareable, so a second opener gets "database is
+locked" even for a read-only `PRAGMA journal_mode` with a 30-second timeout —
+measured on WSL2 Docker, both from a separate container and from a second
+process inside the `raildash` container itself. Pausing the server keeps the
+file path on `raildash load`, RailDash's real documented import command,
+rather than faking it by POSTing the file to the webhook. The pause happens
+during setup, before anyone has opened the dashboard.
+
+The same constraint applies outside this stack: if the database is on a
+Docker named volume, do not expect `raildash load` to work against it while
+`raildash serve` is running. Load first, then serve — or keep the database on
+an ordinary filesystem, where two processes share it fine.
 
 Stopping RailMon (`docker compose stop railmon`) leaves the dashboard serving
 what it already has, same as the "no control plane" reasoning above — the
@@ -128,7 +160,7 @@ file path is passive and the webhook path only ever pushed.
 | **Summary** | interactions, distinct hosts, failures and failure rate, tool calls, latency, bytes each way |
 | **Where the agent went** | every host, ranked, with its failure count and average latency — click one to filter the log |
 | **Interaction log** | one row per request/response pair, filterable by host, method, status class, and failures only |
-| **Detail** | the full exchange in both directions; credential headers are redacted before storage, while bodies remain exactly as RailMon captured them |
+| **Detail** | the full exchange — headers and bodies both ways, exactly as RailMon captured them |
 
 Two flags on a row are worth knowing. `n tool` counts `tool_use` blocks in the
 exchange, which is the closest thing in the payload to *the agent took an
@@ -153,26 +185,15 @@ persists because the question "what did the agent do" is normally asked after
 something has already gone wrong, and an in-memory store can only answer it if
 you still have the process.
 
-One process owns a database at a time. RailDash keeps an exclusive SQLite lock
-so an older process cannot write unredacted rows around a schema migration; use
-a separate `--db` path if you intentionally run another process.
-
-On first open, version 0.2.0 removes credential headers left by older RailDash
-databases and purges the active SQLite/WAL files. That cannot reach backups,
-volume snapshots, or exported copies: delete those separately and rotate any
-credential that may have been captured before upgrading.
-
 ## Docker
 
 ```bash
 docker build -t raildash .
-docker run --rm -p 127.0.0.1:8000:8000 -v raildash-data:/data raildash
+docker run --rm -p 8000:8000 -v raildash-data:/data raildash
 ```
 
 The image binds `0.0.0.0`, where the network namespace is the boundary and the
-operator chooses what to publish. The example maps it only onto the host's
-loopback interface because RailDash has no authentication and contains captured
-request and response bodies. Without the volume it forgets on restart.
+operator chooses what to publish. Without the volume it forgets on restart.
 
 Unlike `make demo`, a fresh container starts empty: the image ships no
 fixture, so a first run shows an empty dashboard until a capture arrives —

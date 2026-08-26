@@ -1,0 +1,79 @@
+# RailMon + RailDash, running together, from one command. DR-81 (BDL-F5).
+# Lives here rather than in `railmon` because RailDash is what a person
+# actually opens — the compose file's job is "clone, one command, see the
+# dashboard" — but the reasoning below applies whichever direction it's read.
+#
+# This repo can build itself (`build: .`, the Dockerfile already at this
+# root) but has no RailMon source to build from and no published RailMon
+# image to pull — `railmon` only vendors nothing of RailDash's and vice
+# versa, and RailDash itself publishes no image today either way. So `make
+# stack` (see Makefile) clones `datrail/railmon` into `./railmon` first, and
+# this file builds it from there. One clone of *this* repo is still "one
+# clone" for a newcomer — the RailMon clone is part of the documented
+# command, not a second thing they have to separately know to do.
+#
+# Both of RailDash's ingestion paths are wired at once: the file (RailMon
+# writes JSONL to the shared `captures` volume) and the webhook (posted
+# straight to this service by compose-network name). They don't double-count
+# each other only because both sides are told the SAME session id (see
+# DEMO_SESSION_ID below) — RailMon's JSONL carries no session id of its own,
+# and RailDash dedups on (session_id, interaction_id), not interaction_id
+# alone. Full explanation in the "Running both together" section of README.md.
+#
+# The file-import step is NOT a service here, deliberately. It was one, and it
+# failed: only ONE process can hold this SQLite database open. The DB lives on
+# a named volume, where WAL's -shm file is not shareable, so a second opener
+# gets "database is locked" even for a read-only `PRAGMA journal_mode` with a
+# 30s timeout — measured on WSL2 Docker, both from a second container and from
+# a second process inside this one. So the Makefile stops this service, runs
+# `raildash load` as the sole opener, and starts it again. That keeps the file
+# path on RailDash's real documented import command rather than faking it
+# through the webhook endpoint.
+
+services:
+  raildash:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - captures:/captures:ro
+      - raildash-db:/data
+    environment:
+      RAILDASH_DB: /data/raildash.db
+    healthcheck:
+      # No curl in this image (just this repo's own Python deps) — a
+      # one-line stdlib request instead of adding a package for it.
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request as u,sys; sys.exit(0 if u.urlopen('http://127.0.0.1:8000/webhook/health', timeout=2).status == 200 else 1)"
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  railmon:
+    build: ./railmon
+    # eBPF tap — collect/demo always need this; not specific to this stack.
+    # See railmon's README.md "Platforms" section for the host kernel
+    # prerequisite (BTF/CO-RE) this doesn't relax.
+    privileged: true
+    pid: "host"
+    command: ["demo"]
+    volumes:
+      - captures:/out
+    environment:
+      # Must match the --session-id the Makefile's file-import step passes, or
+      # the two ingestion paths land in different sessions and double-count
+      # (RailDash dedups on (session_id, interaction_id) — see README.md).
+      # DEMO_SESSION_ID is set once in the Makefile and exported; the default
+      # here keeps a bare `docker compose up` consistent with it.
+      RAILMON_SESSION_ID: "${DEMO_SESSION_ID:-railmon-raildash-stack}"
+      RAILMON_WEBHOOK_URL: "http://raildash:8000/webhook/http-interactions"
+    depends_on:
+      raildash:
+        condition: service_healthy
+
+volumes:
+  captures:
+  raildash-db:

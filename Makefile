@@ -5,6 +5,14 @@ PY   := $(VENV)/bin/python
 
 RAILMON_REPO ?= https://github.com/datrail/railmon.git
 
+# One source of truth for the session id both ingestion paths use. RailMon
+# gets it as RAILMON_SESSION_ID (interpolated into docker-compose.yml, which
+# repeats it only as a fallback default); the file-import step below passes
+# the same value as --session-id. They must match or the webhook and the file
+# land in different sessions and every interaction is counted twice.
+DEMO_SESSION_ID ?= railmon-raildash-stack
+export DEMO_SESSION_ID
+
 # The venv build must not leave a half-made .venv behind. The directory is
 # the make target, so if creation or the install fails partway (no
 # python3-venv package, a dropped network) and the directory survives, every
@@ -44,8 +52,28 @@ clean:
 railmon:
 	git clone --depth 1 $(RAILMON_REPO) railmon
 
+# Only ONE process can hold this SQLite database: it lives on a named volume,
+# where WAL's -shm file is not shareable, so a second opener gets "database is
+# locked" even for a read-only PRAGMA (verified on WSL2 Docker, both from a
+# second container and from a second process inside the raildash container).
+# So the file import runs while the server is stopped, and is the sole opener
+# for those few seconds. `docker wait` first, so the capture is complete
+# before it is read. The dashboard is only down during setup, before anyone
+# has opened it.
 stack: railmon
 	docker compose up --build -d
+	@echo "waiting for the demo capture to finish..."
+	@docker wait $$(docker compose ps -aq railmon) >/dev/null
+	@echo "importing the capture file (server paused)..."
+	docker compose stop raildash
+	docker compose run --rm --entrypoint python3 raildash \
+	  -m raildash.cli --db /data/raildash.db load /captures/capture.jsonl \
+	  --session-id $(DEMO_SESSION_ID)
+	docker compose start raildash
+	@for i in $$(seq 1 30); do \
+	  curl -fsS http://127.0.0.1:8000/webhook/health >/dev/null 2>&1 && break; \
+	  sleep 1; \
+	done
 	docker compose ps
 	@echo ""
 	@echo "open http://127.0.0.1:8000 -- see README.md 'Running both together'"
@@ -67,9 +95,18 @@ stack-down:
 stack-test: railmon
 	docker compose up --build -d raildash
 	docker compose up --build --exit-code-from railmon railmon
-	docker compose up --build --exit-code-from raildash-loader raildash-loader
+	docker compose stop raildash
+	docker compose run --rm --entrypoint python3 raildash \
+	  -m raildash.cli --db /data/raildash.db load /captures/capture.jsonl \
+	  --session-id $(DEMO_SESSION_ID)
+	docker compose start raildash
+	@echo "waiting for the dashboard to come back..."
+	@for i in $$(seq 1 30); do \
+	  curl -fsS http://127.0.0.1:8000/webhook/health >/dev/null 2>&1 && break; \
+	  sleep 1; \
+	done
 	file_lines=$$(docker compose exec -T raildash cat /captures/capture.jsonl | wc -l); \
-	stored=$$(curl -fsS http://127.0.0.1:8000/api/overview | python3 -c 'import json,sys; print(json.load(sys.stdin)["interactions"])'); \
+	stored=$$(curl -fsS http://127.0.0.1:8000/api/overview | python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["interactions"])'); \
 	echo "capture.jsonl lines: $$file_lines, interactions stored: $$stored"; \
 	ok=1; \
 	[ "$$stored" -gt 0 ] || { echo "stack-test: expected interactions > 0, got $$stored" >&2; ok=0; }; \
