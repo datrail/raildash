@@ -75,6 +75,52 @@ sudo railmon collect --mode http \
   --webhook http://127.0.0.1:8000/webhook/http-interactions
 ```
 
+## Running both together (DR-81)
+
+The two sections above are RailMon and RailDash run and wired by hand. This
+repo also ships a `docker compose` stack that does both automatically, with
+both wirings active at once:
+
+```bash
+git clone https://github.com/datrail/raildash.git
+cd raildash
+make stack
+```
+
+`make stack` clones `datrail/railmon` into `./railmon` (this repo has no
+RailMon source of its own — see `docker-compose.yml`'s header for why that's
+a clone-as-bootstrap step rather than a reason to vendor a copy), builds both
+images, and brings the stack up: RailMon runs its own local quickstart demo
+(a real, local, offline HTTPS exchange it generates and taps itself — see
+RailMon's `tools/local-demo/README.md` — not a connection to any real agent),
+posting to this dashboard's webhook *and* writing to a file RailDash then
+imports, so first run shows something without anything else having to be
+running first.
+
+**You should see**, a few seconds after `docker compose ps` prints: RailMon's
+container ran once and exited 0 (expected — the demo capture finishes and
+stops, it isn't a long-running collector), a `raildash-loader` container that
+also ran once and exited 0, and <http://127.0.0.1:8000> showing three
+interactions against `127.0.0.1:8443` — present **once**, not twice, even
+though both the webhook and the file delivered them. `make stack-test` checks
+that last part automatically rather than by eyeballing the dashboard.
+
+Both wirings land on the same three interactions without double-counting only
+because they're told the same session id (RailMon's `RAILMON_SESSION_ID` and
+the loader's `--session-id` share one value in `docker-compose.yml`, via a
+YAML anchor) — the JSONL file carries no session id of its own, and this
+dashboard's dedup index is `(session_id, interaction_id)`, not
+`interaction_id` alone. Wiring the two paths up with mismatched session ids —
+which is what happens if you copy this pattern without also fixing the
+session id — silently doubles every count instead of erroring, so it's worth
+knowing about even outside the stack: the same caveat applies to running a
+manual `railmon collect --output` and `--webhook` against this dashboard at
+the same time, if you ever want both at once by hand.
+
+Stopping RailMon (`docker compose stop railmon`) leaves the dashboard serving
+what it already has, same as the "no control plane" reasoning above — the
+file path is passive and the webhook path only ever pushed.
+
 ## What it shows
 
 | | |
