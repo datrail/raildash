@@ -1,2 +1,6 @@
-fastapi>=0.100.0
-uvicorn>=0.23.0
+# This file defines the executable environment used by Docker and `make`.
+# Keep direct dependencies at the versions exercised by CI/security review;
+# pyproject.toml retains compatible ranges for people installing the package as
+# a library. Update these deliberately and run the OSV audit recorded in the PR.
+fastapi==0.141.1
+uvicorn==0.52.3

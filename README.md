@@ -82,7 +82,7 @@ sudo railmon collect --mode http \
 | **Summary** | interactions, distinct hosts, failures and failure rate, tool calls, latency, bytes each way |
 | **Where the agent went** | every host, ranked, with its failure count and average latency — click one to filter the log |
 | **Interaction log** | one row per request/response pair, filterable by host, method, status class, and failures only |
-| **Detail** | the full exchange — headers and bodies both ways, exactly as RailMon captured them |
+| **Detail** | the full exchange in both directions; credential headers are redacted before storage, while bodies remain exactly as RailMon captured them |
 
 Two flags on a row are worth knowing. `n tool` counts `tool_use` blocks in the
 exchange, which is the closest thing in the payload to *the agent took an
@@ -107,15 +107,26 @@ persists because the question "what did the agent do" is normally asked after
 something has already gone wrong, and an in-memory store can only answer it if
 you still have the process.
 
+One process owns a database at a time. RailDash keeps an exclusive SQLite lock
+so an older process cannot write unredacted rows around a schema migration; use
+a separate `--db` path if you intentionally run another process.
+
+On first open, version 0.2.0 removes credential headers left by older RailDash
+databases and purges the active SQLite/WAL files. That cannot reach backups,
+volume snapshots, or exported copies: delete those separately and rotate any
+credential that may have been captured before upgrading.
+
 ## Docker
 
 ```bash
 docker build -t raildash .
-docker run --rm -p 8000:8000 -v raildash-data:/data raildash
+docker run --rm -p 127.0.0.1:8000:8000 -v raildash-data:/data raildash
 ```
 
 The image binds `0.0.0.0`, where the network namespace is the boundary and the
-operator chooses what to publish. Without the volume it forgets on restart.
+operator chooses what to publish. The example maps it only onto the host's
+loopback interface because RailDash has no authentication and contains captured
+request and response bodies. Without the volume it forgets on restart.
 
 Unlike `make demo`, a fresh container starts empty: the image ships no
 fixture, so a first run shows an empty dashboard until a capture arrives —

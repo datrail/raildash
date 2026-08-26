@@ -1,6 +1,7 @@
 """The HTTP surface, against a store loaded from the fixture."""
 
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from raildash import app as app_module
 from raildash.ingest import normalise, read_jsonl
-from raildash.store import Store
+from raildash.store import SCHEMA, Store
 
 FIXTURE = Path(__file__).parent / "fixtures" / "capture.jsonl"
 
@@ -92,7 +93,7 @@ def test_pagination(client):
     assert {i["id"] for i in first["items"]} & {i["id"] for i in second["items"]} == set()
 
 
-def test_detail_returns_the_untouched_interaction(client):
+def test_detail_returns_the_interaction_with_credentials_redacted(client):
     row_id = client.get("/api/interactions").json()["items"][-1]["id"]
     detail = client.get(f"/api/interactions/{row_id}").json()
     assert detail["raw"]["request"]["method"] == "POST"
@@ -149,9 +150,75 @@ def test_webhook_accepts_a_bare_array(client):
     assert client.post("/webhook/http-interactions", json=items).json()["stored"] == 1
 
 
+def test_webhook_refuses_cors_simple_text_plain_json(client):
+    """A hostile web page can send text/plain cross-origin without preflight.
+
+    RailDash has no CORS grant, so requiring application/json makes the
+    browser stop before an unauthenticated localhost webhook can be poisoned.
+    """
+    res = client.post(
+        "/webhook/http-interactions",
+        content=b'{"interactions": []}',
+        headers={"content-type": "text/plain"},
+    )
+    assert res.status_code == 415
+
+
+def test_webhook_refuses_an_oversized_body(client, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_WEBHOOK_BODY_BYTES", 16)
+    res = client.post("/webhook/http-interactions", json={"interactions": []})
+    assert res.status_code == 413
+
+
+def test_webhook_refuses_an_oversized_batch(client, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_WEBHOOK_ITEMS", 1)
+    res = client.post("/webhook/http-interactions", json=[{}, {}])
+    assert res.status_code == 413
+
+
+def test_body_limit_accepts_railmons_largest_single_interaction():
+    # RailMon size-splits batches, but one interaction still needs room for a
+    # 1 MiB request and response whose bytes may each become a six-byte escape.
+    producer_body_max = 2 * 1024 * 1024 * 6
+    assert app_module.MAX_WEBHOOK_BODY_BYTES >= producer_body_max + 1024 * 1024
+
+
+def test_webhook_rejects_object_expansion_before_json_decode(client, monkeypatch):
+    from raildash import json_safety
+
+    # Patch the constructor default used by the app: dataclass defaults are
+    # captured at class definition time.
+    monkeypatch.setattr(
+        app_module,
+        "JSONStructureGuard",
+        lambda: json_safety.JSONStructureGuard(max_tokens=8),
+    )
+    res = client.post("/webhook/http-interactions", json=[{}, {}, {}, {}])
+    assert res.status_code == 413
+
+
+def test_webhook_bounds_repeated_envelope_fields(client):
+    res = client.post(
+        "/webhook/events",
+        json={"session_id": "s" * (app_module.MAX_SESSION_ID_CHARS + 1), "events": [{}]},
+    )
+    assert res.status_code == 422
+
+
 def test_malformed_json_is_400(client):
     res = client.post("/webhook/http-interactions", content=b"{not json",
                       headers={"content-type": "application/json"})
+    assert res.status_code == 400
+
+
+def test_non_utf8_json_is_400_even_when_stdlib_would_accept_it(client):
+    payload = json.dumps([{}] * 10).encode("utf-16")
+    assert json.loads(payload) == [{}] * 10
+    res = client.post(
+        "/webhook/http-interactions",
+        content=payload,
+        headers={"content-type": "application/json"},
+    )
     assert res.status_code == 400
 
 
@@ -164,6 +231,354 @@ def test_raw_events_endpoint(client):
     payload = {"session_id": "ev-1",
                "events": [{"function": "SSL_write", "pid": 1, "len": 10, "data": "x"}]}
     assert client.post("/webhook/events", json=payload).json()["stored"] == 1
+
+
+def test_raw_events_accept_railmons_actual_interactions_envelope(client):
+    payload = {
+        "session_id": "ev-real-envelope",
+        "interactions": [
+            {"source": "ssl", "data": {"function": "WRITE/SEND", "data": "x"}}
+        ],
+    }
+    result = client.post("/webhook/events", json=payload).json()
+    assert result == {
+        "received": 1,
+        "stored": 1,
+        "session_id": "ev-real-envelope",
+    }
+
+
+def test_raw_events_are_scrubbed_before_persistence(client):
+    ticket = "live-x-rail-ticket"
+    bearer = "Bearer raw-wire-secret"
+    payload = {
+        "session_id": "ev-credentials",
+        "events": [
+            {
+                "headers": {"x-rail": ticket},
+                "data": f"POST / HTTP/1.1\r\nAuthorization: {bearer}\r\n\r\nbody",
+            }
+        ],
+    }
+    assert client.post("/webhook/events", json=payload).status_code == 200
+    stored = app_module.store._db.execute(  # noqa: SLF001 - persistence invariant
+        "SELECT raw FROM raw_events WHERE session_id = ?", ("ev-credentials",)
+    ).fetchone()[0]
+    assert ticket not in stored
+    assert bearer not in stored
+    assert "[REDACTED-BY-RAILDASH]" in stored
+
+
+def test_nested_railmon_raw_event_is_scrubbed_before_persistence(client):
+    ticket = "nested-live-ticket"
+    payload = {
+        "session_id": "nested-event",
+        "events": [
+            {
+                "source": "ssl",
+                "data": {
+                    "function": "WRITE/SEND",
+                    "data": f"POST / HTTP/1.1\r\nx-rail: {ticket}\r\n\r\n",
+                },
+            }
+        ],
+    }
+    client.post("/webhook/events", json=payload).raise_for_status()
+    stored = app_module.store._db.execute(  # noqa: SLF001
+        "SELECT raw FROM raw_events WHERE session_id = ?", ("nested-event",)
+    ).fetchone()[0]
+    assert ticket not in stored
+    assert "[REDACTED-BY-RAILDASH]" in stored
+
+
+def test_raw_event_scrubs_folded_and_coalesced_credential_headers(client):
+    folded = "folded-secret"
+    second = "second-message-secret"
+    third = "third-message-secret"
+    wire = (
+        "HTTP/1.1 200 OK\r\n"
+        "Authorization: Bearer\r\n"
+        f" {folded}\r\n"
+        "Content-Length: 2\r\n\r\n"
+        "{}HTTP/1.1 200 OK\r\n"
+        f"X-Api-Key: {second}\r\n"
+        "Content-Length: 2\r\n\r\n"
+        "{}POST /three HTTP/1.1\r\n"
+        f"Cookie: {third}\r\n\r\n"
+    )
+    payload = {
+        "session_id": "raw-multiple",
+        "interactions": [{"source": "ssl", "data": {"data": wire}}],
+    }
+    client.post("/webhook/events", json=payload).raise_for_status()
+    stored = app_module.store._db.execute(  # noqa: SLF001
+        "SELECT raw FROM raw_events WHERE session_id = ?", ("raw-multiple",)
+    ).fetchone()[0]
+    assert folded not in stored
+    assert second not in stored
+    assert third not in stored
+    assert stored.count("[REDACTED-BY-RAILDASH]") == 4
+
+
+def test_detail_never_returns_credential_headers(client):
+    ticket = "eyJhZ2VudF9pZCI6ImEifQ"
+    bearer = "Bearer secret-that-must-not-reach-the-dashboard"
+    payload = {
+        "session_id": "credentials",
+        "interactions": [
+            {
+                "request": {
+                    "method": "POST",
+                    "path": "/v1/messages",
+                    "headers": {
+                        "host": "api.example.com",
+                        "x-rail": ticket,
+                        "Authorization": bearer,
+                    },
+                    # Bodies are deliberately not part of header redaction.
+                    "body": {
+                        "token": "body-content-is-capture-data",
+                        "data": "Authorization: body-content-is-not-a-header",
+                    },
+                },
+                "response": {
+                    "status_code": 200,
+                    "headers": {"Set-Cookie": "session=secret"},
+                },
+            }
+        ],
+    }
+    posted = client.post("/webhook/http-interactions", json=payload).json()
+    row = client.get(
+        "/api/interactions", params={"session_id": posted["session_id"]}
+    ).json()["items"][0]
+    detail = client.get(f"/api/interactions/{row['id']}").json()
+    rendered = json.dumps(detail)
+
+    assert row["has_ticket"] == 1
+    assert ticket not in rendered
+    assert bearer not in rendered
+    assert "session=secret" not in rendered
+    assert detail["raw"]["request"]["headers"]["x-rail"] == "[REDACTED-BY-RAILDASH]"
+    assert detail["raw"]["request"]["headers"]["host"] == "api.example.com"
+    assert detail["raw"]["request"]["body"]["token"] == "body-content-is-capture-data"
+    assert (
+        detail["raw"]["request"]["body"]["data"]
+        == "Authorization: body-content-is-not-a-header"
+    )
+
+
+def test_runtime_interaction_keeps_ticket_presence_but_not_value(client):
+    ticket = "runtime-ticket"
+    payload = {
+        "session_id": "runtime",
+        "interactions": [
+            {
+                "interaction_id": "runtime-1",
+                "x_rail_header": ticket,
+                "request": {"method": "POST", "path": "/", "destination": "api"},
+                "response": {"status": 200},
+                "raw": {
+                    "request": {"headers": {"x-rail": ticket}},
+                    "response": {"status_code": 200},
+                },
+            }
+        ],
+    }
+    client.post("/webhook/http-interactions", json=payload).raise_for_status()
+    row = client.get(
+        "/api/interactions", params={"session_id": "runtime"}
+    ).json()["items"][0]
+    detail = client.get(f"/api/interactions/{row['id']}").json()
+    assert row["has_ticket"] == 1
+    assert ticket not in json.dumps(detail)
+
+
+def test_opening_an_old_database_migrates_stored_credentials(tmp_path):
+    path = tmp_path / "old.db"
+    ticket = "pre-upgrade-ticket"
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    db.execute("INSERT INTO sessions (session_id) VALUES ('old')")
+    db.execute(
+        "INSERT INTO interactions (session_id, interaction_id, raw) VALUES (?, ?, ?)",
+        (
+            "old",
+            "fixed",
+            json.dumps(
+                {
+                    "request": {"headers": {"x-rail": ticket}},
+                    "response": {"status_code": 200},
+                }
+            ),
+        ),
+    )
+    db.commit()
+    db.close()
+
+    migrated = Store(path)
+    detail = migrated.interaction(1)
+    assert detail is not None
+    assert ticket not in json.dumps(detail)
+    assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 1  # noqa: SLF001
+    migrated.close()
+    files = [path, path.with_name(path.name + "-wal")]
+    assert all(
+        ticket.encode() not in candidate.read_bytes()
+        for candidate in files
+        if candidate.exists()
+    )
+
+
+def test_old_database_migration_discards_pathologically_deep_capture(tmp_path):
+    path = tmp_path / "deep.db"
+    ticket = "deep-pre-upgrade-ticket"
+    raw = '{"request":{"headers":{"x-rail":"' + ticket + '"}},"body":'
+    raw += '{"child":' * 500 + "null" + "}" * 500 + "}"
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    db.execute("INSERT INTO sessions (session_id) VALUES ('deep')")
+    db.execute(
+        "INSERT INTO interactions (session_id, interaction_id, raw) VALUES (?, ?, ?)",
+        ("deep", "fixed", raw),
+    )
+    db.commit()
+    db.close()
+
+    migrated = Store(path)
+    stored = migrated._db.execute("SELECT raw FROM interactions").fetchone()[0]  # noqa: SLF001
+    assert ticket not in stored
+    assert json.loads(stored)["redacted"] is True
+    migrated.close()
+
+
+def test_old_database_migration_discards_huge_integer_literal(tmp_path):
+    path = tmp_path / "huge-int.db"
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    db.execute("INSERT INTO sessions (session_id) VALUES ('huge-int')")
+    db.execute(
+        "INSERT INTO interactions (session_id, interaction_id, raw) VALUES (?, ?, ?)",
+        ("huge-int", "fixed", '{"number":' + "9" * 5_000 + "}"),
+    )
+    db.commit()
+    db.close()
+
+    migrated = Store(path)
+    stored = migrated._db.execute("SELECT raw FROM interactions").fetchone()[0]  # noqa: SLF001
+    assert json.loads(stored)["redacted"] is True
+    migrated.close()
+
+
+def test_old_runtime_interaction_migration_preserves_ticket_presence(tmp_path):
+    path = tmp_path / "runtime.db"
+    ticket = "old-runtime-ticket"
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    db.execute("INSERT INTO sessions (session_id) VALUES ('runtime')")
+    db.execute(
+        """INSERT INTO interactions
+           (session_id, interaction_id, has_ticket, raw) VALUES (?, ?, 0, ?)""",
+        (
+            "runtime",
+            "fixed",
+            json.dumps(
+                {
+                    "x_rail_header": ticket,
+                    "request": {"method": "POST"},
+                    "raw": {"request": {"headers": {"x-rail": ticket}}},
+                }
+            ),
+        ),
+    )
+    db.commit()
+    db.close()
+
+    migrated = Store(path)
+    row = migrated._db.execute(  # noqa: SLF001
+        "SELECT has_ticket, raw FROM interactions"
+    ).fetchone()
+    assert row["has_ticket"] == 1
+    assert ticket not in row["raw"]
+    migrated.close()
+
+
+def test_store_excludes_a_second_database_process(tmp_path):
+    path = tmp_path / "exclusive.db"
+    owner = Store(path)
+    contender = sqlite3.connect(path, timeout=0.05)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        contender.execute("INSERT INTO sessions (session_id) VALUES ('other')")
+        contender.commit()
+    contender.close()
+    owner.close()
+
+
+def test_old_database_migration_processes_multiple_bounded_batches(
+    tmp_path, monkeypatch
+):
+    from raildash import store as store_module
+
+    path = tmp_path / "pages.db"
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    db.execute("INSERT INTO sessions (session_id) VALUES ('pages')")
+    for row_id in range(5):
+        db.execute(
+            "INSERT INTO interactions (session_id, interaction_id, raw) VALUES (?, ?, ?)",
+            (
+                "pages",
+                str(row_id),
+                json.dumps({"request": {"headers": {"x-rail": f"ticket-{row_id}"}}}),
+            ),
+        )
+    db.commit()
+    db.close()
+    monkeypatch.setattr(store_module, "MIGRATION_BATCH_ROWS", 2)
+
+    migrated = Store(path)
+    rows = migrated._db.execute("SELECT raw FROM interactions").fetchall()  # noqa: SLF001
+    assert len(rows) == 5
+    assert all("ticket-" not in row[0] for row in rows)
+    migrated.close()
+
+
+def test_migration_page_budget_does_not_discard_one_safe_large_row(
+    tmp_path, monkeypatch
+):
+    from raildash import store as store_module
+
+    path = tmp_path / "large-safe-row.db"
+    ticket = "large-row-ticket"
+    captured_body = "x" * 512
+    db = sqlite3.connect(path)
+    db.executescript(SCHEMA)
+    db.execute("INSERT INTO sessions (session_id) VALUES ('large')")
+    db.execute(
+        "INSERT INTO interactions (session_id, interaction_id, raw) VALUES (?, ?, ?)",
+        (
+            "large",
+            "fixed",
+            json.dumps(
+                {
+                    "request": {
+                        "headers": {"x-rail": ticket},
+                        "body": {"raw": captured_body},
+                    }
+                }
+            ),
+        ),
+    )
+    db.commit()
+    db.close()
+    monkeypatch.setattr(store_module, "MIGRATION_BATCH_BYTES", 128)
+
+    migrated = Store(path)
+    detail = migrated.interaction(1)
+    assert detail is not None
+    assert detail["raw"]["request"]["body"]["raw"] == captured_body
+    assert ticket not in json.dumps(detail)
+    migrated.close()
 
 
 def test_legacy_session_detail_404s_instead_of_200_with_an_error(client):

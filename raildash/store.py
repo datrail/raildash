@@ -20,6 +20,21 @@ import threading
 from pathlib import Path
 from typing import Any, Iterable
 
+from .ingest import interaction_has_ticket, redact_credential_headers, redact_raw_event
+from .json_safety import (
+    MAX_SAFE_JSON_BYTES,
+    JSONStructureTooComplex,
+    check_json_structure,
+)
+
+CREDENTIAL_REDACTION_SCHEMA_VERSION = 1
+MIGRATION_BATCH_ROWS = 16
+MIGRATION_BATCH_BYTES = 8 * 1024 * 1024
+UNSAFE_LEGACY_CAPTURE = {
+    "redacted": True,
+    "reason": "legacy capture exceeded safe migration limits",
+}
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id    TEXT PRIMARY KEY,
@@ -87,13 +102,143 @@ class Store:
     def __init__(self, path: str | Path = "raildash.db") -> None:
         self.path = str(path)
         self._lock = threading.Lock()
-        self._db = sqlite3.connect(self.path, check_same_thread=False)
+        self._db = sqlite3.connect(self.path, timeout=1.0, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        # A RailDash database is single-process.  Keeping SQLite's exclusive
+        # locking mode for this connection prevents an older process from
+        # inserting an unredacted row between migration pages and after the
+        # schema version has already advanced.
+        locking_mode = self._db.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()[0]
+        if locking_mode.casefold() != "exclusive":
+            raise RuntimeError("RailDash requires exclusive SQLite locking")
         # WAL so a read while a webhook is writing does not block; the
         # dashboard polls, and a stalled poll looks like a hung page.
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        self._migrate()
         self._db.commit()
+
+    def _migrate(self) -> None:
+        """Remove credentials written by versions predating DR-20.
+
+        Re-import cannot repair an old row because the interaction dedup index
+        correctly ignores it. A one-time SQLite user_version migration updates
+        both interaction and raw-event tables in place before any API can read
+        them; read-time scrubbing below remains a defense-in-depth backstop.
+        """
+        version = self._db.execute("PRAGMA user_version").fetchone()[0]
+        if version >= CREDENTIAL_REDACTION_SCHEMA_VERSION:
+            return
+
+        # Overwrite freed cell/overflow bytes as rows shrink.  The final WAL
+        # checkpoint below then removes copies of the old pages from the WAL.
+        # Backups and filesystem snapshots remain outside SQLite's control and
+        # require credential rotation/deletion by the operator.
+        secure_delete = self._db.execute("PRAGMA secure_delete=ON").fetchone()[0]
+        if secure_delete != 1:
+            raise RuntimeError("SQLite secure_delete is required for credential migration")
+
+        for table in ("interactions", "raw_events"):
+            last_id = 0
+            while True:
+                candidates = self._db.execute(
+                    f"SELECT id, length(CAST(raw AS BLOB)) AS size FROM {table} "
+                    "WHERE id > ? ORDER BY id LIMIT ?",
+                    (last_id, MIGRATION_BATCH_ROWS),
+                ).fetchall()
+                if not candidates:
+                    break
+
+                batch: list[tuple[int, int]] = []
+                batch_bytes = 0
+                for candidate in candidates:
+                    size = int(candidate["size"] or 0)
+                    if batch and batch_bytes + size > MIGRATION_BATCH_BYTES:
+                        break
+                    batch.append((candidate["id"], size))
+                    batch_bytes += size
+
+                for row_id, size in batch:
+                    if size > MAX_SAFE_JSON_BYTES:
+                        # Do not even materialise a legacy row larger than the
+                        # current safe wire bound.  SQLite can replace it in
+                        # place while secure_delete erases the old payload.
+                        self._db.execute(
+                            f"UPDATE {table} SET raw = ? WHERE id = ?",
+                            (json.dumps(UNSAFE_LEGACY_CAPTURE), row_id),
+                        )
+                        continue
+                    row = self._db.execute(
+                        f"SELECT raw FROM {table} WHERE id = ?", (row_id,)
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    raw = row["raw"]
+                    try:
+                        check_json_structure(raw)
+                        parsed = json.loads(raw)
+                        if not isinstance(parsed, dict):
+                            scrubbed_value: Any = UNSAFE_LEGACY_CAPTURE
+                        else:
+                            scrubber = (
+                                redact_raw_event
+                                if table == "raw_events"
+                                else redact_credential_headers
+                            )
+                            scrubbed_value = scrubber(parsed)
+                            if table == "interactions" and interaction_has_ticket(parsed):
+                                self._db.execute(
+                                    "UPDATE interactions SET has_ticket = 1 WHERE id = ?",
+                                    (row_id,),
+                                )
+                    except (
+                        JSONStructureTooComplex,
+                        ValueError,
+                        RecursionError,
+                    ):
+                        # Keeping an unparseable record would keep any embedded
+                        # credential too.  Prefer dropping this pathological
+                        # legacy payload to exposing or crashing on it.
+                        scrubbed_value = UNSAFE_LEGACY_CAPTURE
+
+                    scrubbed = json.dumps(scrubbed_value)
+                    if scrubbed != raw:
+                        self._db.execute(
+                            f"UPDATE {table} SET raw = ? WHERE id = ?",
+                            (scrubbed, row_id),
+                        )
+
+                last_id = batch[-1][0]
+                # Bound both Python retention and the WAL created while old
+                # potentially multi-MiB rows are rewritten.
+                self._db.commit()
+
+        checkpoint = self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is None or checkpoint[0] != 0:
+            raise RuntimeError(
+                "could not purge migrated credentials from the SQLite WAL; "
+                "stop other RailDash processes and retry"
+            )
+
+        self._db.execute(
+            f"PRAGMA user_version = {CREDENTIAL_REDACTION_SCHEMA_VERSION}"
+        )
+
+    @staticmethod
+    def _safe_raw(raw: str, *, raw_event: bool = False) -> Any:
+        """Parse and redact one stored row without letting it break an API."""
+        try:
+            check_json_structure(raw)
+            parsed = json.loads(raw)
+            if not isinstance(parsed, dict):
+                return UNSAFE_LEGACY_CAPTURE
+            return (
+                redact_raw_event(parsed)
+                if raw_event
+                else redact_credential_headers(parsed)
+            )
+        except (JSONStructureTooComplex, ValueError, RecursionError):
+            return UNSAFE_LEGACY_CAPTURE
 
     def close(self) -> None:
         with self._lock:
@@ -325,7 +470,7 @@ class Store:
         if row is None:
             return None
         out = dict(row)
-        out["raw"] = json.loads(out["raw"])
+        out["raw"] = self._safe_raw(out["raw"])
         return out
 
     def distinct(self, column: str, session_id: str | None = None) -> list[str]:

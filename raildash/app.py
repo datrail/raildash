@@ -16,17 +16,34 @@ server used, so an existing RailMon deployment does not need reconfiguring.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, JSONResponse
 
-from .ingest import normalise
+from .ingest import normalise, redact_raw_event
+from .json_safety import (
+    MAX_SAFE_JSON_BYTES,
+    JSONStructureGuard,
+    JSONStructureTooComplex,
+)
 from .store import Store
 
 STATIC = Path(__file__).parent / "static"
+# A companion RailMon sender change splits batches by their serialized size,
+# including JSON escaping, before they reach this bound.  One interaction can
+# legitimately carry a 1 MiB request and response whose control bytes expand
+# sixfold, so 16 MiB leaves room for that worst case and its envelope without
+# making every local RailDash accept a 128 MiB unauthenticated request.
+MAX_WEBHOOK_BODY_BYTES = MAX_SAFE_JSON_BYTES
+MAX_WEBHOOK_ITEMS = 1_000
+MAX_SESSION_ID_CHARS = 256
+MAX_AGENT_CHARS = 256
+MAX_CAPTURE_START_CHARS = 128
 
 app = FastAPI(
     title="RailDash",
@@ -60,14 +77,20 @@ async def receive_http_interactions(request: Request) -> dict[str, Any]:
 
     if isinstance(body, list):
         session_id, agent, capture_start, items = "adhoc", "", "", body
-    else:
-        session_id = str(body.get("session_id") or "unknown")
-        agent = str(body.get("agent") or "")
-        capture_start = str(body.get("capture_start") or "")
+    elif isinstance(body, dict):
+        session_id = _bounded_text(body, "session_id", "unknown", MAX_SESSION_ID_CHARS)
+        agent = _bounded_text(body, "agent", "", MAX_AGENT_CHARS)
+        capture_start = _bounded_text(
+            body, "capture_start", "", MAX_CAPTURE_START_CHARS
+        )
         items = body.get("interactions") or []
+    else:
+        raise HTTPException(422, "expected an object or an array")
 
     if not isinstance(items, list):
         raise HTTPException(422, "interactions must be a list")
+    if len(items) > MAX_WEBHOOK_ITEMS:
+        raise HTTPException(413, f"batch exceeds {MAX_WEBHOOK_ITEMS} interactions")
 
     db = get_store()
     db.upsert_session(session_id, agent, capture_start, source="webhook")
@@ -86,27 +109,90 @@ async def receive_events(request: Request) -> dict[str, Any]:
     body = await _json_body(request)
     if not isinstance(body, dict):
         raise HTTPException(422, "expected an object")
-    session_id = str(body.get("session_id") or "unknown")
-    events = body.get("events") or []
+    session_id = _bounded_text(body, "session_id", "unknown", MAX_SESSION_ID_CHARS)
+    # RailMon uses one Sink for every mode and therefore keeps the envelope
+    # key `interactions` even when the items are raw AgentSight events.  Keep
+    # accepting `events` for compatibility with the original demo server.
+    events = body.get("events")
+    if events is None:
+        events = body.get("interactions") or []
     if not isinstance(events, list):
         raise HTTPException(422, "events must be a list")
+    if len(events) > MAX_WEBHOOK_ITEMS:
+        raise HTTPException(413, f"batch exceeds {MAX_WEBHOOK_ITEMS} events")
 
     db = get_store()
     db.upsert_session(
         session_id,
-        str(body.get("agent") or ""),
-        str(body.get("capture_start") or ""),
+        _bounded_text(body, "agent", "", MAX_AGENT_CHARS),
+        _bounded_text(body, "capture_start", "", MAX_CAPTURE_START_CHARS),
         source="webhook",
     )
-    stored = db.add_raw_events(session_id, [e for e in events if isinstance(e, dict)])
+    stored = db.add_raw_events(
+        session_id,
+        [redact_raw_event(e) for e in events if isinstance(e, dict)],
+    )
     return {"received": len(events), "stored": stored, "session_id": session_id}
 
 
+def _bounded_text(
+    body: dict[str, Any], key: str, default: str, max_chars: int
+) -> str:
+    value = body.get(key)
+    if value is None or value == "":
+        return default
+    if not isinstance(value, str):
+        raise HTTPException(422, f"{key} must be a string")
+    if len(value) > max_chars:
+        raise HTTPException(422, f"{key} exceeds {max_chars} characters")
+    return value
+
+
 async def _json_body(request: Request) -> Any:
+    # Besides documenting the contract, requiring a JSON media type prevents a
+    # hostile web page from using a CORS-simple text/plain POST to poison a
+    # RailDash listening on localhost. application/json triggers a browser
+    # preflight, and this app deliberately grants no cross-origin access.
+    media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if media_type != "application/json" and not media_type.endswith("+json"):
+        raise HTTPException(415, "content-type must be application/json")
+
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            declared_size = int(declared)
+        except ValueError as exc:
+            raise HTTPException(400, "invalid content-length") from exc
+        if declared_size < 0:
+            raise HTTPException(400, "invalid content-length")
+        if declared_size > MAX_WEBHOOK_BODY_BYTES:
+            raise HTTPException(413, f"body exceeds {MAX_WEBHOOK_BODY_BYTES} bytes")
+
+    body = bytearray()
     try:
-        return await request.json()
-    except Exception as exc:  # noqa: BLE001 - any malformed body is one 400
+        # Count the actual stream as well as Content-Length: a chunked request,
+        # or a client lying about its length, must not bypass the bound.
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_WEBHOOK_BODY_BYTES:
+                raise HTTPException(413, f"body exceeds {MAX_WEBHOOK_BODY_BYTES} bytes")
+        # UTF-8 is the interoperable JSON encoding for the webhook.  Requiring
+        # it also keeps UTF-16/32 NUL bytes from confusing a byte-level quote
+        # scanner.  The scan and decode are CPU work, so keep them off the
+        # async event loop that serves dashboard reads and health checks.
+        return await run_in_threadpool(_decode_json, body)
+    except HTTPException:
+        raise
+    except JSONStructureTooComplex as exc:
+        raise HTTPException(413, str(exc)) from exc
+    except (ValueError, UnicodeDecodeError, RecursionError) as exc:
         raise HTTPException(400, f"invalid JSON body: {exc}") from exc
+
+
+def _decode_json(body: bytearray) -> Any:
+    text = body.decode("utf-8", "strict")
+    JSONStructureGuard().feed(text)
+    return json.loads(text)
 
 
 # ------------------------------------------------------------------ read API

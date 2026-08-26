@@ -23,8 +23,9 @@ and the webhook wraps batches of those in
 here may assume it exists. `latency_ms` is null when the response arrived
 without a matching request. Both are ordinary, not corruption.
 
-Everything the row stores is derived; the untouched interaction is kept in
-`raw` so the detail view never shows a lossy reconstruction.
+Everything the row stores is derived; `raw` keeps the interaction for the
+detail view, with credential-bearing headers replaced before persistence.
+Bodies are otherwise unchanged and remain sensitive capture data.
 """
 
 from __future__ import annotations
@@ -36,6 +37,183 @@ from urllib.parse import urlsplit
 
 # Header names are matched case-insensitively throughout: AgentSight preserves
 # whatever the wire carried, and HTTP/2 lowercases while HTTP/1.1 does not.
+
+CREDENTIAL_HEADERS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "api-key",
+        "x-goog-api-key",
+        "x-auth-token",
+        "x-access-token",
+        "x-session-token",
+        "cookie",
+        "set-cookie",
+        "token",
+        "bearer",
+        # DatRail's ticket is itself a bearer credential. RailMon needs it long
+        # enough to attribute an interaction, but RailDash must never persist
+        # or display its value.
+        "x-rail",
+    }
+)
+REDACTED = "[REDACTED-BY-RAILDASH]"
+
+
+def _redact_header_lines(text: str) -> str:
+    """Scrub credentials from the header block of raw HTTP wire text."""
+    changed = False
+    in_headers = True
+    redacting_continuation = False
+    out: list[str] = []
+    for line in text.splitlines(keepends=True):
+        trimmed = line.rstrip("\r\n")
+        ending = line[len(trimmed) :]
+        if not in_headers and _is_http_start_line(trimmed):
+            # One SSL read can contain more than one HTTP message.  A blank
+            # line ends one header block, but a recognised request/status line
+            # starts the next one.
+            in_headers = True
+        if in_headers and not trimmed:
+            in_headers = False
+            redacting_continuation = False
+        if in_headers and trimmed.startswith((" ", "\t")):
+            if redacting_continuation:
+                indentation = trimmed[: len(trimmed) - len(trimmed.lstrip(" \t"))]
+                out.append(f"{indentation}{REDACTED}{ending}")
+                changed = True
+                continue
+            out.append(line)
+            continue
+        redacting_continuation = False
+        if in_headers and ":" in trimmed:
+            name, _value = trimmed.split(":", 1)
+            if name.strip().casefold() in CREDENTIAL_HEADERS:
+                out.append(f"{name}: {REDACTED}{ending}")
+                changed = True
+                redacting_continuation = True
+                continue
+        out.append(line)
+    return "".join(out) if changed else text
+
+
+def _is_http_start_line(line: str) -> bool:
+    """Recognise a request/status line that opens a coalesced header block."""
+    # A Content-Length body does not have to end in CR/LF, so a coalesced
+    # response may look like ``{}HTTP/1.1 200 OK`` on this text line. Inspect
+    # the HTTP-version suffix rather than requiring it to start at byte zero.
+    status_at = line.rfind("HTTP/")
+    if status_at >= 0:
+        status_parts = line[status_at:].split()
+        if (
+            len(status_parts) >= 2
+            and len(status_parts[1]) == 3
+            and status_parts[1].isdigit()
+        ):
+            return True
+    # The same mid-line case applies to a pipelined request.  We cannot know
+    # where arbitrary body text ended, so conservatively recognise a trailing
+    # HTTP version when at least a method/target separator precedes it.
+    request_version_at = line.rfind(" HTTP/")
+    if request_version_at < 0:
+        return False
+    before_version = line[:request_version_at].rstrip()
+    return any(char.isspace() for char in before_version)
+
+
+def _copy_json_tree(value: Any) -> Any:
+    """Copy JSON-compatible containers without recursion.
+
+    Captured request bodies are attacker-influenced.  ``copy.deepcopy`` and a
+    recursive visitor both raise ``RecursionError`` on sufficiently nested
+    values, which used to let one legacy row prevent RailDash from starting.
+    """
+    if isinstance(value, dict):
+        root: dict[Any, Any] | list[Any] = {}
+    elif isinstance(value, list):
+        root = []
+    else:
+        return value
+
+    stack: list[tuple[dict[Any, Any] | list[Any], dict[Any, Any] | list[Any]]] = [
+        (value, root)
+    ]
+    while stack:
+        source, target = stack.pop()
+        children = source.items() if isinstance(source, dict) else enumerate(source)
+        for key, child in children:
+            if isinstance(child, dict):
+                clone: dict[Any, Any] | list[Any] = {}
+            elif isinstance(child, list):
+                clone = []
+            else:
+                if isinstance(target, dict):
+                    target[key] = child
+                else:
+                    target.append(child)
+                continue
+
+            if isinstance(target, dict):
+                target[key] = clone
+            else:
+                target.append(clone)
+            stack.append((child, clone))
+    return root
+
+
+def redact_credential_headers(interaction: dict[str, Any]) -> dict[str, Any]:
+    """Copy an interaction and scrub credentials from every header map.
+
+    RailMon already removes common auth headers, but `x-rail` is intentionally
+    present in its legacy payload so Rail Center can attribute the request.
+    RailDash only needs the boolean produced by `_has_ticket`; keeping the
+    bearer value in SQLite and returning it from the detail API would turn a
+    local traffic viewer into a credential store.
+
+    Runtime-interaction envelopes can contain the legacy event under `raw`, so
+    this walks nested objects rather than assuming headers occur only once.
+    Bodies are otherwise left untouched: their sensitivity is a documented
+    property of a traffic capture, not something this narrow scrub can solve.
+    """
+    scrubbed = _copy_json_tree(interaction)
+    stack: list[Any] = [scrubbed]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                folded = key.casefold() if isinstance(key, str) else ""
+                if folded == "headers" and isinstance(child, dict):
+                    for header in list(child):
+                        if isinstance(header, str) and header.casefold() in CREDENTIAL_HEADERS:
+                            child[header] = REDACTED
+                    stack.append(child)
+                elif folded == "x_rail_header" and child is not None:
+                    value[key] = REDACTED
+                elif isinstance(child, (dict, list)):
+                    stack.append(child)
+        elif isinstance(value, list):
+            for child in value:
+                if isinstance(child, (dict, list)):
+                    stack.append(child)
+    return scrubbed
+
+
+def redact_raw_event(event: dict[str, Any]) -> dict[str, Any]:
+    """Scrub a raw SSL event, including nested AgentSight wire payloads."""
+    scrubbed = redact_credential_headers(event)
+    stack: list[Any] = [scrubbed]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key == "data" and isinstance(child, str):
+                    value[key] = _redact_header_lines(child)
+                elif isinstance(child, (dict, list)):
+                    stack.append(child)
+        elif isinstance(value, list):
+            stack.extend(child for child in value if isinstance(child, (dict, list)))
+    return scrubbed
 
 
 def _header(headers: Any, name: str) -> str | None:
@@ -141,6 +319,23 @@ def _has_ticket(request: dict[str, Any]) -> bool:
     return _header(request.get("headers"), "x-rail") is not None
 
 
+def interaction_has_ticket(interaction: dict[str, Any]) -> bool:
+    """Ticket presence in either legacy-http or RuntimeInteraction shape."""
+    request = interaction.get("request")
+    request = request if isinstance(request, dict) else {}
+    if _has_ticket(request):
+        return True
+    top_level = interaction.get("x_rail_header")
+    if top_level is not None and str(top_level).strip():
+        return True
+    raw = interaction.get("raw")
+    if isinstance(raw, dict):
+        raw_request = raw.get("request")
+        if isinstance(raw_request, dict):
+            return _has_ticket(raw_request)
+    return False
+
+
 def _synthetic_id(interaction: dict[str, Any]) -> str:
     """A stable id for an interaction RailMon did not hash.
 
@@ -194,8 +389,8 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
         "response_size": interaction.get("response_size"),
         "model": _model(request_body) or _model(response_body),
         "tool_calls": _count_tool_calls(request_body) + _count_tool_calls(response_body),
-        "has_ticket": int(_has_ticket(request)),
-        "raw": json.dumps(interaction, default=str),
+        "has_ticket": int(interaction_has_ticket(interaction)),
+        "raw": json.dumps(redact_credential_headers(interaction), default=str),
     }
 
 
