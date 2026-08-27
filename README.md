@@ -83,6 +83,7 @@ sudo railmon collect --mode http \
 | **Where the agent went** | every host, ranked, with its failure count and average latency — click one to filter the log |
 | **Interaction log** | one row per request/response pair, filterable by host, method, status class, and failures only |
 | **Detail** | the full exchange, captured tool names, nearby calls on the same pid/tid, and previous/next error or tool-call navigation; credential headers are redacted before storage, while bodies remain exactly as RailMon captured them |
+| **Observed security profile** | hosts, methods, tool names, models, x-rail presence, and error rate for the selected capture; downloadable as versioned JSON |
 
 Two flags on a row are worth knowing. `n tool` counts `tool_use` blocks in the
 exchange, which is the closest thing in the payload to *the agent took an
@@ -94,6 +95,17 @@ from the same session, process and thread, ordered oldest to newest around the
 selected call. Tool names come only from captured `tool_use` blocks and are
 shown as plain text. The error and tool-call buttons move across the selected
 session even when the relevant interaction is outside the visible log page.
+
+The observed security profile is a portable draft generated from one capture.
+Its JSON identifies itself with `schema_version: "1.0"` and
+`source: "raildash-observed"`. It is intentionally a summary of observed
+facts, not an authoritative Agent Security Profile schema or Rail Center
+score. Credential values are never included; `x-rail` is presence and count
+only. Tool-name aggregation is bounded for availability; the JSON sets
+`tool_names_truncated` if an unusually large capture exceeds that bound.
+Host, method, and model cardinality is bounded similarly, with any affected
+names listed in `truncated_dimensions`. Individual captured labels are also
+bounded there so an adversarial capture cannot create an enormous export.
 
 ## What it does not do
 

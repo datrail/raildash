@@ -17,6 +17,33 @@ servers:
     description: Local development webhook server
 
 paths:
+  /api/profile:
+    get:
+      operationId: downloadObservedProfile
+      summary: Download an observed-only Agent Security Profile draft
+      description: |
+        Summarises facts observed in one RailMon capture. The versioned JSON
+        has source=raildash-observed, contains no credential values, and is not
+        an authoritative Rail Center score.
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Portable observed profile JSON
+          headers:
+            Content-Disposition:
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservedProfile'
+        '404':
+          description: Session not found
+
   /api/interactions/{row_id}:
     get:
       operationId: investigateInteraction
@@ -110,6 +137,61 @@ paths:
 
 components:
   schemas:
+    ObservedValueCount:
+      type: object
+      required: [value, count]
+      properties:
+        value: {type: string}
+        count: {type: integer}
+
+    ObservedProfile:
+      type: object
+      required: [schema_version, source, authoritative, disclaimer, session, observed]
+      properties:
+        schema_version: {type: string, const: '1.0'}
+        source: {type: string, const: raildash-observed}
+        authoritative: {type: boolean, const: false}
+        disclaimer: {type: string}
+        session:
+          type: object
+          required: [id, agent, capture_start]
+          properties:
+            id: {type: string}
+            agent: {type: string}
+            capture_start: {type: string}
+        observed:
+          type: object
+          required: [interaction_count, error_count, error_rate, x_rail, hosts, methods, models, tool_names, tool_names_truncated, truncated_dimensions]
+          properties:
+            interaction_count: {type: integer}
+            error_count: {type: integer}
+            error_rate: {type: number, minimum: 0, maximum: 1}
+            x_rail:
+              type: object
+              required: [present, interaction_count]
+              properties:
+                present: {type: boolean}
+                interaction_count: {type: integer}
+            hosts:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedValueCount'}
+            methods:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedValueCount'}
+            models:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedValueCount'}
+            tool_names:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedValueCount'}
+            tool_names_truncated:
+              type: boolean
+              description: True when safety limits prevented a complete tool-name summary.
+            truncated_dimensions:
+              type: array
+              items: {type: string, enum: [hosts, methods, models, tool_names]}
+              description: Dimensions whose cardinality or value-length safety limit was reached.
+
     InteractionSummary:
       type: object
       required: [id, session_id, tool_calls, has_ticket, tool_names]
