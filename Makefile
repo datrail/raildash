@@ -1,43 +1,7 @@
-.PHONY: test lint serve demo clean stack stack-logs stack-down stack-clean stack-test
+.PHONY: test lint serve demo clean
 
 VENV := .venv
 PY   := $(VENV)/bin/python
-
-RAILMON_REPO ?= https://github.com/datrail/railmon.git
-
-# What `make stack` builds RailMon from. The resulting image runs --privileged
-# with the host PID namespace (eBPF; see docker-compose.yml), so whatever this
-# resolves to gets root-equivalent execution on the machine running the stack.
-# A branch name is a moving target: anyone able to push to it, or to MITM the
-# clone, inherits that.
-#
-# Pin it to anything git can resolve -- tag, branch or commit SHA:
-#
-#   make stack RAILMON_REF=v0.1.0-m2
-#   make stack RAILMON_REF=278c79c
-#
-# (The clone below checks the ref out rather than passing it to `git clone
-# --branch`, which resolves branches and tags only and rejects a SHA outright.)
-#
-# The default is a commit SHA, not a branch, and that is the point: a branch
-# name would mean every `make stack` builds whatever upstream happens to hold
-# at that moment, privileged, on the host. This pin is datrail/railmon master
-# as reviewed for DR-81. It does NOT carry the env-var passthrough, so
-# railmon-webhook-check below stops the stack and says what to pass instead --
-# a loud stop rather than a silently half-wired run, and no moving target
-# either way.
-#
-# When datrail/railmon#9 merges, bump this to that merge commit (or the first
-# release tag containing it). Do not change it back to a branch name.
-RAILMON_REF ?= 278c79c
-
-# One source of truth for the session id both ingestion paths use. RailMon gets
-# it as RAILMON_SESSION_ID (interpolated into docker-compose.yml, which repeats
-# it only as a fallback default); the file-import step below passes the same
-# value as --session-id. They must match, or the webhook and the file land in
-# different sessions and every interaction is counted twice.
-DEMO_SESSION_ID ?= railmon-raildash-stack
-export DEMO_SESSION_ID
 
 # The venv build must not leave a half-made .venv behind. The directory is
 # the make target, so if creation or the install fails partway (no
@@ -69,135 +33,142 @@ demo: $(VENV)
 clean:
 	rm -rf $(VENV) .pytest_cache **/__pycache__ demo.db raildash.db *.db-wal *.db-shm
 
-# DR-81 (BDL-F5) — RailMon + RailDash together, from one command. This repo has
-# no RailMon source and no published RailMon image to build the other service
-# from, so `make stack` clones it into ./railmon first (skipped if already
-# present — delete the directory to force a re-clone). See docker-compose.yml's
-# header and README.md's "Running both together" for why this lives here.
-railmon:
-	git clone $(RAILMON_REPO) railmon || { rm -rf railmon; exit 1; }
-	git -C railmon checkout --detach "$(RAILMON_REF)" || { rm -rf railmon; exit 1; }
-	@printf '%s\n' "$(RAILMON_REF)" > railmon/.railmon-ref
+# ---------------------------------------------------------------- DR-81 stack
+# RailMon + RailDash together, from one command, in two modes (BDL-F5):
+#
+#   make stack-local                              build from source checkouts
+#   make stack RAILMON_TAG=v0.1.1 RAILDASH_TAG=v0.1.0
+#                                                 run the published images
+#
+# Local-built mode assumes the component repos are already checked out:
+# raildash is this directory, railmon a sibling (override with RAILMON_SRC).
+# Registry mode pulls ghcr.io/datrail/{railmon,raildash} at the tags you name.
+# See README.md "Running both together".
+.PHONY: stack stack-local stack-test stack-logs stack-down stack-clean \
+	railmon-src-check _stack-up
 
-# `railmon` above is a directory target, so it does not re-run when only
-# RAILMON_REF changes -- an override against an existing ./railmon would
-# otherwise be silently ignored and appear to have taken effect.
-.PHONY: railmon-ref-check railmon-webhook-check
-railmon-ref-check: railmon
-	@if [ ! -f railmon/.railmon-ref ]; then \
-	  echo "./railmon exists but this Makefile did not clone it (no .railmon-ref)." >&2; \
-	  echo "Nothing here will modify or delete it. Either set RAILMON_REF to the ref" >&2; \
-	  echo "it is actually on, or move it aside and let 'make stack' clone its own." >&2; \
-	  exit 1; \
-	fi; \
-	have=$$(cat railmon/.railmon-ref); \
-	if [ "$$have" != "$(RAILMON_REF)" ]; then \
-	  echo "./railmon was cloned at '$$have', but RAILMON_REF is '$(RAILMON_REF)'." >&2; \
-	  echo "'make stack-clean' will re-clone it (it removes only a clone it made," >&2; \
-	  echo "and only with nothing uncommitted in it)." >&2; \
-	  exit 1; \
-	fi
+RAILMON_SRC ?= ../railmon
+export RAILMON_SRC
 
-# The webhook half of this stack depends on RailMon's demo honouring both
-# RAILMON_WEBHOOK_URL and RAILMON_SESSION_ID, so this greps for both: the URL
-# alone would post to a session id the file import cannot match, which is the
-# double-count this stack exists to avoid. That passthrough is datrail/railmon#9
-# and is not on master yet. Without it the collector is invoked with --output
-# only: the webhook never fires, the file import is the sole ingester, and
-# stack-test's dedup assertion would pass vacuously. Fail here instead, so the
-# stack is never quietly half of what it claims to be.
-railmon-webhook-check: railmon-ref-check
-	@grep -q RAILMON_WEBHOOK_URL railmon/tools/local-demo/run_local_demo.sh 2>/dev/null \
-	  && grep -q RAILMON_SESSION_ID railmon/tools/local-demo/run_local_demo.sh 2>/dev/null || { \
-	  echo "The RailMon at ./railmon (ref '$(RAILMON_REF)') has no RAILMON_WEBHOOK_URL" >&2; \
-	  echo "passthrough, so only the file path would ingest and the webhook path" >&2; \
-	  echo "would never fire. That passthrough is datrail/railmon#9." >&2; \
-	  echo "" >&2; \
-	  echo "Until it lands on master:" >&2; \
-	  echo "  make stack-clean && make stack RAILMON_REF=dr-81-demo-env-passthrough" >&2; \
-	  exit 1; }
+# One source of truth for the session id both ingestion paths use. RailMon
+# gets it as RAILMON_SESSION_ID (interpolated into docker-compose.yml, which
+# repeats it only as a fallback default); the import step below passes the
+# same value as --session-id. They must match, or the webhook and the file
+# land in different sessions and every interaction is counted twice.
+DEMO_SESSION_ID ?= railmon-raildash-stack
+export DEMO_SESSION_ID
 
-# A RailDash database is single-process by design: store.py takes
-# `PRAGMA locking_mode=EXCLUSIVE` so an older process cannot write unredacted
-# rows around a schema migration (DR-20). A second opener therefore gets
-# "database is locked" no matter where the file lives. So the file import runs
-# while the server is stopped and is the sole owner for those few seconds.
-# `docker wait` first, so the capture is complete before it is read. The
-# dashboard is only down during setup, before anyone has opened it.
-stack: railmon-webhook-check
-	docker compose up --build -d
+export RAILMON_TAG RAILDASH_TAG
+
+COMPOSE       := docker compose
+COMPOSE_LOCAL := docker compose -f docker-compose.yml -f docker-compose.build.yml
+
+# Local-built mode needs a RailMon checkout, and one that honours the demo
+# env vars this stack depends on (datrail/railmon#9) -- both of them: the URL
+# alone would post under a session id the file import cannot match, which is
+# the double-count this stack exists to avoid. Without the passthrough the
+# webhook path never fires and the stack is silently half of what it claims,
+# so this fails loudly instead.
+railmon-src-check:
+	@[ -f "$(RAILMON_SRC)/tools/local-demo/run_local_demo.sh" ] || { \
+	  echo "no RailMon checkout at $(RAILMON_SRC) -- clone datrail/railmon there," >&2; \
+	  echo "or point RAILMON_SRC at an existing checkout." >&2; exit 1; }
+	@grep -q RAILMON_WEBHOOK_URL "$(RAILMON_SRC)/tools/local-demo/run_local_demo.sh" \
+	  && grep -q RAILMON_SESSION_ID "$(RAILMON_SRC)/tools/local-demo/run_local_demo.sh" || { \
+	  echo "the RailMon at $(RAILMON_SRC) does not honour RAILMON_WEBHOOK_URL /" >&2; \
+	  echo "RAILMON_SESSION_ID (datrail/railmon#9), so only the file path would" >&2; \
+	  echo "ingest. Update that checkout to a revision that includes it." >&2; exit 1; }
+
+stack-local: railmon-src-check
+	@$(MAKE) --no-print-directory _stack-up COMPOSE_CMD='$(COMPOSE_LOCAL)' UP_FLAGS=--build
+
+# Registry mode. Tags may be git-style (v0.1.0-m2) or image-style (0.1.0-m2);
+# the leading v is stripped to match what container-release.yml publishes. An
+# image predating railmon#9 starts but never posts the webhook -- there is no
+# way to check inside an image up front, so that case is caught at run time
+# by stack-test's delivered-by-webhook assertion instead.
+stack:
+	@[ -n "$(RAILMON_TAG)" ] && [ -n "$(RAILDASH_TAG)" ] || { \
+	  echo "registry mode needs both tags, e.g.:" >&2; \
+	  echo "  make stack RAILMON_TAG=v0.1.1 RAILDASH_TAG=v0.1.0" >&2; \
+	  echo "(or build from checkouts instead: make stack-local)" >&2; exit 1; }
+	@$(MAKE) --no-print-directory _stack-up COMPOSE_CMD='$(COMPOSE)' UP_FLAGS= \
+	  RAILMON_TAG='$(patsubst v%,%,$(RAILMON_TAG))' \
+	  RAILDASH_TAG='$(patsubst v%,%,$(RAILDASH_TAG))'
+
+# Internal: the run sequence both modes share -- one copy, so a fix to the
+# readiness loop or the import cannot land in one mode and miss the other.
+# COMPOSE_CMD is set by stack / stack-local; not for direct invocation.
+#
+# The import runs with the server stopped: a RailDash database is
+# single-process by design (store.py takes PRAGMA locking_mode=EXCLUSIVE so an
+# older process cannot write unredacted rows around a schema migration,
+# DR-20), so a second opener gets "database is locked" wherever the file
+# lives. If the import fails, the dashboard is started again before this
+# target exits -- a failed import must not leave the stack down.
+_stack-up:
+	$(COMPOSE_CMD) up $(UP_FLAGS) -d
 	@echo "waiting for the demo capture to finish..."
-	@code=$$(docker wait "$$(docker compose ps -aq railmon)"); \
+	@code=$$(docker wait "$$($(COMPOSE_CMD) ps -aq railmon)"); \
 	  [ "$$code" = "0" ] || { \
 	    echo "railmon's demo exited $$code -- capture is missing or truncated." >&2; \
-	    echo "see: docker compose logs railmon" >&2; exit 1; }
+	    echo "see: $(COMPOSE_CMD) logs railmon" >&2; exit 1; }
 	@echo "importing the capture file (server paused)..."
-	docker compose stop raildash
-	docker compose run --rm --entrypoint python3 raildash \
+	$(COMPOSE_CMD) stop raildash
+	@if ! $(COMPOSE_CMD) run --rm --entrypoint python3 raildash \
 	  -m raildash.cli --db /data/raildash.db load /captures/capture.jsonl \
-	  --session-id "$(DEMO_SESSION_ID)"
-	docker compose start raildash
+	  --session-id "$(DEMO_SESSION_ID)"; then \
+	  $(COMPOSE_CMD) start raildash; \
+	  echo "the file import failed; the dashboard was restarted without it (see above)" >&2; \
+	  exit 1; \
+	fi
+	$(COMPOSE_CMD) start raildash
 	@ok=0; for i in $$(seq 1 30); do \
 	  if curl -fsS http://127.0.0.1:8000/webhook/health >/dev/null 2>&1; then ok=1; break; fi; \
 	  sleep 1; \
 	done; \
 	[ "$$ok" = "1" ] || { echo "raildash did not come back healthy" >&2; exit 1; }
-	docker compose ps
+	$(COMPOSE_CMD) ps
 	@echo ""
 	@echo "open http://127.0.0.1:8000 -- see README.md 'Running both together'"
 	@echo "tail logs with: make stack-logs"
 
 stack-logs:
-	docker compose logs -f --tail=50
+	$(COMPOSE) logs -f --tail=50
 
 stack-down:
-	docker compose down
+	$(COMPOSE) down
 
 # `down` alone keeps the named volumes, so capture.jsonl (RailMon appends) and
-# raildash.db survive and a second `make stack` shows the first run's rows too.
-# This is the reset that makes the README's "6 interactions" true again.
-# Removes only a ./railmon this Makefile cloned (it leaves a .railmon-ref
-# stamp) and only when it has nothing uncommitted. A hand-made checkout --
-# which is exactly what you have if you are testing datrail/railmon#9 -- is
-# left alone with a message, never deleted.
+# the database survive and a second run shows the first run's rows too. This
+# is the reset that makes the README's first-run numbers true again.
 stack-clean:
-	docker compose down -v
-	@if [ ! -d railmon ]; then :; \
-	elif [ ! -f railmon/.railmon-ref ]; then \
-	  echo "./railmon has no .railmon-ref stamp, so this Makefile did not clone it." >&2; \
-	  echo "Leaving it alone. Remove it yourself if that is what you meant." >&2; \
-	elif [ -n "$$(git -C railmon status --porcelain 2>/dev/null)" ]; then \
-	  echo "./railmon has uncommitted changes. Leaving it alone." >&2; \
-	  echo "Commit, stash, or move it aside first." >&2; \
-	else rm -rf railmon; fi
+	$(COMPOSE) down -v
 
-# Compose-level smoke test: raildash up, demo capture, file import, then check
-# that what got stored equals what actually got captured -- not just "greater
-# than zero". A dedup regression (the two wirings landing in different sessions)
-# shows up as stored > file_lines, which "count > 0" alone would never catch.
-# One shell with a trap, so teardown runs even when an early step fails --
-# otherwise the failure this target exists to catch leaves containers and both
-# volumes up, and the next run starts dirty. `down -v` because the volumes are
-# the dirty part: capture.jsonl appends and the database persists, so keeping
-# them makes each run's numbers depend on the last. The count is also scoped to
-# this session id, since /api/overview aggregates the whole database.
-stack-test: railmon-webhook-check
+# Compose-level smoke test, in local-built mode: raildash up, demo capture,
+# file import, then check that what got stored equals what actually got
+# parsed out of the capture -- not just "greater than zero". The count is
+# scoped to this session id (/api/overview aggregates the whole database),
+# the trap tears the volumes down even on the failure this exists to catch,
+# and the delivered-by-webhook assertion fails when only the file path
+# ingested -- the case where the dedup check would otherwise pass vacuously.
+stack-test: railmon-src-check
 	@set -e; \
-	trap 'docker compose down -v' EXIT; \
-	docker compose up --build -d raildash; \
-	docker compose up --build --exit-code-from railmon railmon; \
-	docker compose stop raildash; \
-	import_out=$$(docker compose run --rm --entrypoint python3 raildash \
+	trap '$(COMPOSE_LOCAL) down -v' EXIT; \
+	$(COMPOSE_LOCAL) up --build -d raildash; \
+	$(COMPOSE_LOCAL) up --build --exit-code-from railmon railmon; \
+	$(COMPOSE_LOCAL) stop raildash; \
+	import_out=$$($(COMPOSE_LOCAL) run --rm --entrypoint python3 raildash \
 	  -m raildash.cli --db /data/raildash.db load /captures/capture.jsonl \
 	  --session-id "$(DEMO_SESSION_ID)"); \
 	printf '%s\n' "$$import_out"; \
-	docker compose start raildash; \
+	$(COMPOSE_LOCAL) start raildash; \
 	ok=0; for i in $$(seq 1 30); do \
 	  if curl -fsS http://127.0.0.1:8000/webhook/health >/dev/null 2>&1; then ok=1; break; fi; \
 	  sleep 1; \
 	done; \
 	[ "$$ok" = "1" ] || { echo "raildash did not come back healthy" >&2; exit 1; }; \
-	capture=$$(docker compose exec -T raildash cat /captures/capture.jsonl) \
+	capture=$$($(COMPOSE_LOCAL) exec -T raildash cat /captures/capture.jsonl) \
 	  || { echo "stack-test: could not read /captures/capture.jsonl" >&2; exit 1; }; \
 	file_lines=$$(printf '%s\n' "$$capture" | grep -c . || true); \
 	[ "$$file_lines" -gt 0 ] || { echo "stack-test: capture.jsonl is empty -- RailMon captured nothing" >&2; exit 1; }; \
@@ -208,7 +179,7 @@ stack-test: railmon-webhook-check
 	[ "$$total" -gt 0 ] || { echo "stack-test: the import parsed no interactions out of $$file_lines line(s)" >&2; exit 1; }; \
 	[ "$$total" -eq "$$file_lines" ] || echo "stack-test: note -- $$file_lines line(s) in capture.jsonl, $$total parsed (truncated or unparseable tail)" >&2; \
 	stored=$$(curl -fsS "http://127.0.0.1:8000/api/overview?session_id=$(DEMO_SESSION_ID)" | python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["interactions"])'); \
-	echo "capture.jsonl lines: $$file_lines, interactions stored: $$stored"; \
+	echo "capture parsed: $$total, interactions stored: $$stored"; \
 	[ "$$stored" -gt 0 ] || { echo "stack-test: expected interactions > 0, got $$stored" >&2; exit 1; }; \
 	[ "$$duplicate" -eq "$$total" ] || { echo "stack-test: the webhook path did not deliver -- the import found $$duplicate of $$total already present, so it ingested them itself. Both paths must be wired for this assertion to mean anything." >&2; exit 1; }; \
 	[ "$$inserted" = "0" ] || { echo "stack-test: the import inserted $$inserted row(s) the webhook should already have delivered" >&2; exit 1; }; \

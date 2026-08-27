@@ -79,48 +79,52 @@ sudo railmon collect --mode http \
 
 The two sections above are RailMon and RailDash run and wired by hand. This
 repo also ships a `docker compose` stack that does both automatically, with
-both wirings active at once:
+both of RailMon's output paths wired at once. It runs in two modes.
+
+**Local-built** — build from source. Assumes the component repos are already
+checked out: this one, and a RailMon checkout at `../railmon` (override with
+`RAILMON_SRC=/path/to/railmon`). That checkout must include RailMon's demo
+env-var passthrough ([datrail/railmon#9](https://github.com/datrail/railmon/pull/9));
+`make stack-local` checks and stops with instructions if it does not.
 
 ```bash
 git clone https://github.com/datrail/raildash.git
+git clone https://github.com/datrail/railmon.git
 cd raildash
-make stack
+make stack-local
 ```
 
-> **Requires RailMon's env-var passthrough.** The webhook half of this stack
-> needs `datrail/railmon`'s demo to honour `RAILMON_WEBHOOK_URL`, which is
-> [datrail/railmon#9](https://github.com/datrail/railmon/pull/9) and is not on
-> `master` yet. `make stack` checks for it and stops with instructions rather
-> than running half-wired; until it merges, use
-> `make stack RAILMON_REF=dr-81-demo-env-passthrough`. Pin RailMon to any tag,
-> branch or commit the same way. The default is a commit SHA rather than a
-> branch on purpose: the RailMon image runs privileged with the host PID
-> namespace, so a moving upstream ref would mean root-equivalent execution on
-> your machine from whatever that branch holds today.
+**From published images** — no source builds; pulls
+`ghcr.io/datrail/railmon` and `ghcr.io/datrail/raildash` at the tags you
+name. Git-style (`v0.1.0-m2`) and image-style (`0.1.0-m2`) tags both work —
+the leading `v` is stripped to match what the release workflow publishes.
 
-`make stack` clones `datrail/railmon` into `./railmon` (this repo has no
-RailMon source of its own — see `docker-compose.yml`'s header for why that is
-a clone-as-bootstrap step rather than a reason to vendor a copy), builds both
-images, and brings the stack up: RailMon runs its own local quickstart demo
-(a real, local, offline HTTPS exchange it generates and taps itself — see
-RailMon's `tools/local-demo/README.md` — not a connection to any real agent),
-posting to this dashboard's webhook *and* writing to a file RailDash then
-imports, so a first run shows something without anything else having to be
-running first.
+```bash
+make stack RAILMON_TAG=v0.1.1 RAILDASH_TAG=v0.1.0
+```
 
-**You should see**, a few seconds after `docker compose ps` prints: RailMon's
-container ran once and exited 0 (expected — the demo capture finishes and
-stops, it is not a long-running collector), the file-import step reporting
-`6 already present, skipped`, and <http://127.0.0.1:8000> showing **6
-interactions** against `127.0.0.1:8443`, all `POST`, all `200`, across
-`/v1/demo` and `/v1/demo/other`.
+While the datrail repos are private their packages are too, so `docker login
+ghcr.io` with a GitHub PAT (`read:packages`) first. The RailMon tag must
+contain the passthrough from railmon#9 — an older image starts, but its demo
+never posts the webhook; there is no way to check an image up front, so
+`make stack-test` catches that case at run time rather than letting it pass.
+RailDash's own image is published by this repository's
+`.github/workflows/container-release.yml` (added alongside this stack, copied
+from RailMon's): pushing a `vX.Y.Z` git tag is what produces it.
+
+**You should see**, in either mode, a few seconds after `docker compose ps`
+prints: RailMon's container ran once and exited 0 (expected — the demo
+capture finishes and stops, it is not a long-running collector), the
+file-import step reporting `6 already present, skipped`, and
+<http://127.0.0.1:8000> showing **6 interactions** against `127.0.0.1:8443`,
+all `POST`, all `200`, across `/v1/demo` and `/v1/demo/other`.
 
 Six, from three requests, is correct and worth understanding before you read
 it as a bug. RailMon's demo taps by process name (`--comm python3`), and both
 ends of the exchange — `demo_server.py` and `demo_client.py` — are `python3`,
 so each request is captured twice: once as the client sent it, once as the
 server received it. They are two genuine observations of one exchange, with
-different `pid`s, not one row written twice. In the interaction log they show
+different `pid`s, not one row written twice; in the interaction log they show
 as pairs sharing a timestamp to the millisecond. See RailMon's
 `tools/local-demo/README.md` for why the demo filters that broadly.
 
@@ -128,42 +132,37 @@ as pairs sharing a timestamp to the millisecond. See RailMon's
 ingestion paths would produce if they were wired naively. The file-import
 step reporting `6 already present, skipped` is the dedup working: the webhook
 delivered those 6 while RailMon ran, and the import then recognised every one
-rather than adding a second copy. `make stack-test` asserts this
-automatically (stored count == `capture.jsonl` line count) rather than
-leaving it to be eyeballed.
-
-Both wirings land on the same interactions without double-counting only
-because they are told the same session id — `DEMO_SESSION_ID` in the
+rather than adding a second copy. Both wirings land on the same interactions
+only because they are told the same session id — `DEMO_SESSION_ID` in the
 `Makefile` is the single source, reaching RailMon as `RAILMON_SESSION_ID` and
-the import step as `--session-id`. The JSONL file carries no session id of its
-own, and this dashboard's dedup index is `(session_id, interaction_id)`, not
-`interaction_id` alone. Wiring the two paths up with mismatched session ids —
-which is what happens if you copy this pattern without also fixing the session
-id — silently doubles every count instead of erroring.
+the import step as `--session-id`. The JSONL file carries no session id of
+its own, and this dashboard's dedup index is `(session_id, interaction_id)`,
+not `interaction_id` alone; mismatched ids silently double every count
+instead of erroring. `make stack-test` asserts all of this — including that
+the webhook actually delivered — rather than leaving it to be eyeballed.
 
-`make stack` briefly stops the dashboard to run that import, and you will see
-it in the output. That follows directly from the single-process rule in
-**Storage** above: RailDash holds an exclusive SQLite lock, so `raildash load`
-cannot open the database while `raildash serve` has it, wherever that database
-lives. Pausing the server makes the import the sole owner for those few
-seconds, which keeps the file path on `raildash load` — RailDash's real
-documented import command — rather than faking it by POSTing the file to the
-webhook. The pause happens during setup, before anyone has opened the
-dashboard. The alternative the Storage section names, a separate `--db` path,
-would defeat the point here: the two ingestion paths have to land in one
-database to be deduplicated against each other.
+The stack briefly stops the dashboard to run that import, and you will see it
+in the output. That follows from the single-process rule in **Storage**
+above: RailDash holds an exclusive SQLite lock, so `raildash load` cannot
+open the database while the server has it, wherever that database lives.
+Pausing the server makes the import the sole owner for those few seconds,
+keeping the file path on `raildash load` — the real documented import
+command — rather than faking it by POSTing the file to the webhook. If the
+import fails, the dashboard is started again before the command exits. The
+separate `--db` path the Storage section suggests would defeat the point
+here: the two ingestion paths have to land in one database to be
+deduplicated against each other.
 
-Those numbers describe a first run on empty volumes. `make stack-down` stops
-the stack but keeps them, and RailMon's capture file appends rather than
-truncating, so a second `make stack` shows both runs — 12 interactions, not 6,
-and correctly so. `make stack-clean` removes the volumes and the cloned
-`railmon/`, which is what makes the counts above true again. `make stack-test`
-always tears its volumes down, so its assertion does not depend on what ran
-before it.
+Those first-run numbers describe empty volumes. `make stack-down` stops the
+stack but keeps them, and RailMon's capture file appends rather than
+truncating, so a second run shows both runs — 12 interactions, and correctly
+so. `make stack-clean` removes the volumes, which is what makes the counts
+above true again; `make stack-test` always tears its volumes down, so its
+assertions never depend on what ran before it.
 
 Stopping RailMon (`docker compose stop railmon`) leaves the dashboard serving
-what it already has, same as the "no control plane" reasoning above — the file
-path is passive and the webhook path only ever pushed.
+what it already has, same as the "no control plane" reasoning above — the
+file path is passive and the webhook path only ever pushed.
 
 ## What it shows
 

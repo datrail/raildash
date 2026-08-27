@@ -1,0 +1,16 @@
+# Local-built mode override: build both images from source instead of pulling.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up --build
+#
+# (or just `make stack-local`). Assumes the component repos are already
+# checked out: raildash is this directory; railmon defaults to the sibling
+# checkout ../railmon (override with RAILMON_SRC). The Makefile's
+# railmon-src-check verifies that checkout exists and honours the demo env
+# vars this stack depends on (datrail/railmon#9) before anything builds.
+services:
+  raildash:
+    image: raildash:local
+    build: .
+  railmon:
+    image: railmon:local
+    build: ${RAILMON_SRC:-../railmon}
