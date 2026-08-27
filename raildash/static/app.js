@@ -16,6 +16,8 @@ const state = {
   offset: 0,
   limit: 100,
   total: 0,
+  driftLeft: null,
+  driftRight: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -147,6 +149,27 @@ async function loadSessions() {
     li.append(btn);
     list.append(li);
   });
+  syncDriftSelectors(sessions);
+}
+
+function syncDriftSelectors(sessions) {
+  const ids = sessions.map((session) => session.session_id);
+  if (!ids.includes(state.driftRight)) state.driftRight = ids[0] || null;
+  if (!ids.includes(state.driftLeft)) state.driftLeft = ids[1] || ids[0] || null;
+
+  [["drift-left", state.driftLeft], ["drift-right", state.driftRight]].forEach(
+    ([id, selected]) => {
+      const select = $(id);
+      select.replaceChildren();
+      ids.forEach((sessionId) => {
+        const option = el("option", null, sessionId);
+        option.value = sessionId;
+        select.append(option);
+      });
+      select.value = selected || "";
+      select.disabled = ids.length === 0;
+    }
+  );
 }
 
 /* ---------------------------------------------------------------- overview */
@@ -234,6 +257,110 @@ async function loadProfile() {
   grid.append(profileValues("Methods", observed.methods || []));
   grid.append(profileValues("Tools", observed.tool_names || []));
   grid.append(profileValues("Models", observed.models || []));
+}
+
+function changedValues(before, after) {
+  const previous = new Set((before || []).map((item) => item.value));
+  const current = new Set((after || []).map((item) => item.value));
+  return {
+    added: [...current].filter((item) => !previous.has(item)).sort(),
+    removed: [...previous].filter((item) => !current.has(item)).sort(),
+  };
+}
+
+function driftLabels(title, change, incomplete) {
+  const section = el("section", "drift-group");
+  section.append(el("h3", null, title));
+  if (incomplete) {
+    section.append(el("p", "note", "Comparison incomplete because one or both profiles truncated this dimension."));
+    return section;
+  }
+  [["Added", change.added], ["Removed", change.removed]].forEach(
+    ([label, items]) => {
+      const row = el("div", "drift-change");
+      row.append(el("span", "drift-kind", label));
+      if (!items.length) row.append(el("span", "muted", "None"));
+      items.forEach((item) => row.append(el("span", "drift-label", item)));
+      section.append(row);
+    }
+  );
+  return section;
+}
+
+function signed(value, formatter) {
+  if (value === null) return "not captured";
+  if (value === 0) return formatter(0);
+  return `${value > 0 ? "+" : "−"}${formatter(Math.abs(value))}`;
+}
+
+async function loadDrift() {
+  const generation = ++driftGeneration;
+  const leftSession = state.driftLeft;
+  const rightSession = state.driftRight;
+  const body = $("drift-body");
+  body.replaceChildren();
+  if (!leftSession || !rightSession) {
+    body.append(el("p", "muted", "Two captured sessions are needed for comparison."));
+    return;
+  }
+  if (leftSession === rightSession) {
+    body.append(el("p", "note", "The same session is selected on both sides; no drift to compare."));
+    return;
+  }
+
+  try {
+    // The app has one SQLite connection. Keep these reads sequential so a
+    // comparison that includes the selected session cannot overlap the main
+    // summary's overview query on that connection.
+    const leftProfile = await getJSON("/api/profile", { session_id: leftSession });
+    if (generation !== driftGeneration) return;
+    const rightProfile = await getJSON("/api/profile", { session_id: rightSession });
+    if (generation !== driftGeneration) return;
+    const leftOverview = await getJSON("/api/overview", { session_id: leftSession });
+    if (generation !== driftGeneration) return;
+    const rightOverview = await getJSON("/api/overview", { session_id: rightSession });
+    if (generation !== driftGeneration) return;
+    const before = leftProfile.observed || {};
+    const after = rightProfile.observed || {};
+    if (!before.interaction_count || !after.interaction_count) {
+      body.append(el("p", "note", "One or both selected sessions are empty; observed label and metric changes may be incomplete."));
+    }
+
+    const labels = el("div", "drift-grid");
+    const incomplete = (dimension) =>
+      (before.truncated_dimensions || []).includes(dimension) ||
+      (after.truncated_dimensions || []).includes(dimension) ||
+      (dimension === "tool_names" &&
+        (before.tool_names_truncated || after.tool_names_truncated));
+    labels.append(driftLabels("Hosts", changedValues(before.hosts, after.hosts), incomplete("hosts")));
+    labels.append(driftLabels("Tools", changedValues(before.tool_names, after.tool_names), incomplete("tool_names")));
+    labels.append(driftLabels("Models", changedValues(before.models, after.models), incomplete("models")));
+    body.append(labels);
+
+    const leftTotals = leftOverview.totals || {};
+    const rightTotals = rightOverview.totals || {};
+    const leftBytes = (leftTotals.request_bytes || 0) + (leftTotals.response_bytes || 0);
+    const rightBytes = (rightTotals.request_bytes || 0) + (rightTotals.response_bytes || 0);
+    const latencyDelta = typeof leftTotals.avg_latency_ms === "number" &&
+      typeof rightTotals.avg_latency_ms === "number"
+      ? rightTotals.avg_latency_ms - leftTotals.avg_latency_ms
+      : null;
+    const metrics = el("dl", "drift-metrics");
+    [
+      ["Error rate", signed((after.error_rate || 0) - (before.error_rate || 0),
+        (value) => `${(value * 100).toFixed(1)} pp`)],
+      ["Average latency", signed(latencyDelta, (value) => fmtMs(value))],
+      ["Transferred bytes", signed(rightBytes - leftBytes, (value) => fmtBytes(value))],
+    ].forEach(([label, value]) => {
+      metrics.append(el("dt", null, label));
+      metrics.append(el("dd", null, value));
+    });
+    body.append(metrics);
+  } catch (error) {
+    if (generation !== driftGeneration) return;
+    body.append(el("p", "note", "Comparison data is unavailable for one or both sessions."));
+    console.error(error);
+  }
 }
 
 function renderHosts(hosts) {
@@ -500,6 +627,7 @@ function closeDetail() {
 /* ------------------------------------------------------------------- wiring */
 
 let refreshing = false;
+let driftGeneration = 0;
 
 async function refresh() {
   if (refreshing) return;
@@ -508,6 +636,7 @@ async function refresh() {
     await loadSessions();
     renderActiveFilter();
     await Promise.all([loadOverview(), loadProfile(), loadLog()]);
+    await loadDrift();
     await loadFilterOptions();
     setConn("live", "live");
   } catch (err) {
@@ -567,6 +696,14 @@ function init() {
   initTheme();
 
   $("refresh").addEventListener("click", refresh);
+  $("drift-left").addEventListener("change", (event) => {
+    state.driftLeft = event.target.value;
+    loadDrift();
+  });
+  $("drift-right").addEventListener("change", (event) => {
+    state.driftRight = event.target.value;
+    loadDrift();
+  });
 
   const rerun = () => {
     state.offset = 0;

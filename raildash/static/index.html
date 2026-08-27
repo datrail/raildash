@@ -86,6 +86,30 @@
       </div>
     </section>
 
+    <!-- Capture drift --------------------------------------------------- -->
+    <section class="panel drift" aria-labelledby="drift-h">
+      <div class="panel-head">
+        <div>
+          <h2 id="drift-h">Capture drift</h2>
+          <span class="hint">Neutral observed changes between two sessions</span>
+        </div>
+        <div class="drift-selectors">
+          <label class="field">
+            <span>From</span>
+            <select id="drift-left"></select>
+          </label>
+          <span aria-hidden="true">→</span>
+          <label class="field">
+            <span>To</span>
+            <select id="drift-right"></select>
+          </label>
+        </div>
+      </div>
+      <div class="drift-body" id="drift-body">
+        <p class="muted">Two captured sessions are needed for comparison.</p>
+      </div>
+    </section>
+
     <!-- Hosts ----------------------------------------------------------- -->
     <section class="panel" aria-labelledby="hosts-h">
       <div class="panel-head">

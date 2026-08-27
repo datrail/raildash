@@ -84,6 +84,7 @@ sudo railmon collect --mode http \
 | **Interaction log** | one row per request/response pair, filterable by host, method, status class, and failures only |
 | **Detail** | the full exchange, captured tool names, nearby calls on the same pid/tid, and previous/next error or tool-call navigation; credential headers are redacted before storage, while bodies remain exactly as RailMon captured them |
 | **Observed security profile** | hosts, methods, tool names, models, x-rail presence, and error rate for the selected capture; downloadable as versioned JSON |
+| **Capture drift** | neutral added/removed hosts, tools, and models plus error-rate, average-latency, and byte deltas between two sessions |
 
 Two flags on a row are worth knowing. `n tool` counts `tool_use` blocks in the
 exchange, which is the closest thing in the payload to *the agent took an
@@ -106,6 +107,11 @@ only. Tool-name aggregation is bounded for availability; the JSON sets
 Host, method, and model cardinality is bounded similarly, with any affected
 names listed in `truncated_dimensions`. Individual captured labels are also
 bounded there so an adversarial capture cannot create an enormous export.
+
+Capture drift compares two observed profiles and their overview totals. It
+reports additions, removals, and numeric deltas without assigning a risk
+score. Selecting the same session, an empty capture, or unavailable comparison
+data produces an explicit message rather than an invented zero.
 
 ## What it does not do
 
