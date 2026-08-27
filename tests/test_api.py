@@ -927,3 +927,22 @@ def test_observed_profile_ui_is_present_and_text_only(client):
     assert 'id="profile-download"' in html
     assert "not an authoritative Rail Center score" in html
     assert 'el("span", "profile-value", item.value)' in js
+
+
+def test_capture_drift_ui_uses_existing_profile_and_overview_apis(client):
+    html = client.get("/").text
+    js = client.get("/app.js").text
+
+    assert "Capture drift" in html
+    assert 'id="drift-left"' in html
+    assert 'id="drift-right"' in html
+    assert 'getJSON("/api/profile"' in js
+    assert 'getJSON("/api/overview"' in js
+    assert 'el("span", "drift-label", item)' in js
+    assert "same session is selected" in js
+    assert "selected sessions are empty" in js
+    assert "Comparison data is unavailable" in js
+    assert "truncated_dimensions" in js
+    assert "generation !== driftGeneration" in js
+    assert "Comparison incomplete" in js
+    assert "risk score" not in html.lower()
