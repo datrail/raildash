@@ -65,6 +65,25 @@ def main() -> int:
         if sink in js:
             problems.append(f"app.js: {sink} would render captured traffic as markup")
 
+    for interaction_id in (
+        "previous-error",
+        "next-error",
+        "previous-tool",
+        "next-tool",
+    ):
+        if interaction_id not in ids_in_html:
+            problems.append(
+                f'index.html: interaction investigation control "{interaction_id}" is missing'
+            )
+
+    if 'sequence.id = "nearby-interactions"' not in js:
+        problems.append("app.js: nearby interaction sequence is missing")
+
+    if "tool_names.forEach" not in js or 'el("span", "tool-name", name)' not in js:
+        problems.append(
+            "app.js: captured tool names must be rendered through textContent-backed el()"
+        )
+
     # Every colour must come from a token, so both themes stay complete. A
     # literal in a component rule is the classic one-theme-only bug: it looks
     # right in whichever theme it was written against and wrong in the other.

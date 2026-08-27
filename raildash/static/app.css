@@ -488,6 +488,40 @@ td.num { font-variant-numeric: tabular-nums; }
   font-family: var(--mono); font-size: 14px; overflow-wrap: anywhere;
 }
 
+.investigation-nav {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 9px 15px;
+  border-bottom: 1px solid var(--line);
+}
+
+.investigation-tools, .nearby { display: grid; gap: 7px; }
+.investigation-tools h3, .nearby h3 {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.09em;
+  color: var(--ink-faint);
+}
+.tool-name {
+  display: inline-block; width: fit-content;
+  padding: 2px 6px;
+  font-family: var(--mono); font-size: 11px;
+  color: var(--accent); background: var(--accent-soft);
+  border: 1px solid var(--accent); border-radius: var(--r);
+  overflow-wrap: anywhere;
+}
+.nearby-list { display: grid; gap: 5px; margin: 0; padding: 0; list-style: none; }
+.nearby-interaction {
+  width: 100%; display: grid;
+  grid-template-columns: 90px minmax(0, 1fr) auto;
+  align-items: center; gap: 8px;
+  padding: 7px 8px; text-align: left; cursor: pointer;
+  color: var(--ink); background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--r);
+}
+.nearby-interaction:hover { background: var(--surface-sunk); }
+.nearby-interaction[data-current="true"] { border-color: var(--accent); }
+.nearby-time, .nearby-target { font-family: var(--mono); font-size: 11px; }
+.nearby-time { color: var(--ink-faint); }
+.nearby-target { overflow-wrap: anywhere; }
+
 .detail-body { overflow-y: auto; padding: 15px; display: grid; gap: 16px; }
 
 .kv {

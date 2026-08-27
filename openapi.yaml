@@ -17,6 +17,30 @@ servers:
     description: Local development webhook server
 
 paths:
+  /api/interactions/{row_id}:
+    get:
+      operationId: investigateInteraction
+      summary: Inspect an interaction in its captured sequence
+      description: |
+        Returns the credential-redacted exchange, nearby interactions from the
+        same session and pid/tid in timestamp order, captured tool_use names,
+        and previous/next error and tool-call row identifiers.
+      parameters:
+        - name: row_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Interaction investigation detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InteractionInvestigation'
+        '404':
+          description: Interaction not found
+
   /webhook/events:
     post:
       operationId: receiveEvents
@@ -86,6 +110,57 @@ paths:
 
 components:
   schemas:
+    InteractionSummary:
+      type: object
+      required: [id, session_id, tool_calls, has_ticket, tool_names]
+      properties:
+        id: {type: integer}
+        session_id: {type: string}
+        interaction_id: {type: [string, 'null']}
+        timestamp: {type: [string, 'null']}
+        timestamp_ns: {type: [integer, 'null']}
+        pid: {type: [integer, 'null']}
+        tid: {type: [integer, 'null']}
+        method: {type: [string, 'null']}
+        host: {type: [string, 'null']}
+        path: {type: [string, 'null']}
+        status_code: {type: [integer, 'null']}
+        latency_ms: {type: [number, 'null']}
+        tool_calls: {type: integer}
+        has_ticket:
+          type: integer
+          description: Ticket presence as 0 or 1; the credential value is never returned.
+        tool_names:
+          type: array
+          items: {type: string}
+          description: Untrusted text derived from captured tool_use blocks.
+
+    InteractionNavigation:
+      type: object
+      required: [previous_error, next_error, previous_tool_call, next_tool_call]
+      properties:
+        previous_error: {type: [integer, 'null']}
+        next_error: {type: [integer, 'null']}
+        previous_tool_call: {type: [integer, 'null']}
+        next_tool_call: {type: [integer, 'null']}
+
+    InteractionInvestigation:
+      allOf:
+        - $ref: '#/components/schemas/InteractionSummary'
+        - type: object
+          required: [raw, nearby, navigation]
+          properties:
+            raw:
+              type: object
+              description: Captured interaction with credential headers redacted.
+            nearby:
+              type: array
+              description: Same-session pid/tid interactions ordered by timestamp.
+              items:
+                $ref: '#/components/schemas/InteractionSummary'
+            navigation:
+              $ref: '#/components/schemas/InteractionNavigation'
+
     # ---- Raw SSL Event (directly from sslsniff) ----
     SslEvent:
       type: object

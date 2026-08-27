@@ -100,6 +100,126 @@ def test_detail_returns_the_interaction_with_credentials_redacted(client):
     assert detail["raw"]["response"]["status_code"] == 200
 
 
+def test_store_investigation_orders_same_process_thread_fixture_sequence(client):
+    rows = client.get("/api/interactions").json()["items"]
+    target = next(row for row in rows if row["status_code"] == 403)
+
+    investigation = app_module.store.investigation(target["id"])
+
+    assert investigation is not None
+    nearby = investigation["nearby"]
+    assert [row["timestamp"] for row in nearby] == sorted(
+        row["timestamp"] for row in nearby
+    )
+    assert {(row["pid"], row["tid"]) for row in nearby} == {(4021, 4030)}
+    assert any(row["id"] == target["id"] for row in nearby)
+
+
+def test_fixture_tool_names_come_from_captured_tool_use_blocks(client):
+    rows = client.get("/api/interactions").json()["items"]
+    target = next(row for row in rows if row["timestamp"] == "2026-08-15T17:04:11Z")
+
+    detail = client.get(f"/api/interactions/{target['id']}").json()
+
+    assert detail["tool_names"] == ["delivery_track_package"]
+
+
+def test_investigation_api_provides_error_and_tool_navigation(client):
+    rows = client.get("/api/interactions").json()["items"]
+    target = next(row for row in rows if row["status_code"] == 500)
+
+    detail = client.get(f"/api/interactions/{target['id']}").json()
+
+    assert detail["navigation"] == {
+        "previous_error": next(row["id"] for row in rows if row["status_code"] == 429),
+        "next_error": next(row["id"] for row in rows if row["status_code"] == 403),
+        "previous_tool_call": next(
+            row["id"] for row in rows if row["timestamp"] == "2026-08-15T17:04:17.274000Z"
+        ),
+        "next_tool_call": None,
+    }
+
+
+def test_investigation_uses_wall_clock_when_timestamp_ns_is_missing(client):
+    interactions = [
+        {
+            "interaction_id": interaction_id,
+            "timestamp": timestamp,
+            "pid": 9,
+            "tid": 10,
+            "request": {"method": "GET", "path": f"/{interaction_id}"},
+            "response": {"status_code": status},
+        }
+        for interaction_id, timestamp, status in (
+            ("last", "2026-08-15T18:00:03Z", 403),
+            ("first", "2026-08-15T18:00:01Z", 429),
+            ("middle", "2026-08-15T18:00:02Z", 500),
+        )
+    ]
+    client.post(
+        "/webhook/http-interactions",
+        json={"session_id": "no-monotonic-clock", "interactions": interactions},
+    ).raise_for_status()
+    rows = client.get(
+        "/api/interactions", params={"session_id": "no-monotonic-clock"}
+    ).json()["items"]
+    by_interaction = {row["interaction_id"]: row for row in rows}
+
+    detail = client.get(
+        f"/api/interactions/{by_interaction['middle']['id']}"
+    ).json()
+
+    assert [row["interaction_id"] for row in detail["nearby"]] == [
+        "first",
+        "middle",
+        "last",
+    ]
+    assert detail["navigation"]["previous_error"] == by_interaction["first"]["id"]
+    assert detail["navigation"]["next_error"] == by_interaction["last"]["id"]
+
+
+def test_tool_names_and_navigation_never_expose_credentials(client):
+    credential = "Bearer-never-return-this"
+    malicious_name = '<img src=x onerror="alert(1)">'
+    posted = client.post(
+        "/webhook/http-interactions",
+        json={
+            "session_id": "untrusted-tools",
+            "interactions": [
+                {
+                    "timestamp": "2026-08-15T18:00:00Z",
+                    "timestamp_ns": 1,
+                    "pid": 1,
+                    "tid": 2,
+                    "request": {
+                        "method": "POST",
+                        "path": "/v1/messages",
+                        "headers": {"authorization": credential},
+                    },
+                    "response": {
+                        "status_code": 200,
+                        "body": {
+                            "content": [{"type": "tool_use", "name": malicious_name}]
+                        },
+                    },
+                }
+            ],
+        },
+    ).json()
+    row = client.get(
+        "/api/interactions", params={"session_id": posted["session_id"]}
+    ).json()["items"][0]
+
+    detail = client.get(f"/api/interactions/{row['id']}").json()
+    rendered = json.dumps(detail)
+
+    assert detail["tool_names"] == [malicious_name]
+    assert credential not in rendered
+    assert detail["raw"]["request"]["headers"]["authorization"] == (
+        "[REDACTED-BY-RAILDASH]"
+    )
+
+
 def test_missing_interaction_is_404(client):
     assert client.get("/api/interactions/999999").status_code == 404
 

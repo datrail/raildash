@@ -344,6 +344,49 @@ async function openDetail(rowId) {
   const body = $("detail-body");
   body.replaceChildren();
 
+  const nav = data.navigation || {};
+  [
+    ["previous-error", nav.previous_error],
+    ["next-error", nav.next_error],
+    ["previous-tool", nav.previous_tool_call],
+    ["next-tool", nav.next_tool_call],
+  ].forEach(([id, target]) => {
+    const button = $(id);
+    button.disabled = !target;
+    button.onclick = target ? () => openDetail(target) : null;
+  });
+
+  if (data.tool_names && data.tool_names.length) {
+    const tools = el("section", "investigation-tools");
+    tools.append(el("h3", null, "Captured tool names"));
+    data.tool_names.forEach((name) => {
+      tools.append(el("span", "tool-name", name));
+    });
+    body.append(tools);
+  }
+
+  const sequence = el("section", "nearby");
+  sequence.append(el("h3", null, "Nearby on the same pid / tid"));
+  const sequenceList = el("ol", "nearby-list");
+  (data.nearby || []).forEach((row) => {
+    const item = el("li");
+    const button = el("button", "nearby-interaction");
+    button.type = "button";
+    button.dataset.current = String(row.id === data.id);
+    button.append(el("span", "nearby-time", fmtTime(row.timestamp)));
+    button.append(el("span", "nearby-target", `${row.method || "—"} ${row.host || "—"}${row.path || ""}`));
+    button.append(statusPill(row.status_code));
+    (row.tool_names || []).forEach((name) => {
+      button.append(el("span", "tool-name", name));
+    });
+    button.addEventListener("click", () => openDetail(row.id));
+    item.append(button);
+    sequenceList.append(item);
+  });
+  sequence.append(sequenceList);
+  sequence.id = "nearby-interactions";
+  body.append(sequence);
+
   // Facts
   const dl = el("dl", "kv");
   const pairs = [

@@ -82,12 +82,18 @@ sudo railmon collect --mode http \
 | **Summary** | interactions, distinct hosts, failures and failure rate, tool calls, latency, bytes each way |
 | **Where the agent went** | every host, ranked, with its failure count and average latency — click one to filter the log |
 | **Interaction log** | one row per request/response pair, filterable by host, method, status class, and failures only |
-| **Detail** | the full exchange in both directions; credential headers are redacted before storage, while bodies remain exactly as RailMon captured them |
+| **Detail** | the full exchange, captured tool names, nearby calls on the same pid/tid, and previous/next error or tool-call navigation; credential headers are redacted before storage, while bodies remain exactly as RailMon captured them |
 
 Two flags on a row are worth knowing. `n tool` counts `tool_use` blocks in the
 exchange, which is the closest thing in the payload to *the agent took an
 action*. `x-rail` means the request carried a ticket — **whether**, never the
 value.
+
+Open a row to investigate its sequence. Nearby calls are the captured calls
+from the same session, process and thread, ordered oldest to newest around the
+selected call. Tool names come only from captured `tool_use` blocks and are
+shown as plain text. The error and tool-call buttons move across the selected
+session even when the relevant interaction is outside the visible log page.
 
 ## What it does not do
 
