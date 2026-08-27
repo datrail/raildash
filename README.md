@@ -87,6 +87,14 @@ cd raildash
 make stack
 ```
 
+> **Requires RailMon's env-var passthrough.** The webhook half of this stack
+> needs `datrail/railmon`'s demo to honour `RAILMON_WEBHOOK_URL`, which is
+> [datrail/railmon#9](https://github.com/datrail/railmon/pull/9) and is not on
+> `master` yet. `make stack` checks for it and stops with instructions rather
+> than running half-wired; until it merges, use
+> `make stack RAILMON_REF=dr-81-demo-env-passthrough`. Pin RailMon to any tag,
+> branch or commit the same way.
+
 `make stack` clones `datrail/railmon` into `./railmon` (this repo has no
 RailMon source of its own — see `docker-compose.yml`'s header for why that is
 a clone-as-bootstrap step rather than a reason to vendor a copy), builds both
