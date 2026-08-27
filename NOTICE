@@ -4,9 +4,7 @@ Copyright (c) 2026 DatRail
 This product is part of the DatRail open-source agent-security toolchain
 (https://github.com/datrail).
 
-NOTE: this repository has no LICENSE file yet. One must be chosen before it is
-made public — see DR-21, where the inconsistency across the DatRail repos is
-being resolved. Until then nothing here grants a licence to anyone.
+Licensed under the Apache License, Version 2.0. See LICENSE.
 
 --------------------------------------------------------------------------------
 Third-party components
@@ -14,7 +12,8 @@ Third-party components
 
 FastAPI and Uvicorn — declared in requirements.txt
     RailDash's HTTP surface. Starlette and Pydantic come in transitively via
-    FastAPI. Each is under its own licence.
+    FastAPI. Their permissive licences permit distribution of RailDash under
+    Apache-2.0; each dependency remains under its own licence.
 
 Contributor Covenant — https://www.contributor-covenant.org
     CODE_OF_CONDUCT.md adopts version 2.1 by reference.

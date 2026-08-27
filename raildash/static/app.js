@@ -16,9 +16,13 @@ const state = {
   offset: 0,
   limit: 100,
   total: 0,
+  driftLeft: null,
+  driftRight: null,
 };
 
 const $ = (id) => document.getElementById(id);
+const staticDemo = window.RAIL_DASH_STATIC_DEMO === true;
+let staticDataPromise = null;
 
 /* --------------------------------------------------------------- utilities */
 
@@ -74,6 +78,7 @@ function statusPill(code) {
 }
 
 async function getJSON(path, params) {
+  if (staticDemo) return getStaticJSON(path, params || {});
   const url = new URL(path, window.location.origin);
   Object.entries(params || {}).forEach(([k, v]) => {
     if (v !== null && v !== undefined && v !== "" && v !== false) {
@@ -83,6 +88,52 @@ async function getJSON(path, params) {
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
+}
+
+async function staticFixtureData() {
+  if (!staticDataPromise) {
+    staticDataPromise = fetch("./fixture-data.json").then((response) => {
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      return response.json();
+    });
+  }
+  return staticDataPromise;
+}
+
+function filterStaticInteractions(items, params) {
+  const filtered = items.filter((row) => {
+    if (params.session_id && row.session_id !== params.session_id) return false;
+    if (params.host && row.host !== params.host) return false;
+    if (params.method && row.method !== params.method) return false;
+    if (params.status_class && String(row.status_code || "")[0] !== params.status_class) return false;
+    if (params.errors_only && !(row.status_code >= 400)) return false;
+    if (params.q) {
+      const needle = String(params.q).toLowerCase();
+      if (!String(row.host || "").toLowerCase().includes(needle) &&
+          !String(row.path || "").toLowerCase().includes(needle)) return false;
+    }
+    return true;
+  });
+  const offset = Number(params.offset || 0);
+  const limit = Number(params.limit || 100);
+  return { total: filtered.length, items: filtered.slice(offset, offset + limit) };
+}
+
+async function getStaticJSON(path, params) {
+  const data = await staticFixtureData();
+  if (path === "/api/sessions") return data.sessions;
+  if (path === "/api/overview") return data.overview;
+  if (path === "/api/profile") return data.profile;
+  if (path === "/api/filters") return data.filters;
+  if (path === "/api/interactions") {
+    return filterStaticInteractions(data.interactions, params);
+  }
+  if (path.startsWith("/api/interactions/")) {
+    const rowId = path.slice(path.lastIndexOf("/") + 1);
+    const detail = data.details[rowId];
+    if (detail) return detail;
+  }
+  throw new Error(`Static fixture has no response for ${path}`);
 }
 
 function setConn(stateName, text) {
@@ -147,6 +198,27 @@ async function loadSessions() {
     li.append(btn);
     list.append(li);
   });
+  syncDriftSelectors(sessions);
+}
+
+function syncDriftSelectors(sessions) {
+  const ids = sessions.map((session) => session.session_id);
+  if (!ids.includes(state.driftRight)) state.driftRight = ids[0] || null;
+  if (!ids.includes(state.driftLeft)) state.driftLeft = ids[1] || ids[0] || null;
+
+  [["drift-left", state.driftLeft], ["drift-right", state.driftRight]].forEach(
+    ([id, selected]) => {
+      const select = $(id);
+      select.replaceChildren();
+      ids.forEach((sessionId) => {
+        const option = el("option", null, sessionId);
+        option.value = sessionId;
+        select.append(option);
+      });
+      select.value = selected || "";
+      select.disabled = ids.length === 0;
+    }
+  );
 }
 
 /* ---------------------------------------------------------------- overview */
@@ -180,6 +252,164 @@ async function loadOverview() {
     `${fmtBytes(t.request_bytes || 0)} out · ${fmtBytes(t.response_bytes || 0)} in`;
 
   renderHosts(data.hosts || []);
+}
+
+function profileValues(title, items) {
+  const group = el("section", "profile-group");
+  group.append(el("h3", null, title));
+  const values = el("div", "profile-values");
+  if (!items.length) {
+    values.append(el("span", "muted", "None observed"));
+  }
+  items.forEach((item) => {
+    const chip = el("span", "profile-chip");
+    chip.append(el("span", "profile-value", item.value));
+    chip.append(el("span", "profile-count", item.count));
+    values.append(chip);
+  });
+  group.append(values);
+  return group;
+}
+
+async function loadProfile() {
+  const grid = $("profile-grid");
+  const download = $("profile-download");
+  grid.replaceChildren();
+  if (!state.sessionId) {
+    grid.append(el("p", "muted", "Select a captured session."));
+    download.setAttribute("aria-disabled", "true");
+    download.removeAttribute("href");
+    return;
+  }
+
+  const path = `/api/profile?session_id=${encodeURIComponent(state.sessionId)}`;
+  const profile = await getJSON("/api/profile", { session_id: state.sessionId });
+  const observed = profile.observed || {};
+  download.href = staticDemo ? "./profile.json" : path;
+  download.removeAttribute("aria-disabled");
+
+  const facts = el("section", "profile-group profile-facts");
+  facts.append(el("h3", null, "Capture summary"));
+  const summary = el("dl", "profile-summary");
+  [
+    ["Errors", `${fmtInt(observed.error_count)} · ${((observed.error_rate || 0) * 100).toFixed(1)}%`],
+    ["x-rail", observed.x_rail && observed.x_rail.present
+      ? `present on ${fmtInt(observed.x_rail.interaction_count)} calls`
+      : "not observed"],
+  ].forEach(([label, value]) => {
+    summary.append(el("dt", null, label));
+    summary.append(el("dd", null, value));
+  });
+  facts.append(summary);
+  grid.append(facts);
+  grid.append(profileValues("Hosts", observed.hosts || []));
+  grid.append(profileValues("Methods", observed.methods || []));
+  grid.append(profileValues("Tools", observed.tool_names || []));
+  grid.append(profileValues("Models", observed.models || []));
+}
+
+function changedValues(before, after) {
+  const previous = new Set((before || []).map((item) => item.value));
+  const current = new Set((after || []).map((item) => item.value));
+  return {
+    added: [...current].filter((item) => !previous.has(item)).sort(),
+    removed: [...previous].filter((item) => !current.has(item)).sort(),
+  };
+}
+
+function driftLabels(title, change, incomplete) {
+  const section = el("section", "drift-group");
+  section.append(el("h3", null, title));
+  if (incomplete) {
+    section.append(el("p", "note", "Comparison incomplete because one or both profiles truncated this dimension."));
+    return section;
+  }
+  [["Added", change.added], ["Removed", change.removed]].forEach(
+    ([label, items]) => {
+      const row = el("div", "drift-change");
+      row.append(el("span", "drift-kind", label));
+      if (!items.length) row.append(el("span", "muted", "None"));
+      items.forEach((item) => row.append(el("span", "drift-label", item)));
+      section.append(row);
+    }
+  );
+  return section;
+}
+
+function signed(value, formatter) {
+  if (value === null) return "not captured";
+  if (value === 0) return formatter(0);
+  return `${value > 0 ? "+" : "−"}${formatter(Math.abs(value))}`;
+}
+
+async function loadDrift() {
+  const generation = ++driftGeneration;
+  const leftSession = state.driftLeft;
+  const rightSession = state.driftRight;
+  const body = $("drift-body");
+  body.replaceChildren();
+  if (!leftSession || !rightSession) {
+    body.append(el("p", "muted", "Two captured sessions are needed for comparison."));
+    return;
+  }
+  if (leftSession === rightSession) {
+    body.append(el("p", "note", "The same session is selected on both sides; no drift to compare."));
+    return;
+  }
+
+  try {
+    // The app has one SQLite connection. Keep these reads sequential so a
+    // comparison that includes the selected session cannot overlap the main
+    // summary's overview query on that connection.
+    const leftProfile = await getJSON("/api/profile", { session_id: leftSession });
+    if (generation !== driftGeneration) return;
+    const rightProfile = await getJSON("/api/profile", { session_id: rightSession });
+    if (generation !== driftGeneration) return;
+    const leftOverview = await getJSON("/api/overview", { session_id: leftSession });
+    if (generation !== driftGeneration) return;
+    const rightOverview = await getJSON("/api/overview", { session_id: rightSession });
+    if (generation !== driftGeneration) return;
+    const before = leftProfile.observed || {};
+    const after = rightProfile.observed || {};
+    if (!before.interaction_count || !after.interaction_count) {
+      body.append(el("p", "note", "One or both selected sessions are empty; observed label and metric changes may be incomplete."));
+    }
+
+    const labels = el("div", "drift-grid");
+    const incomplete = (dimension) =>
+      (before.truncated_dimensions || []).includes(dimension) ||
+      (after.truncated_dimensions || []).includes(dimension) ||
+      (dimension === "tool_names" &&
+        (before.tool_names_truncated || after.tool_names_truncated));
+    labels.append(driftLabels("Hosts", changedValues(before.hosts, after.hosts), incomplete("hosts")));
+    labels.append(driftLabels("Tools", changedValues(before.tool_names, after.tool_names), incomplete("tool_names")));
+    labels.append(driftLabels("Models", changedValues(before.models, after.models), incomplete("models")));
+    body.append(labels);
+
+    const leftTotals = leftOverview.totals || {};
+    const rightTotals = rightOverview.totals || {};
+    const leftBytes = (leftTotals.request_bytes || 0) + (leftTotals.response_bytes || 0);
+    const rightBytes = (rightTotals.request_bytes || 0) + (rightTotals.response_bytes || 0);
+    const latencyDelta = typeof leftTotals.avg_latency_ms === "number" &&
+      typeof rightTotals.avg_latency_ms === "number"
+      ? rightTotals.avg_latency_ms - leftTotals.avg_latency_ms
+      : null;
+    const metrics = el("dl", "drift-metrics");
+    [
+      ["Error rate", signed((after.error_rate || 0) - (before.error_rate || 0),
+        (value) => `${(value * 100).toFixed(1)} pp`)],
+      ["Average latency", signed(latencyDelta, (value) => fmtMs(value))],
+      ["Transferred bytes", signed(rightBytes - leftBytes, (value) => fmtBytes(value))],
+    ].forEach(([label, value]) => {
+      metrics.append(el("dt", null, label));
+      metrics.append(el("dd", null, value));
+    });
+    body.append(metrics);
+  } catch (error) {
+    if (generation !== driftGeneration) return;
+    body.append(el("p", "note", "Comparison data is unavailable for one or both sessions."));
+    console.error(error);
+  }
 }
 
 function renderHosts(hosts) {
@@ -344,6 +574,49 @@ async function openDetail(rowId) {
   const body = $("detail-body");
   body.replaceChildren();
 
+  const nav = data.navigation || {};
+  [
+    ["previous-error", nav.previous_error],
+    ["next-error", nav.next_error],
+    ["previous-tool", nav.previous_tool_call],
+    ["next-tool", nav.next_tool_call],
+  ].forEach(([id, target]) => {
+    const button = $(id);
+    button.disabled = !target;
+    button.onclick = target ? () => openDetail(target) : null;
+  });
+
+  if (data.tool_names && data.tool_names.length) {
+    const tools = el("section", "investigation-tools");
+    tools.append(el("h3", null, "Captured tool names"));
+    data.tool_names.forEach((name) => {
+      tools.append(el("span", "tool-name", name));
+    });
+    body.append(tools);
+  }
+
+  const sequence = el("section", "nearby");
+  sequence.append(el("h3", null, "Nearby on the same pid / tid"));
+  const sequenceList = el("ol", "nearby-list");
+  (data.nearby || []).forEach((row) => {
+    const item = el("li");
+    const button = el("button", "nearby-interaction");
+    button.type = "button";
+    button.dataset.current = String(row.id === data.id);
+    button.append(el("span", "nearby-time", fmtTime(row.timestamp)));
+    button.append(el("span", "nearby-target", `${row.method || "—"} ${row.host || "—"}${row.path || ""}`));
+    button.append(statusPill(row.status_code));
+    (row.tool_names || []).forEach((name) => {
+      button.append(el("span", "tool-name", name));
+    });
+    button.addEventListener("click", () => openDetail(row.id));
+    item.append(button);
+    sequenceList.append(item);
+  });
+  sequence.append(sequenceList);
+  sequence.id = "nearby-interactions";
+  body.append(sequence);
+
   // Facts
   const dl = el("dl", "kv");
   const pairs = [
@@ -403,6 +676,7 @@ function closeDetail() {
 /* ------------------------------------------------------------------- wiring */
 
 let refreshing = false;
+let driftGeneration = 0;
 
 async function refresh() {
   if (refreshing) return;
@@ -410,9 +684,10 @@ async function refresh() {
   try {
     await loadSessions();
     renderActiveFilter();
-    await Promise.all([loadOverview(), loadLog()]);
+    await Promise.all([loadOverview(), loadProfile(), loadLog()]);
+    await loadDrift();
     await loadFilterOptions();
-    setConn("live", "live");
+    setConn("live", staticDemo ? "fixture" : "live");
   } catch (err) {
     // Say what broke. A dashboard that silently shows stale numbers during an
     // incident is worse than one that admits it lost the server.
@@ -469,7 +744,20 @@ function initTheme() {
 function init() {
   initTheme();
 
+  if (staticDemo) {
+    $("demo-banner").hidden = false;
+    setConn("live", "fixture");
+  }
+
   $("refresh").addEventListener("click", refresh);
+  $("drift-left").addEventListener("change", (event) => {
+    state.driftLeft = event.target.value;
+    loadDrift();
+  });
+  $("drift-right").addEventListener("change", (event) => {
+    state.driftRight = event.target.value;
+    loadDrift();
+  });
 
   const rerun = () => {
     state.offset = 0;
@@ -514,9 +802,11 @@ function init() {
   refresh();
   // A capture arriving over the webhook should show up without a reload; five
   // seconds is frequent enough to feel live and rare enough to stay quiet.
-  setInterval(() => {
-    if (document.visibilityState === "visible" && $("detail").hidden) refresh();
-  }, 5000);
+  if (!staticDemo) {
+    setInterval(() => {
+      if (document.visibilityState === "visible" && $("detail").hidden) refresh();
+    }, 5000);
+  }
 }
 
 document.addEventListener("DOMContentLoaded", init);

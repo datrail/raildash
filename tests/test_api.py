@@ -50,6 +50,189 @@ def test_overview_totals(client):
     assert hosts["api.anthropic.com"]["errors"] == 1
 
 
+def test_observed_profile_summarises_one_capture(client):
+    response = client.get("/api/profile", params={"session_id": "file:capture.jsonl"})
+
+    assert response.status_code == 200
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="raildash-observed-profile.json"'
+    )
+    profile = response.json()
+    assert profile["schema_version"] == "1.0"
+    assert profile["source"] == "raildash-observed"
+    assert profile["authoritative"] is False
+    assert "not an authoritative Rail Center score" in profile["disclaimer"]
+    assert profile["session"] == {
+        "id": "file:capture.jsonl",
+        "agent": "openclaw-1",
+        "capture_start": "",
+    }
+    observed = profile["observed"]
+    assert observed["interaction_count"] == 8
+    assert observed["error_count"] == 3
+    assert observed["error_rate"] == 0.375
+    assert observed["x_rail"] == {"present": True, "interaction_count": 4}
+    assert observed["hosts"][0] == {"value": "api.anthropic.com", "count": 3}
+    assert observed["methods"] == [
+        {"value": "POST", "count": 5},
+        {"value": "GET", "count": 2},
+    ]
+    assert observed["models"] == [{"value": "claude-sonnet-5", "count": 3}]
+    assert observed["tool_names"] == [
+        {"value": "delivery_track_package", "count": 2}
+    ]
+    assert observed["tool_names_truncated"] is False
+    assert observed["truncated_dimensions"] == []
+
+
+def test_observed_profile_missing_session_is_404(client):
+    assert client.get("/api/profile", params={"session_id": "missing"}).status_code == 404
+
+
+def test_observed_profile_accepts_session_ids_with_slashes(client):
+    client.post(
+        "/webhook/http-interactions",
+        json={"session_id": "agent/run-1", "interactions": []},
+    ).raise_for_status()
+
+    response = client.get("/api/profile", params={"session_id": "agent/run-1"})
+
+    assert response.status_code == 200
+    assert response.json()["session"]["id"] == "agent/run-1"
+
+
+def test_observed_profile_bounds_tool_name_work(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_TOOL_ROWS", 1)
+    payload = {
+        "session_id": "bounded-profile",
+        "interactions": [
+            {
+                "interaction_id": f"tool-{index}",
+                "response": {
+                    "status_code": 200,
+                    "body": {
+                        "content": [
+                            {"type": "tool_use", "name": f"tool-{index}"}
+                        ]
+                    },
+                },
+            }
+            for index in range(2)
+        ],
+    }
+    client.post("/webhook/http-interactions", json=payload).raise_for_status()
+
+    observed = client.get(
+        "/api/profile", params={"session_id": "bounded-profile"}
+    ).json()["observed"]
+
+    assert observed["tool_names_truncated"] is True
+    assert len(observed["tool_names"]) == 1
+
+
+def test_observed_profile_bounds_distinct_dimension_values(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_DIMENSION_VALUES", 1)
+
+    observed = client.get(
+        "/api/profile", params={"session_id": "file:capture.jsonl"}
+    ).json()["observed"]
+
+    assert len(observed["hosts"]) == 1
+    assert len(observed["methods"]) == 1
+    assert len(observed["models"]) == 1
+    assert observed["truncated_dimensions"] == ["hosts", "methods"]
+
+
+def test_observed_profile_bounds_individual_value_lengths(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_VALUE_CHARS", 8)
+    long_value = "captured-value-that-is-too-long"
+    client.post(
+        "/webhook/http-interactions",
+        json={
+            "session_id": "long-profile-values",
+            "interactions": [
+                {
+                    "request": {
+                        "method": long_value,
+                        "headers": {"host": long_value},
+                        "body": {"model": long_value},
+                    },
+                    "response": {
+                        "status_code": 200,
+                        "body": {
+                            "content": [
+                                {"type": "tool_use", "name": long_value}
+                            ]
+                        },
+                    },
+                }
+            ],
+        },
+    ).raise_for_status()
+
+    observed = client.get(
+        "/api/profile", params={"session_id": "long-profile-values"}
+    ).json()["observed"]
+
+    assert observed["hosts"] == [{"value": "captured", "count": 1}]
+    assert observed["methods"] == [{"value": "CAPTURED", "count": 1}]
+    assert observed["models"] == [{"value": "captured", "count": 1}]
+    assert observed["tool_names"] == [{"value": "captured", "count": 1}]
+    assert observed["tool_names_truncated"] is True
+    assert observed["truncated_dimensions"] == [
+        "hosts",
+        "methods",
+        "models",
+        "tool_names",
+    ]
+
+
+def test_observed_profile_never_exports_credentials(client):
+    secret = "profile-must-not-export-this"
+    tool_name = "<img src=x onerror='alert(1)'>"
+    client.post(
+        "/webhook/http-interactions",
+        json={
+            "session_id": "profile-safety",
+            "interactions": [
+                {
+                    "request": {
+                        "method": "POST",
+                        "headers": {
+                            "host": "api.example.com",
+                            "authorization": secret,
+                            "x-rail": secret,
+                        },
+                        "body": {"model": "example-model"},
+                    },
+                    "response": {
+                        "status_code": 500,
+                        "body": {
+                            "content": [
+                                {"type": "tool_use", "name": tool_name},
+                                {"type": "tool_use", "name": tool_name},
+                            ]
+                        },
+                    },
+                }
+            ],
+        },
+    ).raise_for_status()
+
+    profile = client.get("/api/profile", params={"session_id": "profile-safety"}).json()
+    rendered = json.dumps(profile)
+
+    assert secret not in rendered
+    assert profile["observed"]["tool_names"] == [{"value": tool_name, "count": 2}]
+    assert profile["observed"]["x_rail"]["present"] is True
+
+
 def test_interactions_are_newest_first(client):
     items = client.get("/api/interactions").json()["items"]
     stamps = [i["timestamp"] for i in items if i["timestamp"]]
@@ -98,6 +281,126 @@ def test_detail_returns_the_interaction_with_credentials_redacted(client):
     detail = client.get(f"/api/interactions/{row_id}").json()
     assert detail["raw"]["request"]["method"] == "POST"
     assert detail["raw"]["response"]["status_code"] == 200
+
+
+def test_store_investigation_orders_same_process_thread_fixture_sequence(client):
+    rows = client.get("/api/interactions").json()["items"]
+    target = next(row for row in rows if row["status_code"] == 403)
+
+    investigation = app_module.store.investigation(target["id"])
+
+    assert investigation is not None
+    nearby = investigation["nearby"]
+    assert [row["timestamp"] for row in nearby] == sorted(
+        row["timestamp"] for row in nearby
+    )
+    assert {(row["pid"], row["tid"]) for row in nearby} == {(4021, 4030)}
+    assert any(row["id"] == target["id"] for row in nearby)
+
+
+def test_fixture_tool_names_come_from_captured_tool_use_blocks(client):
+    rows = client.get("/api/interactions").json()["items"]
+    target = next(row for row in rows if row["timestamp"] == "2026-08-15T17:04:11Z")
+
+    detail = client.get(f"/api/interactions/{target['id']}").json()
+
+    assert detail["tool_names"] == ["delivery_track_package"]
+
+
+def test_investigation_api_provides_error_and_tool_navigation(client):
+    rows = client.get("/api/interactions").json()["items"]
+    target = next(row for row in rows if row["status_code"] == 500)
+
+    detail = client.get(f"/api/interactions/{target['id']}").json()
+
+    assert detail["navigation"] == {
+        "previous_error": next(row["id"] for row in rows if row["status_code"] == 429),
+        "next_error": next(row["id"] for row in rows if row["status_code"] == 403),
+        "previous_tool_call": next(
+            row["id"] for row in rows if row["timestamp"] == "2026-08-15T17:04:17.274000Z"
+        ),
+        "next_tool_call": None,
+    }
+
+
+def test_investigation_uses_wall_clock_when_timestamp_ns_is_missing(client):
+    interactions = [
+        {
+            "interaction_id": interaction_id,
+            "timestamp": timestamp,
+            "pid": 9,
+            "tid": 10,
+            "request": {"method": "GET", "path": f"/{interaction_id}"},
+            "response": {"status_code": status},
+        }
+        for interaction_id, timestamp, status in (
+            ("last", "2026-08-15T18:00:03Z", 403),
+            ("first", "2026-08-15T18:00:01Z", 429),
+            ("middle", "2026-08-15T18:00:02Z", 500),
+        )
+    ]
+    client.post(
+        "/webhook/http-interactions",
+        json={"session_id": "no-monotonic-clock", "interactions": interactions},
+    ).raise_for_status()
+    rows = client.get(
+        "/api/interactions", params={"session_id": "no-monotonic-clock"}
+    ).json()["items"]
+    by_interaction = {row["interaction_id"]: row for row in rows}
+
+    detail = client.get(
+        f"/api/interactions/{by_interaction['middle']['id']}"
+    ).json()
+
+    assert [row["interaction_id"] for row in detail["nearby"]] == [
+        "first",
+        "middle",
+        "last",
+    ]
+    assert detail["navigation"]["previous_error"] == by_interaction["first"]["id"]
+    assert detail["navigation"]["next_error"] == by_interaction["last"]["id"]
+
+
+def test_tool_names_and_navigation_never_expose_credentials(client):
+    credential = "Bearer-never-return-this"
+    malicious_name = '<img src=x onerror="alert(1)">'
+    posted = client.post(
+        "/webhook/http-interactions",
+        json={
+            "session_id": "untrusted-tools",
+            "interactions": [
+                {
+                    "timestamp": "2026-08-15T18:00:00Z",
+                    "timestamp_ns": 1,
+                    "pid": 1,
+                    "tid": 2,
+                    "request": {
+                        "method": "POST",
+                        "path": "/v1/messages",
+                        "headers": {"authorization": credential},
+                    },
+                    "response": {
+                        "status_code": 200,
+                        "body": {
+                            "content": [{"type": "tool_use", "name": malicious_name}]
+                        },
+                    },
+                }
+            ],
+        },
+    ).json()
+    row = client.get(
+        "/api/interactions", params={"session_id": posted["session_id"]}
+    ).json()["items"][0]
+
+    detail = client.get(f"/api/interactions/{row['id']}").json()
+    rendered = json.dumps(detail)
+
+    assert detail["tool_names"] == [malicious_name]
+    assert credential not in rendered
+    assert detail["raw"]["request"]["headers"]["authorization"] == (
+        "[REDACTED-BY-RAILDASH]"
+    )
 
 
 def test_missing_interaction_is_404(client):
@@ -614,3 +917,32 @@ def test_the_front_end_never_assigns_markup(client):
     js = client.get("/app.js").text
     for sink in ("innerHTML =", "outerHTML =", "insertAdjacentHTML", "document.write"):
         assert sink not in js, f"{sink} would render captured traffic as markup"
+
+
+def test_observed_profile_ui_is_present_and_text_only(client):
+    html = client.get("/").text
+    js = client.get("/app.js").text
+
+    assert "Observed security profile" in html
+    assert 'id="profile-download"' in html
+    assert "not an authoritative Rail Center score" in html
+    assert 'el("span", "profile-value", item.value)' in js
+
+
+def test_capture_drift_ui_uses_existing_profile_and_overview_apis(client):
+    html = client.get("/").text
+    js = client.get("/app.js").text
+
+    assert "Capture drift" in html
+    assert 'id="drift-left"' in html
+    assert 'id="drift-right"' in html
+    assert 'getJSON("/api/profile"' in js
+    assert 'getJSON("/api/overview"' in js
+    assert 'el("span", "drift-label", item)' in js
+    assert "same session is selected" in js
+    assert "selected sessions are empty" in js
+    assert "Comparison data is unavailable" in js
+    assert "truncated_dimensions" in js
+    assert "generation !== driftGeneration" in js
+    assert "Comparison incomplete" in js
+    assert "risk score" not in html.lower()

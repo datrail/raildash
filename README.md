@@ -184,12 +184,36 @@ file path is passive and the webhook path only ever pushed.
 | **Summary** | interactions, distinct hosts, failures and failure rate, tool calls, latency, bytes each way |
 | **Where the agent went** | every host, ranked, with its failure count and average latency — click one to filter the log |
 | **Interaction log** | one row per request/response pair, filterable by host, method, status class, and failures only |
-| **Detail** | the full exchange in both directions; credential headers are redacted before storage, while bodies remain exactly as RailMon captured them |
+| **Detail** | the full exchange, captured tool names, nearby calls on the same pid/tid, and previous/next error or tool-call navigation; credential headers are redacted before storage, while bodies remain exactly as RailMon captured them |
+| **Observed security profile** | hosts, methods, tool names, models, x-rail presence, and error rate for the selected capture; downloadable as versioned JSON |
+| **Capture drift** | neutral added/removed hosts, tools, and models plus error-rate, average-latency, and byte deltas between two sessions |
 
 Two flags on a row are worth knowing. `n tool` counts `tool_use` blocks in the
 exchange, which is the closest thing in the payload to *the agent took an
 action*. `x-rail` means the request carried a ticket — **whether**, never the
 value.
+
+Open a row to investigate its sequence. Nearby calls are the captured calls
+from the same session, process and thread, ordered oldest to newest around the
+selected call. Tool names come only from captured `tool_use` blocks and are
+shown as plain text. The error and tool-call buttons move across the selected
+session even when the relevant interaction is outside the visible log page.
+
+The observed security profile is a portable draft generated from one capture.
+Its JSON identifies itself with `schema_version: "1.0"` and
+`source: "raildash-observed"`. It is intentionally a summary of observed
+facts, not an authoritative Agent Security Profile schema or Rail Center
+score. Credential values are never included; `x-rail` is presence and count
+only. Tool-name aggregation is bounded for availability; the JSON sets
+`tool_names_truncated` if an unusually large capture exceeds that bound.
+Host, method, and model cardinality is bounded similarly, with any affected
+names listed in `truncated_dimensions`. Individual captured labels are also
+bounded there so an adversarial capture cannot create an enormous export.
+
+Capture drift compares two observed profiles and their overview totals. It
+reports additions, removals, and numeric deltas without assigning a risk
+score. Selecting the same session, an empty capture, or unavailable comparison
+data produces an explicit message rather than an invented zero.
 
 ## What it does not do
 
@@ -241,7 +265,16 @@ it with `docker exec <container> python -m raildash.cli load <file>`.
 make test     # pytest + py_compile
 make lint     # static check of the three front-end files
 make demo     # load the test fixture and serve it
+make static-demo  # build a hosting-ready synthetic fixture site under dist/
 ```
+
+`make static-demo` is deterministic and does not deploy anything. It exports
+the current UI assets plus precomputed JSON from
+`tests/fixtures/capture.jsonl` only. The generated site has no FastAPI or
+SQLite process: filtering and pagination run in the browser, and a visible
+banner identifies it as a static fixture with no live capture. The output is
+ready to upload to an approved static host later; this repository does not
+assume a public host or deployment credential exists.
 
 `tests/fixtures/capture.jsonl` is shaped exactly like RailMon's output,
 including the two fields that are routinely null in a real capture — a
@@ -264,4 +297,4 @@ with an `error` key.
 
 ## License
 
-MIT; see [LICENSE](LICENSE).
+Apache License 2.0. See [LICENSE](LICENSE).

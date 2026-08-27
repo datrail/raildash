@@ -26,6 +26,11 @@
   </div>
 </header>
 
+<div class="demo-banner" id="demo-banner" hidden>
+  <strong>Static fixture demo</strong>
+  <span>No live capture. Every value on this page comes from synthetic test data.</span>
+</div>
+
 <div class="shell">
 
   <!-- Sessions ------------------------------------------------------------ -->
@@ -69,6 +74,44 @@
         <span class="tile-label">Transferred</span>
         <span class="tile-value" id="stat-bytes">—</span>
         <span class="tile-note" id="stat-bytes-note"></span>
+      </div>
+    </section>
+
+    <!-- Observed profile ------------------------------------------------ -->
+    <section class="panel profile" aria-labelledby="profile-h">
+      <div class="panel-head">
+        <div>
+          <h2 id="profile-h">Observed security profile</h2>
+          <span class="hint">Capture facts only — not an authoritative Rail Center score</span>
+        </div>
+        <a class="btn" id="profile-download" href="#" download>Download JSON</a>
+      </div>
+      <div class="profile-grid" id="profile-grid">
+        <p class="muted">Select a captured session.</p>
+      </div>
+    </section>
+
+    <!-- Capture drift --------------------------------------------------- -->
+    <section class="panel drift" aria-labelledby="drift-h">
+      <div class="panel-head">
+        <div>
+          <h2 id="drift-h">Capture drift</h2>
+          <span class="hint">Neutral observed changes between two sessions</span>
+        </div>
+        <div class="drift-selectors">
+          <label class="field">
+            <span>From</span>
+            <select id="drift-left"></select>
+          </label>
+          <span aria-hidden="true">→</span>
+          <label class="field">
+            <span>To</span>
+            <select id="drift-right"></select>
+          </label>
+        </div>
+      </div>
+      <div class="drift-body" id="drift-body">
+        <p class="muted">Two captured sessions are needed for comparison.</p>
       </div>
     </section>
 
@@ -177,6 +220,12 @@
     </div>
     <button type="button" class="btn btn-icon" id="detail-close" aria-label="Close">×</button>
   </div>
+  <nav class="investigation-nav" aria-label="Notable interaction navigation">
+    <button type="button" class="btn btn-quiet" id="previous-error">← Error</button>
+    <button type="button" class="btn btn-quiet" id="next-error">Error →</button>
+    <button type="button" class="btn btn-quiet" id="previous-tool">← Tool call</button>
+    <button type="button" class="btn btn-quiet" id="next-tool">Tool call →</button>
+  </nav>
   <div class="detail-body" id="detail-body"></div>
 </aside>
 

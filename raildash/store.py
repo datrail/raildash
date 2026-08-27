@@ -34,6 +34,10 @@ UNSAFE_LEGACY_CAPTURE = {
     "redacted": True,
     "reason": "legacy capture exceeded safe migration limits",
 }
+MAX_PROFILE_TOOL_ROWS = 10_000
+MAX_PROFILE_TOOL_NAMES = 1_000
+MAX_PROFILE_DIMENSION_VALUES = 100
+MAX_PROFILE_VALUE_CHARS = 256
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -409,6 +413,134 @@ class Store:
             "statuses": [dict(r) for r in statuses],
         }
 
+    def observed_profile(self, session_id: str) -> dict[str, Any] | None:
+        """Build a portable summary of facts observed in one capture.
+
+        This deliberately contains no score or inferred posture. Values come
+        only from the already-redacted interaction columns and captured
+        ``tool_use`` names.
+        """
+        session = self._db.execute(
+            "SELECT session_id, agent, capture_start FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if session is None:
+            return None
+
+        totals = self._db.execute(
+            """
+            SELECT COUNT(*) AS interactions,
+                   COALESCE(SUM(status_code >= 400), 0) AS errors,
+                   COALESCE(SUM(has_ticket), 0) AS ticket_interactions
+            FROM interactions WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchone()
+
+        truncated_dimensions: list[str] = []
+
+        def mark_truncated(label: str) -> None:
+            if label not in truncated_dimensions:
+                truncated_dimensions.append(label)
+
+        def counted(column: str, label: str) -> list[dict[str, Any]]:
+            rows = self._db.execute(
+                f"""SELECT substr({column}, 1, ?) AS value,
+                           COUNT(*) AS count,
+                           MAX(length({column}) > ?) AS value_truncated
+                    FROM interactions
+                    WHERE session_id = ? AND {column} IS NOT NULL AND {column} != ''
+                    GROUP BY substr({column}, 1, ?)
+                    ORDER BY count DESC, value
+                    LIMIT ?""",
+                (
+                    MAX_PROFILE_VALUE_CHARS,
+                    MAX_PROFILE_VALUE_CHARS,
+                    session_id,
+                    MAX_PROFILE_VALUE_CHARS,
+                    MAX_PROFILE_DIMENSION_VALUES + 1,
+                ),
+            ).fetchall()
+            if len(rows) > MAX_PROFILE_DIMENSION_VALUES:
+                mark_truncated(label)
+                rows = rows[:MAX_PROFILE_DIMENSION_VALUES]
+            if any(row["value_truncated"] for row in rows):
+                mark_truncated(label)
+            return [{"value": row["value"], "count": row["count"]} for row in rows]
+
+        tool_counts: dict[str, int] = {}
+        tool_names_truncated = False
+        raw_rows = self._db.execute(
+            """SELECT raw FROM interactions
+               WHERE session_id = ? AND tool_calls > 0
+               ORDER BY id LIMIT ?""",
+            (session_id, MAX_PROFILE_TOOL_ROWS + 1),
+        )
+        for index, row in enumerate(raw_rows):
+            if index == MAX_PROFILE_TOOL_ROWS:
+                tool_names_truncated = True
+                break
+            names = self._tool_names(
+                self._safe_raw(row["raw"]),
+                deduplicate=False,
+                limit=MAX_PROFILE_TOOL_NAMES + 1,
+            )
+            if len(names) > MAX_PROFILE_TOOL_NAMES:
+                names = names[:MAX_PROFILE_TOOL_NAMES]
+                tool_names_truncated = True
+            for name in names:
+                if len(name) > MAX_PROFILE_VALUE_CHARS:
+                    name = name[:MAX_PROFILE_VALUE_CHARS]
+                    tool_names_truncated = True
+                    mark_truncated("tool_names")
+                if name not in tool_counts and len(tool_counts) >= MAX_PROFILE_TOOL_NAMES:
+                    tool_names_truncated = True
+                    continue
+                tool_counts[name] = tool_counts.get(name, 0) + 1
+
+        interaction_count = int(totals["interactions"])
+        error_count = int(totals["errors"])
+        ticket_count = int(totals["ticket_interactions"])
+        return {
+            "schema_version": "1.0",
+            "source": "raildash-observed",
+            "authoritative": False,
+            "disclaimer": "Observed capture summary; not an authoritative Rail Center score.",
+            "session": {
+                "id": session["session_id"],
+                "agent": session["agent"],
+                "capture_start": session["capture_start"],
+            },
+            "observed": {
+                "interaction_count": interaction_count,
+                "error_count": error_count,
+                "error_rate": (
+                    round(error_count / interaction_count, 6)
+                    if interaction_count
+                    else 0.0
+                ),
+                "x_rail": {
+                    "present": ticket_count > 0,
+                    "interaction_count": ticket_count,
+                },
+                "hosts": counted("host", "hosts"),
+                "methods": counted("method", "methods"),
+                "models": counted("model", "models"),
+                "tool_names": [
+                    {"value": name, "count": count}
+                    for name, count in sorted(
+                        tool_counts.items(), key=lambda item: (-item[1], item[0])
+                    )
+                ],
+                "tool_names_truncated": tool_names_truncated,
+                "truncated_dimensions": [
+                    label
+                    for label in ("hosts", "methods", "models", "tool_names")
+                    if label in truncated_dimensions
+                ],
+            },
+        }
+
     def interactions(
         self,
         session_id: str | None = None,
@@ -472,6 +604,141 @@ class Store:
         out = dict(row)
         out["raw"] = self._safe_raw(out["raw"])
         return out
+
+    @staticmethod
+    def _tool_names(
+        raw: Any, *, deduplicate: bool = True, limit: int | None = None
+    ) -> list[str]:
+        """Return ordered tool_use names from captured message blocks.
+
+        Capture bodies are untrusted, so only the known Anthropic message
+        locations are inspected and every unexpected shape is ignored.
+        """
+        if not isinstance(raw, dict):
+            return []
+
+        names: list[str] = []
+
+        def add_blocks(content: Any) -> None:
+            if not isinstance(content, list):
+                return
+            for block in content:
+                if limit is not None and len(names) >= limit:
+                    return
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                name = block.get("name")
+                if (
+                    isinstance(name, str)
+                    and name
+                    and (not deduplicate or name not in names)
+                ):
+                    names.append(name)
+
+        for direction in ("request", "response"):
+            message = raw.get(direction)
+            if not isinstance(message, dict):
+                continue
+            body = message.get("body")
+            if not isinstance(body, dict):
+                continue
+            add_blocks(body.get("content"))
+            messages = body.get("messages")
+            if isinstance(messages, list):
+                for nested in messages:
+                    if isinstance(nested, dict):
+                        add_blocks(nested.get("content"))
+        return names
+
+    def _interaction_summary(self, row: sqlite3.Row) -> dict[str, Any]:
+        summary = dict(row)
+        raw = self._safe_raw(summary.pop("raw"))
+        summary["tool_names"] = self._tool_names(raw)
+        return summary
+
+    def investigation(self, row_id: int, nearby_each_side: int = 3) -> dict[str, Any] | None:
+        """Detail, same pid/tid context, and notable-event navigation."""
+        current_row = self._db.execute(
+            "SELECT * FROM interactions WHERE id = ?", (row_id,)
+        ).fetchone()
+        if current_row is None:
+            return None
+
+        current = dict(current_row)
+        current_raw = self._safe_raw(current["raw"])
+        current["raw"] = current_raw
+        current["tool_names"] = self._tool_names(current_raw)
+
+        # Wall-clock timestamps are the route contract; timestamp_ns is an
+        # optional RailMon/eBPF aid. julianday also normalises RFC 3339 offsets,
+        # unlike lexical timestamp ordering. Fall back only for legacy rows
+        # that have no parseable wall clock.
+        # Do not compare timestamp_ns directly with the wall clock: eBPF's
+        # monotonic nanoseconds have no Unix/Julian epoch. Rows without a
+        # parseable wall clock form a deterministic group of their own, where
+        # the monotonic value remains useful for relative ordering.
+        order_expr = (
+            "CASE WHEN julianday(timestamp) IS NULL THEN 0 ELSE 1 END, "
+            "COALESCE(julianday(timestamp), 0), COALESCE(timestamp_ns, 0)"
+        )
+        order_desc = (
+            "CASE WHEN julianday(timestamp) IS NULL THEN 0 ELSE 1 END DESC, "
+            "COALESCE(julianday(timestamp), 0) DESC, "
+            "COALESCE(timestamp_ns, 0) DESC, id DESC"
+        )
+        order_asc = f"{order_expr}, id"
+        current_order = self._db.execute(
+            f"SELECT {order_expr} FROM interactions WHERE id = ?", (row_id,)
+        ).fetchone()
+        current_order = tuple(current_order)
+        key = (*current_order, current["id"])
+        key_sql = "?, ?, ?, ?"
+        common = (current["session_id"], current["pid"], current["tid"])
+        columns = (
+            "id, session_id, interaction_id, timestamp, timestamp_ns, pid, tid, "
+            "method, host, path, status_code, latency_ms, request_size, "
+            "response_size, model, tool_calls, has_ticket, raw"
+        )
+        before = self._db.execute(
+            f"""SELECT {columns} FROM interactions
+                WHERE session_id = ? AND pid IS ? AND tid IS ?
+                  AND ({order_expr}, id) < ({key_sql})
+                ORDER BY {order_desc} LIMIT ?""",
+            (*common, *key, nearby_each_side),
+        ).fetchall()
+        after = self._db.execute(
+            f"""SELECT {columns} FROM interactions
+                WHERE session_id = ? AND pid IS ? AND tid IS ?
+                  AND ({order_expr}, id) > ({key_sql})
+                ORDER BY {order_asc} LIMIT ?""",
+            (*common, *key, nearby_each_side),
+        ).fetchall()
+        nearby_rows = [*reversed(before), current_row, *after]
+        current["nearby"] = [self._interaction_summary(row) for row in nearby_rows]
+
+        navigation: dict[str, int | None] = {}
+        for label, predicate in (
+            ("error", "status_code >= 400"),
+            ("tool_call", "tool_calls > 0"),
+        ):
+            previous = self._db.execute(
+                f"""SELECT id FROM interactions
+                    WHERE session_id = ? AND {predicate}
+                      AND ({order_expr}, id) < ({key_sql})
+                    ORDER BY {order_desc} LIMIT 1""",
+                (current["session_id"], *key),
+            ).fetchone()
+            following = self._db.execute(
+                f"""SELECT id FROM interactions
+                    WHERE session_id = ? AND {predicate}
+                      AND ({order_expr}, id) > ({key_sql})
+                    ORDER BY {order_asc} LIMIT 1""",
+                (current["session_id"], *key),
+            ).fetchone()
+            navigation[f"previous_{label}"] = previous["id"] if previous else None
+            navigation[f"next_{label}"] = following["id"] if following else None
+        current["navigation"] = navigation
+        return current
 
     def distinct(self, column: str, session_id: str | None = None) -> list[str]:
         if column not in {"host", "method"}:
