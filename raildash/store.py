@@ -533,14 +533,26 @@ class Store:
         # optional RailMon/eBPF aid. julianday also normalises RFC 3339 offsets,
         # unlike lexical timestamp ordering. Fall back only for legacy rows
         # that have no parseable wall clock.
+        # Do not compare timestamp_ns directly with the wall clock: eBPF's
+        # monotonic nanoseconds have no Unix/Julian epoch. Rows without a
+        # parseable wall clock form a deterministic group of their own, where
+        # the monotonic value remains useful for relative ordering.
         order_expr = (
-            "COALESCE(julianday(timestamp), "
-            "timestamp_ns / 86400000000000.0, 0)"
+            "CASE WHEN julianday(timestamp) IS NULL THEN 0 ELSE 1 END, "
+            "COALESCE(julianday(timestamp), 0), COALESCE(timestamp_ns, 0)"
         )
+        order_desc = (
+            "CASE WHEN julianday(timestamp) IS NULL THEN 0 ELSE 1 END DESC, "
+            "COALESCE(julianday(timestamp), 0) DESC, "
+            "COALESCE(timestamp_ns, 0) DESC, id DESC"
+        )
+        order_asc = f"{order_expr}, id"
         current_order = self._db.execute(
             f"SELECT {order_expr} FROM interactions WHERE id = ?", (row_id,)
-        ).fetchone()[0]
-        key = (current_order, current["id"])
+        ).fetchone()
+        current_order = tuple(current_order)
+        key = (*current_order, current["id"])
+        key_sql = "?, ?, ?, ?"
         common = (current["session_id"], current["pid"], current["tid"])
         columns = (
             "id, session_id, interaction_id, timestamp, timestamp_ns, pid, tid, "
@@ -550,15 +562,15 @@ class Store:
         before = self._db.execute(
             f"""SELECT {columns} FROM interactions
                 WHERE session_id = ? AND pid IS ? AND tid IS ?
-                  AND ({order_expr}, id) < (?, ?)
-                ORDER BY {order_expr} DESC, id DESC LIMIT ?""",
+                  AND ({order_expr}, id) < ({key_sql})
+                ORDER BY {order_desc} LIMIT ?""",
             (*common, *key, nearby_each_side),
         ).fetchall()
         after = self._db.execute(
             f"""SELECT {columns} FROM interactions
                 WHERE session_id = ? AND pid IS ? AND tid IS ?
-                  AND ({order_expr}, id) > (?, ?)
-                ORDER BY {order_expr}, id LIMIT ?""",
+                  AND ({order_expr}, id) > ({key_sql})
+                ORDER BY {order_asc} LIMIT ?""",
             (*common, *key, nearby_each_side),
         ).fetchall()
         nearby_rows = [*reversed(before), current_row, *after]
@@ -572,15 +584,15 @@ class Store:
             previous = self._db.execute(
                 f"""SELECT id FROM interactions
                     WHERE session_id = ? AND {predicate}
-                      AND ({order_expr}, id) < (?, ?)
-                    ORDER BY {order_expr} DESC, id DESC LIMIT 1""",
+                      AND ({order_expr}, id) < ({key_sql})
+                    ORDER BY {order_desc} LIMIT 1""",
                 (current["session_id"], *key),
             ).fetchone()
             following = self._db.execute(
                 f"""SELECT id FROM interactions
                     WHERE session_id = ? AND {predicate}
-                      AND ({order_expr}, id) > (?, ?)
-                    ORDER BY {order_expr}, id LIMIT 1""",
+                      AND ({order_expr}, id) > ({key_sql})
+                    ORDER BY {order_asc} LIMIT 1""",
                 (current["session_id"], *key),
             ).fetchone()
             navigation[f"previous_{label}"] = previous["id"] if previous else None
