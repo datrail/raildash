@@ -1,9 +1,18 @@
-.PHONY: test lint serve demo clean stack stack-logs stack-down stack-test
+.PHONY: test lint serve demo clean stack stack-logs stack-down stack-clean stack-test
 
 VENV := .venv
 PY   := $(VENV)/bin/python
 
 RAILMON_REPO ?= https://github.com/datrail/railmon.git
+
+# What `make stack` builds RailMon from. The resulting image runs --privileged
+# with the host PID namespace (eBPF; see docker-compose.yml), so whatever this
+# resolves to gets root-equivalent execution on the machine running the stack.
+# A branch name is a moving target: anyone able to push to it, or to MITM the
+# clone, inherits that. Override with a tag or commit SHA to pin --
+# `make stack RAILMON_REF=v0.1.0` -- and switch the default to a release tag
+# once one carries DR-81's env-var passthrough.
+RAILMON_REF ?= master
 
 # One source of truth for the session id both ingestion paths use. RailMon gets
 # it as RAILMON_SESSION_ID (interpolated into docker-compose.yml, which repeats
@@ -49,7 +58,7 @@ clean:
 # present — delete the directory to force a re-clone). See docker-compose.yml's
 # header and README.md's "Running both together" for why this lives here.
 railmon:
-	git clone --depth 1 $(RAILMON_REPO) railmon || { rm -rf railmon; exit 1; }
+	git clone --depth 1 --branch "$(RAILMON_REF)" $(RAILMON_REPO) railmon || { rm -rf railmon; exit 1; }
 
 # A RailDash database is single-process by design: store.py takes
 # `PRAGMA locking_mode=EXCLUSIVE` so an older process cannot write unredacted
@@ -61,17 +70,21 @@ railmon:
 stack: railmon
 	docker compose up --build -d
 	@echo "waiting for the demo capture to finish..."
-	@docker wait $$(docker compose ps -aq railmon) >/dev/null
+	@code=$$(docker wait $$(docker compose ps -aq railmon)); \
+	  [ "$$code" = "0" ] || { \
+	    echo "railmon's demo exited $$code -- capture is missing or truncated." >&2; \
+	    echo "see: docker compose logs railmon" >&2; exit 1; }
 	@echo "importing the capture file (server paused)..."
 	docker compose stop raildash
 	docker compose run --rm --entrypoint python3 raildash \
 	  -m raildash.cli --db /data/raildash.db load /captures/capture.jsonl \
 	  --session-id "$(DEMO_SESSION_ID)"
 	docker compose start raildash
-	@for i in $$(seq 1 30); do \
-	  curl -fsS http://127.0.0.1:8000/webhook/health >/dev/null 2>&1 && break; \
+	@ok=0; for i in $$(seq 1 30); do \
+	  if curl -fsS http://127.0.0.1:8000/webhook/health >/dev/null 2>&1; then ok=1; break; fi; \
 	  sleep 1; \
-	done
+	done; \
+	[ "$$ok" = "1" ] || { echo "raildash did not come back healthy" >&2; exit 1; }
 	docker compose ps
 	@echo ""
 	@echo "open http://127.0.0.1:8000 -- see README.md 'Running both together'"
@@ -83,16 +96,26 @@ stack-logs:
 stack-down:
 	docker compose down
 
+# `down` alone keeps the named volumes, so capture.jsonl (RailMon appends) and
+# raildash.db survive and a second `make stack` shows the first run's rows too.
+# This is the reset that makes the README's "6 interactions" true again.
+stack-clean:
+	docker compose down -v
+	rm -rf railmon
+
 # Compose-level smoke test: raildash up, demo capture, file import, then check
 # that what got stored equals what actually got captured -- not just "greater
 # than zero". A dedup regression (the two wirings landing in different sessions)
 # shows up as stored > file_lines, which "count > 0" alone would never catch.
 # One shell with a trap, so teardown runs even when an early step fails --
 # otherwise the failure this target exists to catch leaves containers and both
-# volumes up, and the next run starts dirty.
+# volumes up, and the next run starts dirty. `down -v` because the volumes are
+# the dirty part: capture.jsonl appends and the database persists, so keeping
+# them makes each run's numbers depend on the last. The count is also scoped to
+# this session id, since /api/overview aggregates the whole database.
 stack-test: railmon
 	@set -e; \
-	trap 'docker compose down' EXIT; \
+	trap 'docker compose down -v' EXIT; \
 	docker compose up --build -d raildash; \
 	docker compose up --build --exit-code-from railmon railmon; \
 	docker compose stop raildash; \
@@ -105,7 +128,7 @@ stack-test: railmon
 	  sleep 1; \
 	done; \
 	file_lines=$$(docker compose exec -T raildash cat /captures/capture.jsonl | wc -l); \
-	stored=$$(curl -fsS http://127.0.0.1:8000/api/overview | python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["interactions"])'); \
+	stored=$$(curl -fsS "http://127.0.0.1:8000/api/overview?session_id=$(DEMO_SESSION_ID)" | python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["interactions"])'); \
 	echo "capture.jsonl lines: $$file_lines, interactions stored: $$stored"; \
 	[ "$$stored" -gt 0 ] || { echo "stack-test: expected interactions > 0, got $$stored" >&2; exit 1; }; \
 	[ "$$stored" -eq "$$file_lines" ] || { echo "stack-test: both wirings double-counted -- $$stored stored vs $$file_lines captured" >&2; exit 1; }

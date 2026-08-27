@@ -142,6 +142,14 @@ dashboard. The alternative the Storage section names, a separate `--db` path,
 would defeat the point here: the two ingestion paths have to land in one
 database to be deduplicated against each other.
 
+Those numbers describe a first run on empty volumes. `make stack-down` stops
+the stack but keeps them, and RailMon's capture file appends rather than
+truncating, so a second `make stack` shows both runs — 12 interactions, not 6,
+and correctly so. `make stack-clean` removes the volumes and the cloned
+`railmon/`, which is what makes the counts above true again. `make stack-test`
+always tears its volumes down, so its assertion does not depend on what ran
+before it.
+
 Stopping RailMon (`docker compose stop railmon`) leaves the dashboard serving
 what it already has, same as the "no control plane" reasoning above — the file
 path is passive and the webhook path only ever pushed.
