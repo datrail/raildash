@@ -140,6 +140,44 @@ def test_investigation_api_provides_error_and_tool_navigation(client):
     }
 
 
+def test_investigation_uses_wall_clock_when_timestamp_ns_is_missing(client):
+    interactions = [
+        {
+            "interaction_id": interaction_id,
+            "timestamp": timestamp,
+            "pid": 9,
+            "tid": 10,
+            "request": {"method": "GET", "path": f"/{interaction_id}"},
+            "response": {"status_code": status},
+        }
+        for interaction_id, timestamp, status in (
+            ("last", "2026-08-15T18:00:03Z", 403),
+            ("first", "2026-08-15T18:00:01Z", 429),
+            ("middle", "2026-08-15T18:00:02Z", 500),
+        )
+    ]
+    client.post(
+        "/webhook/http-interactions",
+        json={"session_id": "no-monotonic-clock", "interactions": interactions},
+    ).raise_for_status()
+    rows = client.get(
+        "/api/interactions", params={"session_id": "no-monotonic-clock"}
+    ).json()["items"]
+    by_interaction = {row["interaction_id"]: row for row in rows}
+
+    detail = client.get(
+        f"/api/interactions/{by_interaction['middle']['id']}"
+    ).json()
+
+    assert [row["interaction_id"] for row in detail["nearby"]] == [
+        "first",
+        "middle",
+        "last",
+    ]
+    assert detail["navigation"]["previous_error"] == by_interaction["first"]["id"]
+    assert detail["navigation"]["next_error"] == by_interaction["last"]["id"]
+
+
 def test_tool_names_and_navigation_never_expose_credentials(client):
     credential = "Bearer-never-return-this"
     malicious_name = '<img src=x onerror="alert(1)">'
