@@ -163,7 +163,16 @@ it with `docker exec <container> python -m raildash.cli load <file>`.
 make test     # pytest + py_compile
 make lint     # static check of the three front-end files
 make demo     # load the test fixture and serve it
+make static-demo  # build a hosting-ready synthetic fixture site under dist/
 ```
+
+`make static-demo` is deterministic and does not deploy anything. It exports
+the current UI assets plus precomputed JSON from
+`tests/fixtures/capture.jsonl` only. The generated site has no FastAPI or
+SQLite process: filtering and pagination run in the browser, and a visible
+banner identifies it as a static fixture with no live capture. The output is
+ready to upload to an approved static host later; this repository does not
+assume a public host or deployment credential exists.
 
 `tests/fixtures/capture.jsonl` is shaped exactly like RailMon's output,
 including the two fields that are routinely null in a real capture — a
