@@ -182,6 +182,60 @@ async function loadOverview() {
   renderHosts(data.hosts || []);
 }
 
+function profileValues(title, items) {
+  const group = el("section", "profile-group");
+  group.append(el("h3", null, title));
+  const values = el("div", "profile-values");
+  if (!items.length) {
+    values.append(el("span", "muted", "None observed"));
+  }
+  items.forEach((item) => {
+    const chip = el("span", "profile-chip");
+    chip.append(el("span", "profile-value", item.value));
+    chip.append(el("span", "profile-count", item.count));
+    values.append(chip);
+  });
+  group.append(values);
+  return group;
+}
+
+async function loadProfile() {
+  const grid = $("profile-grid");
+  const download = $("profile-download");
+  grid.replaceChildren();
+  if (!state.sessionId) {
+    grid.append(el("p", "muted", "Select a captured session."));
+    download.setAttribute("aria-disabled", "true");
+    download.removeAttribute("href");
+    return;
+  }
+
+  const path = `/api/profile?session_id=${encodeURIComponent(state.sessionId)}`;
+  const profile = await getJSON(path);
+  const observed = profile.observed || {};
+  download.href = path;
+  download.removeAttribute("aria-disabled");
+
+  const facts = el("section", "profile-group profile-facts");
+  facts.append(el("h3", null, "Capture summary"));
+  const summary = el("dl", "profile-summary");
+  [
+    ["Errors", `${fmtInt(observed.error_count)} · ${((observed.error_rate || 0) * 100).toFixed(1)}%`],
+    ["x-rail", observed.x_rail && observed.x_rail.present
+      ? `present on ${fmtInt(observed.x_rail.interaction_count)} calls`
+      : "not observed"],
+  ].forEach(([label, value]) => {
+    summary.append(el("dt", null, label));
+    summary.append(el("dd", null, value));
+  });
+  facts.append(summary);
+  grid.append(facts);
+  grid.append(profileValues("Hosts", observed.hosts || []));
+  grid.append(profileValues("Methods", observed.methods || []));
+  grid.append(profileValues("Tools", observed.tool_names || []));
+  grid.append(profileValues("Models", observed.models || []));
+}
+
 function renderHosts(hosts) {
   const body = $("hosts");
   body.replaceChildren();
@@ -453,7 +507,7 @@ async function refresh() {
   try {
     await loadSessions();
     renderActiveFilter();
-    await Promise.all([loadOverview(), loadLog()]);
+    await Promise.all([loadOverview(), loadProfile(), loadLog()]);
     await loadFilterOptions();
     setConn("live", "live");
   } catch (err) {

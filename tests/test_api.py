@@ -50,6 +50,189 @@ def test_overview_totals(client):
     assert hosts["api.anthropic.com"]["errors"] == 1
 
 
+def test_observed_profile_summarises_one_capture(client):
+    response = client.get("/api/profile", params={"session_id": "file:capture.jsonl"})
+
+    assert response.status_code == 200
+    assert response.headers["content-disposition"] == (
+        'attachment; filename="raildash-observed-profile.json"'
+    )
+    profile = response.json()
+    assert profile["schema_version"] == "1.0"
+    assert profile["source"] == "raildash-observed"
+    assert profile["authoritative"] is False
+    assert "not an authoritative Rail Center score" in profile["disclaimer"]
+    assert profile["session"] == {
+        "id": "file:capture.jsonl",
+        "agent": "openclaw-1",
+        "capture_start": "",
+    }
+    observed = profile["observed"]
+    assert observed["interaction_count"] == 8
+    assert observed["error_count"] == 3
+    assert observed["error_rate"] == 0.375
+    assert observed["x_rail"] == {"present": True, "interaction_count": 4}
+    assert observed["hosts"][0] == {"value": "api.anthropic.com", "count": 3}
+    assert observed["methods"] == [
+        {"value": "POST", "count": 5},
+        {"value": "GET", "count": 2},
+    ]
+    assert observed["models"] == [{"value": "claude-sonnet-5", "count": 3}]
+    assert observed["tool_names"] == [
+        {"value": "delivery_track_package", "count": 2}
+    ]
+    assert observed["tool_names_truncated"] is False
+    assert observed["truncated_dimensions"] == []
+
+
+def test_observed_profile_missing_session_is_404(client):
+    assert client.get("/api/profile", params={"session_id": "missing"}).status_code == 404
+
+
+def test_observed_profile_accepts_session_ids_with_slashes(client):
+    client.post(
+        "/webhook/http-interactions",
+        json={"session_id": "agent/run-1", "interactions": []},
+    ).raise_for_status()
+
+    response = client.get("/api/profile", params={"session_id": "agent/run-1"})
+
+    assert response.status_code == 200
+    assert response.json()["session"]["id"] == "agent/run-1"
+
+
+def test_observed_profile_bounds_tool_name_work(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_TOOL_ROWS", 1)
+    payload = {
+        "session_id": "bounded-profile",
+        "interactions": [
+            {
+                "interaction_id": f"tool-{index}",
+                "response": {
+                    "status_code": 200,
+                    "body": {
+                        "content": [
+                            {"type": "tool_use", "name": f"tool-{index}"}
+                        ]
+                    },
+                },
+            }
+            for index in range(2)
+        ],
+    }
+    client.post("/webhook/http-interactions", json=payload).raise_for_status()
+
+    observed = client.get(
+        "/api/profile", params={"session_id": "bounded-profile"}
+    ).json()["observed"]
+
+    assert observed["tool_names_truncated"] is True
+    assert len(observed["tool_names"]) == 1
+
+
+def test_observed_profile_bounds_distinct_dimension_values(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_DIMENSION_VALUES", 1)
+
+    observed = client.get(
+        "/api/profile", params={"session_id": "file:capture.jsonl"}
+    ).json()["observed"]
+
+    assert len(observed["hosts"]) == 1
+    assert len(observed["methods"]) == 1
+    assert len(observed["models"]) == 1
+    assert observed["truncated_dimensions"] == ["hosts", "methods"]
+
+
+def test_observed_profile_bounds_individual_value_lengths(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_VALUE_CHARS", 8)
+    long_value = "captured-value-that-is-too-long"
+    client.post(
+        "/webhook/http-interactions",
+        json={
+            "session_id": "long-profile-values",
+            "interactions": [
+                {
+                    "request": {
+                        "method": long_value,
+                        "headers": {"host": long_value},
+                        "body": {"model": long_value},
+                    },
+                    "response": {
+                        "status_code": 200,
+                        "body": {
+                            "content": [
+                                {"type": "tool_use", "name": long_value}
+                            ]
+                        },
+                    },
+                }
+            ],
+        },
+    ).raise_for_status()
+
+    observed = client.get(
+        "/api/profile", params={"session_id": "long-profile-values"}
+    ).json()["observed"]
+
+    assert observed["hosts"] == [{"value": "captured", "count": 1}]
+    assert observed["methods"] == [{"value": "CAPTURED", "count": 1}]
+    assert observed["models"] == [{"value": "captured", "count": 1}]
+    assert observed["tool_names"] == [{"value": "captured", "count": 1}]
+    assert observed["tool_names_truncated"] is True
+    assert observed["truncated_dimensions"] == [
+        "hosts",
+        "methods",
+        "models",
+        "tool_names",
+    ]
+
+
+def test_observed_profile_never_exports_credentials(client):
+    secret = "profile-must-not-export-this"
+    tool_name = "<img src=x onerror='alert(1)'>"
+    client.post(
+        "/webhook/http-interactions",
+        json={
+            "session_id": "profile-safety",
+            "interactions": [
+                {
+                    "request": {
+                        "method": "POST",
+                        "headers": {
+                            "host": "api.example.com",
+                            "authorization": secret,
+                            "x-rail": secret,
+                        },
+                        "body": {"model": "example-model"},
+                    },
+                    "response": {
+                        "status_code": 500,
+                        "body": {
+                            "content": [
+                                {"type": "tool_use", "name": tool_name},
+                                {"type": "tool_use", "name": tool_name},
+                            ]
+                        },
+                    },
+                }
+            ],
+        },
+    ).raise_for_status()
+
+    profile = client.get("/api/profile", params={"session_id": "profile-safety"}).json()
+    rendered = json.dumps(profile)
+
+    assert secret not in rendered
+    assert profile["observed"]["tool_names"] == [{"value": tool_name, "count": 2}]
+    assert profile["observed"]["x_rail"]["present"] is True
+
+
 def test_interactions_are_newest_first(client):
     items = client.get("/api/interactions").json()["items"]
     stamps = [i["timestamp"] for i in items if i["timestamp"]]
@@ -734,3 +917,13 @@ def test_the_front_end_never_assigns_markup(client):
     js = client.get("/app.js").text
     for sink in ("innerHTML =", "outerHTML =", "insertAdjacentHTML", "document.write"):
         assert sink not in js, f"{sink} would render captured traffic as markup"
+
+
+def test_observed_profile_ui_is_present_and_text_only(client):
+    html = client.get("/").text
+    js = client.get("/app.js").text
+
+    assert "Observed security profile" in html
+    assert 'id="profile-download"' in html
+    assert "not an authoritative Rail Center score" in html
+    assert 'el("span", "profile-value", item.value)' in js

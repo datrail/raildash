@@ -213,6 +213,21 @@ def api_overview(session_id: str | None = None) -> dict[str, Any]:
     return get_store().overview(session_id)
 
 
+@app.get("/api/profile")
+def api_observed_profile(session_id: str) -> JSONResponse:
+    profile = get_store().observed_profile(session_id)
+    if profile is None:
+        raise HTTPException(404, "no such session")
+    return JSONResponse(
+        profile,
+        headers={
+            "Content-Disposition": (
+                'attachment; filename="raildash-observed-profile.json"'
+            )
+        },
+    )
+
+
 @app.get("/api/filters")
 def api_filters(session_id: str | None = None) -> dict[str, Any]:
     db = get_store()
