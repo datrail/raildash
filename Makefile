@@ -19,11 +19,17 @@ RAILMON_REPO ?= https://github.com/datrail/railmon.git
 # (The clone below checks the ref out rather than passing it to `git clone
 # --branch`, which resolves branches and tags only and rejects a SHA outright.)
 #
-# The default stays on master because DR-81's env-var passthrough is not yet
-# released -- see the railmon-webhook-check target below, which fails loudly
-# rather than letting the stack run half-wired. Switch this default to the
-# first release tag that carries the passthrough.
-RAILMON_REF ?= master
+# The default is a commit SHA, not a branch, and that is the point: a branch
+# name would mean every `make stack` builds whatever upstream happens to hold
+# at that moment, privileged, on the host. This pin is datrail/railmon master
+# as reviewed for DR-81. It does NOT carry the env-var passthrough, so
+# railmon-webhook-check below stops the stack and says what to pass instead --
+# a loud stop rather than a silently half-wired run, and no moving target
+# either way.
+#
+# When datrail/railmon#9 merges, bump this to that merge commit (or the first
+# release tag containing it). Do not change it back to a branch name.
+RAILMON_REF ?= 278c79c
 
 # One source of truth for the session id both ingestion paths use. RailMon gets
 # it as RAILMON_SESSION_ID (interpolated into docker-compose.yml, which repeats
@@ -78,21 +84,31 @@ railmon:
 # otherwise be silently ignored and appear to have taken effect.
 .PHONY: railmon-ref-check railmon-webhook-check
 railmon-ref-check: railmon
-	@have=$$(cat railmon/.railmon-ref 2>/dev/null || echo '<unknown>'); \
+	@if [ ! -f railmon/.railmon-ref ]; then \
+	  echo "./railmon exists but this Makefile did not clone it (no .railmon-ref)." >&2; \
+	  echo "Nothing here will modify or delete it. Either set RAILMON_REF to the ref" >&2; \
+	  echo "it is actually on, or move it aside and let 'make stack' clone its own." >&2; \
+	  exit 1; \
+	fi; \
+	have=$$(cat railmon/.railmon-ref); \
 	if [ "$$have" != "$(RAILMON_REF)" ]; then \
-	  echo "./railmon is checked out at '$$have', but RAILMON_REF is '$(RAILMON_REF)'." >&2; \
-	  echo "Run 'make stack-clean' first to re-clone at the ref you asked for." >&2; \
+	  echo "./railmon was cloned at '$$have', but RAILMON_REF is '$(RAILMON_REF)'." >&2; \
+	  echo "'make stack-clean' will re-clone it (it removes only a clone it made," >&2; \
+	  echo "and only with nothing uncommitted in it)." >&2; \
 	  exit 1; \
 	fi
 
-# The webhook half of this stack depends on RailMon's demo honouring
-# RAILMON_WEBHOOK_URL / RAILMON_SESSION_ID. That passthrough is datrail/railmon#9
+# The webhook half of this stack depends on RailMon's demo honouring both
+# RAILMON_WEBHOOK_URL and RAILMON_SESSION_ID, so this greps for both: the URL
+# alone would post to a session id the file import cannot match, which is the
+# double-count this stack exists to avoid. That passthrough is datrail/railmon#9
 # and is not on master yet. Without it the collector is invoked with --output
 # only: the webhook never fires, the file import is the sole ingester, and
 # stack-test's dedup assertion would pass vacuously. Fail here instead, so the
 # stack is never quietly half of what it claims to be.
 railmon-webhook-check: railmon-ref-check
-	@grep -q RAILMON_WEBHOOK_URL railmon/tools/local-demo/run_local_demo.sh 2>/dev/null || { \
+	@grep -q RAILMON_WEBHOOK_URL railmon/tools/local-demo/run_local_demo.sh 2>/dev/null \
+	  && grep -q RAILMON_SESSION_ID railmon/tools/local-demo/run_local_demo.sh 2>/dev/null || { \
 	  echo "The RailMon at ./railmon (ref '$(RAILMON_REF)') has no RAILMON_WEBHOOK_URL" >&2; \
 	  echo "passthrough, so only the file path would ingest and the webhook path" >&2; \
 	  echo "would never fire. That passthrough is datrail/railmon#9." >&2; \
@@ -111,7 +127,7 @@ railmon-webhook-check: railmon-ref-check
 stack: railmon-webhook-check
 	docker compose up --build -d
 	@echo "waiting for the demo capture to finish..."
-	@code=$$(docker wait $$(docker compose ps -aq railmon)); \
+	@code=$$(docker wait "$$(docker compose ps -aq railmon)"); \
 	  [ "$$code" = "0" ] || { \
 	    echo "railmon's demo exited $$code -- capture is missing or truncated." >&2; \
 	    echo "see: docker compose logs railmon" >&2; exit 1; }
@@ -140,9 +156,20 @@ stack-down:
 # `down` alone keeps the named volumes, so capture.jsonl (RailMon appends) and
 # raildash.db survive and a second `make stack` shows the first run's rows too.
 # This is the reset that makes the README's "6 interactions" true again.
+# Removes only a ./railmon this Makefile cloned (it leaves a .railmon-ref
+# stamp) and only when it has nothing uncommitted. A hand-made checkout --
+# which is exactly what you have if you are testing datrail/railmon#9 -- is
+# left alone with a message, never deleted.
 stack-clean:
 	docker compose down -v
-	rm -rf railmon
+	@if [ ! -d railmon ]; then :; \
+	elif [ ! -f railmon/.railmon-ref ]; then \
+	  echo "./railmon has no .railmon-ref stamp, so this Makefile did not clone it." >&2; \
+	  echo "Leaving it alone. Remove it yourself if that is what you meant." >&2; \
+	elif [ -n "$$(git -C railmon status --porcelain 2>/dev/null)" ]; then \
+	  echo "./railmon has uncommitted changes. Leaving it alone." >&2; \
+	  echo "Commit, stash, or move it aside first." >&2; \
+	else rm -rf railmon; fi
 
 # Compose-level smoke test: raildash up, demo capture, file import, then check
 # that what got stored equals what actually got captured -- not just "greater
@@ -170,14 +197,19 @@ stack-test: railmon-webhook-check
 	  sleep 1; \
 	done; \
 	[ "$$ok" = "1" ] || { echo "raildash did not come back healthy" >&2; exit 1; }; \
-	file_lines=$$(docker compose exec -T raildash cat /captures/capture.jsonl | wc -l); \
-	[ "$$file_lines" -gt 0 ] || { echo "stack-test: /captures/capture.jsonl is empty or unreadable -- RailMon captured nothing" >&2; exit 1; }; \
+	capture=$$(docker compose exec -T raildash cat /captures/capture.jsonl) \
+	  || { echo "stack-test: could not read /captures/capture.jsonl" >&2; exit 1; }; \
+	file_lines=$$(printf '%s\n' "$$capture" | grep -c . || true); \
+	[ "$$file_lines" -gt 0 ] || { echo "stack-test: capture.jsonl is empty -- RailMon captured nothing" >&2; exit 1; }; \
 	inserted=$$(printf '%s\n' "$$import_out" | sed -n 's/^loaded \([0-9][0-9]*\) interaction.*/\1/p'); \
 	duplicate=$$(printf '%s\n' "$$import_out" | sed -n 's/^ *\([0-9][0-9]*\) already present.*/\1/p'); \
-	duplicate=$${duplicate:-0}; \
+	inserted=$${inserted:-0}; duplicate=$${duplicate:-0}; \
+	total=$$((inserted + duplicate)); \
+	[ "$$total" -gt 0 ] || { echo "stack-test: the import parsed no interactions out of $$file_lines line(s)" >&2; exit 1; }; \
+	[ "$$total" -eq "$$file_lines" ] || echo "stack-test: note -- $$file_lines line(s) in capture.jsonl, $$total parsed (truncated or unparseable tail)" >&2; \
 	stored=$$(curl -fsS "http://127.0.0.1:8000/api/overview?session_id=$(DEMO_SESSION_ID)" | python3 -c 'import json,sys; print(json.load(sys.stdin)["totals"]["interactions"])'); \
 	echo "capture.jsonl lines: $$file_lines, interactions stored: $$stored"; \
 	[ "$$stored" -gt 0 ] || { echo "stack-test: expected interactions > 0, got $$stored" >&2; exit 1; }; \
-	[ "$$duplicate" -eq "$$file_lines" ] || { echo "stack-test: the webhook path did not deliver -- the import found $$duplicate of $$file_lines already present, so it ingested them itself. Both paths must be wired for this assertion to mean anything." >&2; exit 1; }; \
+	[ "$$duplicate" -eq "$$total" ] || { echo "stack-test: the webhook path did not deliver -- the import found $$duplicate of $$total already present, so it ingested them itself. Both paths must be wired for this assertion to mean anything." >&2; exit 1; }; \
 	[ "$$inserted" = "0" ] || { echo "stack-test: the import inserted $$inserted row(s) the webhook should already have delivered" >&2; exit 1; }; \
-	[ "$$stored" -eq "$$file_lines" ] || { echo "stack-test: both wirings double-counted -- $$stored stored vs $$file_lines captured" >&2; exit 1; }
+	[ "$$stored" -eq "$$total" ] || { echo "stack-test: both wirings double-counted -- $$stored stored vs $$total captured" >&2; exit 1; }

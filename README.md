@@ -93,7 +93,10 @@ make stack
 > `master` yet. `make stack` checks for it and stops with instructions rather
 > than running half-wired; until it merges, use
 > `make stack RAILMON_REF=dr-81-demo-env-passthrough`. Pin RailMon to any tag,
-> branch or commit the same way.
+> branch or commit the same way. The default is a commit SHA rather than a
+> branch on purpose: the RailMon image runs privileged with the host PID
+> namespace, so a moving upstream ref would mean root-equivalent execution on
+> your machine from whatever that branch holds today.
 
 `make stack` clones `datrail/railmon` into `./railmon` (this repo has no
 RailMon source of its own — see `docker-compose.yml`'s header for why that is
