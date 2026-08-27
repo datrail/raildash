@@ -21,14 +21,13 @@
 # alone. Full explanation in the "Running both together" section of README.md.
 #
 # The file-import step is NOT a service here, deliberately. It was one, and it
-# failed: only ONE process can hold this SQLite database open. The DB lives on
-# a named volume, where WAL's -shm file is not shareable, so a second opener
-# gets "database is locked" even for a read-only `PRAGMA journal_mode` with a
-# 30s timeout — measured on WSL2 Docker, both from a second container and from
-# a second process inside this one. So the Makefile stops this service, runs
-# `raildash load` as the sole opener, and starts it again. That keeps the file
-# path on RailDash's real documented import command rather than faking it
-# through the webhook endpoint.
+# failed: a RailDash database is single-process by design. store.py takes
+# `PRAGMA locking_mode=EXCLUSIVE` so an older process cannot write unredacted
+# rows around a schema migration (DR-20), so a second opener gets "database is
+# locked" wherever the file lives. The Makefile therefore stops this service,
+# runs `raildash load` as the sole owner, and starts it again — keeping the
+# file path on RailDash's real documented import command rather than faking it
+# through the webhook endpoint. See README.md's Storage section.
 
 services:
   raildash:
