@@ -247,7 +247,7 @@ def api_interactions(
 
 @app.get("/api/interactions/{row_id}")
 def api_interaction(row_id: int) -> dict[str, Any]:
-    found = get_store().interaction(row_id)
+    found = get_store().investigation(row_id)
     if found is None:
         raise HTTPException(404, "no such interaction")
     return found
