@@ -8,6 +8,12 @@ __pycache__/
 *.egg-info/
 build/
 
-# `make stack` clones datrail/railmon here (see Makefile). Build input, not
-# source: it is its own repository and must never be committed.
+# A leftover ./railmon checkout (earlier DR-81 iterations cloned one here; the
+# stack now uses an existing sibling checkout via RAILMON_SRC and clones
+# nothing). It is its own repository and must never be committed here.
 railmon/
+
+# Local-only scratch checker for the DR-81 stack. Deliberately untracked: it
+# greps this working tree against the review rounds it was written for, so it
+# is a developer's notes, not something the repo ships.
+preflight.sh

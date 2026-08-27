@@ -107,16 +107,20 @@ jobs:
   # test one tree and publish another — precisely the divergence the version
   # job exists to close.
   #
-  # `secrets: inherit` because only GITHUB_TOKEN is passed to a called workflow
-  # automatically. Without it SUBMODULE_TOKEN arrives as an empty string, and a
-  # component with a private submodule would attempt the recursive checkout
-  # with a token that cannot read another repository.
+  # No `secrets:` block. Only GITHUB_TOKEN reaches a called workflow
+  # automatically, and that is all ci.yml uses: neither of its checkout steps
+  # passes `submodules:` or `token:`, and it references no secret anywhere. The
+  # submodule machinery that would need SUBMODULE_TOKEN lives in the `publish`
+  # job below, not here, so `secrets: inherit` would hand every repository and
+  # organisation secret to a workflow that has no use for one. A component
+  # whose ci.yml grows a private-submodule checkout adds `secrets:
+  # SUBMODULE_TOKEN: ${{ secrets.SUBMODULE_TOKEN }}` here — the one secret, not
+  # all of them.
   ci:
     needs: version
     uses: ./.github/workflows/ci.yml
     with:
       ref: ${{ needs.version.outputs.tag }}
-    secrets: inherit
     permissions:
       contents: read
 

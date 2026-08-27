@@ -81,15 +81,24 @@ The two sections above are RailMon and RailDash run and wired by hand. This
 repo also ships a `docker compose` stack that does both automatically, with
 both of RailMon's output paths wired at once. It runs in two modes.
 
+> **Prerequisite, not yet on `master`.** Both modes need RailMon's demo
+> env-var passthrough,
+> [datrail/railmon#9](https://github.com/datrail/railmon/pull/9), which is
+> still an open pull request. Until it merges and a release is tagged,
+> `railmon`'s `master` does not have it and no published `RAILMON_TAG`
+> contains it — check out the branch, as below, and expect registry mode to
+> be unusable. `make stack-local` verifies the checkout and stops with
+> instructions rather than running half a stack.
+
 **Local-built** — build from source. Assumes the component repos are already
 checked out: this one, and a RailMon checkout at `../railmon` (override with
-`RAILMON_SRC=/path/to/railmon`). That checkout must include RailMon's demo
-env-var passthrough ([datrail/railmon#9](https://github.com/datrail/railmon/pull/9));
-`make stack-local` checks and stops with instructions if it does not.
+`RAILMON_SRC=/path/to/railmon`).
 
 ```bash
 git clone https://github.com/datrail/raildash.git
 git clone https://github.com/datrail/railmon.git
+# until railmon#9 merges, master lacks the passthrough this stack needs:
+git -C railmon checkout dr-81-demo-env-passthrough
 cd raildash
 make stack-local
 ```
@@ -102,6 +111,10 @@ the leading `v` is stripped to match what the release workflow publishes.
 ```bash
 make stack RAILMON_TAG=v0.1.1 RAILDASH_TAG=v0.1.0
 ```
+
+Both tags are required — there is no `latest` default, here or in
+`docker-compose.yml`, because RailMon runs privileged with the host PID
+namespace and a moving tag there is a moving root-equivalent process.
 
 While the datrail repos are private their packages are too, so `docker login
 ghcr.io` with a GitHub PAT (`read:packages`) first. The RailMon tag must

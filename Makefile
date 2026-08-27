@@ -60,8 +60,19 @@ export DEMO_SESSION_ID
 
 export RAILMON_TAG RAILDASH_TAG
 
+# The base compose file requires both tags rather than defaulting them to
+# `:latest`, so that a bare `docker compose up` cannot pull a moving tag into
+# railmon's privileged, host-PID container (see docker-compose.yml). Compose
+# interpolates that file for every subcommand though -- including `down` and
+# `logs`, which resolve no image at all -- so the invocations that do not name
+# a release still have to supply something. `local` is that something: it is
+# the tag docker-compose.build.yml substitutes in anyway, and no teardown or
+# log-tail command ever turns it into a registry pull.
+PLACEHOLDER_TAGS := RAILMON_TAG=local RAILDASH_TAG=local
+
 COMPOSE       := docker compose
-COMPOSE_LOCAL := docker compose -f docker-compose.yml -f docker-compose.build.yml
+COMPOSE_ANY   := $(PLACEHOLDER_TAGS) docker compose
+COMPOSE_LOCAL := $(PLACEHOLDER_TAGS) docker compose -f docker-compose.yml -f docker-compose.build.yml
 
 # Local-built mode needs a RailMon checkout, and one that honours the demo
 # env vars this stack depends on (datrail/railmon#9) -- both of them: the URL
@@ -112,7 +123,7 @@ _stack-up:
 	@code=$$(docker wait "$$($(COMPOSE_CMD) ps -aq railmon)"); \
 	  [ "$$code" = "0" ] || { \
 	    echo "railmon's demo exited $$code -- capture is missing or truncated." >&2; \
-	    echo "see: $(COMPOSE_CMD) logs railmon" >&2; exit 1; }
+	    echo "see: make stack-logs" >&2; exit 1; }
 	@echo "importing the capture file (server paused)..."
 	$(COMPOSE_CMD) stop raildash
 	@if ! $(COMPOSE_CMD) run --rm --entrypoint python3 raildash \
@@ -134,16 +145,16 @@ _stack-up:
 	@echo "tail logs with: make stack-logs"
 
 stack-logs:
-	$(COMPOSE) logs -f --tail=50
+	$(COMPOSE_ANY) logs -f --tail=50
 
 stack-down:
-	$(COMPOSE) down
+	$(COMPOSE_ANY) down
 
 # `down` alone keeps the named volumes, so capture.jsonl (RailMon appends) and
 # the database survive and a second run shows the first run's rows too. This
 # is the reset that makes the README's first-run numbers true again.
 stack-clean:
-	$(COMPOSE) down -v
+	$(COMPOSE_ANY) down -v
 
 # Compose-level smoke test, in local-built mode: raildash up, demo capture,
 # file import, then check that what got stored equals what actually got

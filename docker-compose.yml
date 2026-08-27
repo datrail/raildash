@@ -28,7 +28,10 @@ services:
     # Registry mode; docker-compose.build.yml overrides this with a local
     # build. Image tags carry no leading v (the release workflow publishes
     # 0.1.0 for git tag v0.1.0); `make stack` strips one either way.
-    image: ghcr.io/datrail/raildash:${RAILDASH_TAG:-latest}
+    #
+    # Required, not defaulted -- see the railmon service below for why there is
+    # no `:-latest` here either.
+    image: ghcr.io/datrail/raildash:${RAILDASH_TAG:?set RAILDASH_TAG to a published tag, or use `make stack RAILMON_TAG=... RAILDASH_TAG=...` / `make stack-local`}
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
@@ -49,7 +52,17 @@ services:
       retries: 15
 
   railmon:
-    image: ghcr.io/datrail/railmon:${RAILMON_TAG:-latest}
+    # No `:-latest` default, deliberately. This service is privileged with the
+    # host PID namespace (below), so whatever image lands here runs
+    # root-equivalent on the machine -- and `:latest` is a mutable pointer that
+    # container-release.yml's own header documents as last-write-wins across
+    # concurrent tag pushes. `make stack` already refuses to run without both
+    # tags, but that guard lives in the Makefile: a bare `docker compose up` in
+    # this directory would sail past it. Requiring the variable here means the
+    # unguarded path fails with an explanation instead of silently pulling a
+    # moving tag into a privileged container. Local-built mode supplies
+    # `local`, which docker-compose.build.yml then replaces outright.
+    image: ghcr.io/datrail/railmon:${RAILMON_TAG:?set RAILMON_TAG to a published tag, or use `make stack RAILMON_TAG=... RAILDASH_TAG=...` / `make stack-local`}
     # eBPF tap -- RailMon's collect/demo always need this; not a choice this
     # stack makes. See railmon's README "Platforms" for the host kernel
     # prerequisites (BTF/CO-RE) it does not relax.
