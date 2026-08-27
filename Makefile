@@ -1,4 +1,4 @@
-.PHONY: test lint serve demo clean
+.PHONY: test lint serve demo static-demo clean
 
 VENV := .venv
 PY   := $(VENV)/bin/python
@@ -30,5 +30,10 @@ serve: $(VENV)
 demo: $(VENV)
 	$(PY) -m raildash.cli --db demo.db load tests/fixtures/capture.jsonl --serve
 
+# Deterministic, synthetic-data-only site. This builds files for a future
+# static host; it does not publish or deploy them.
+static-demo: $(VENV)
+	$(PY) tools/build_static_demo.py --output dist/static-demo
+
 clean:
-	rm -rf $(VENV) .pytest_cache **/__pycache__ demo.db raildash.db *.db-wal *.db-shm
+	rm -rf $(VENV) .pytest_cache **/__pycache__ demo.db raildash.db *.db-wal *.db-shm dist

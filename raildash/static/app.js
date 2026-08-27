@@ -21,6 +21,8 @@ const state = {
 };
 
 const $ = (id) => document.getElementById(id);
+const staticDemo = window.RAIL_DASH_STATIC_DEMO === true;
+let staticDataPromise = null;
 
 /* --------------------------------------------------------------- utilities */
 
@@ -76,6 +78,7 @@ function statusPill(code) {
 }
 
 async function getJSON(path, params) {
+  if (staticDemo) return getStaticJSON(path, params || {});
   const url = new URL(path, window.location.origin);
   Object.entries(params || {}).forEach(([k, v]) => {
     if (v !== null && v !== undefined && v !== "" && v !== false) {
@@ -85,6 +88,52 @@ async function getJSON(path, params) {
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
+}
+
+async function staticFixtureData() {
+  if (!staticDataPromise) {
+    staticDataPromise = fetch("./fixture-data.json").then((response) => {
+      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      return response.json();
+    });
+  }
+  return staticDataPromise;
+}
+
+function filterStaticInteractions(items, params) {
+  const filtered = items.filter((row) => {
+    if (params.session_id && row.session_id !== params.session_id) return false;
+    if (params.host && row.host !== params.host) return false;
+    if (params.method && row.method !== params.method) return false;
+    if (params.status_class && String(row.status_code || "")[0] !== params.status_class) return false;
+    if (params.errors_only && !(row.status_code >= 400)) return false;
+    if (params.q) {
+      const needle = String(params.q).toLowerCase();
+      if (!String(row.host || "").toLowerCase().includes(needle) &&
+          !String(row.path || "").toLowerCase().includes(needle)) return false;
+    }
+    return true;
+  });
+  const offset = Number(params.offset || 0);
+  const limit = Number(params.limit || 100);
+  return { total: filtered.length, items: filtered.slice(offset, offset + limit) };
+}
+
+async function getStaticJSON(path, params) {
+  const data = await staticFixtureData();
+  if (path === "/api/sessions") return data.sessions;
+  if (path === "/api/overview") return data.overview;
+  if (path === "/api/profile") return data.profile;
+  if (path === "/api/filters") return data.filters;
+  if (path === "/api/interactions") {
+    return filterStaticInteractions(data.interactions, params);
+  }
+  if (path.startsWith("/api/interactions/")) {
+    const rowId = path.slice(path.lastIndexOf("/") + 1);
+    const detail = data.details[rowId];
+    if (detail) return detail;
+  }
+  throw new Error(`Static fixture has no response for ${path}`);
 }
 
 function setConn(stateName, text) {
@@ -234,9 +283,9 @@ async function loadProfile() {
   }
 
   const path = `/api/profile?session_id=${encodeURIComponent(state.sessionId)}`;
-  const profile = await getJSON(path);
+  const profile = await getJSON("/api/profile", { session_id: state.sessionId });
   const observed = profile.observed || {};
-  download.href = path;
+  download.href = staticDemo ? "./profile.json" : path;
   download.removeAttribute("aria-disabled");
 
   const facts = el("section", "profile-group profile-facts");
@@ -638,7 +687,7 @@ async function refresh() {
     await Promise.all([loadOverview(), loadProfile(), loadLog()]);
     await loadDrift();
     await loadFilterOptions();
-    setConn("live", "live");
+    setConn("live", staticDemo ? "fixture" : "live");
   } catch (err) {
     // Say what broke. A dashboard that silently shows stale numbers during an
     // incident is worse than one that admits it lost the server.
@@ -695,6 +744,11 @@ function initTheme() {
 function init() {
   initTheme();
 
+  if (staticDemo) {
+    $("demo-banner").hidden = false;
+    setConn("live", "fixture");
+  }
+
   $("refresh").addEventListener("click", refresh);
   $("drift-left").addEventListener("change", (event) => {
     state.driftLeft = event.target.value;
@@ -748,9 +802,11 @@ function init() {
   refresh();
   // A capture arriving over the webhook should show up without a reload; five
   // seconds is frequent enough to feel live and rare enough to stay quiet.
-  setInterval(() => {
-    if (document.visibilityState === "visible" && $("detail").hidden) refresh();
-  }, 5000);
+  if (!staticDemo) {
+    setInterval(() => {
+      if (document.visibilityState === "visible" && $("detail").hidden) refresh();
+    }, 5000);
+  }
 }
 
 document.addEventListener("DOMContentLoaded", init);
