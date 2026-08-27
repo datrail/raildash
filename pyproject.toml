@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Local dashboard for RailMon captures. No control plane required."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "Apache-2.0"
 dependencies = [
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
