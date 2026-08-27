@@ -1,0 +1,227 @@
+# Build and publish a versioned container image to GitHub Packages (ghcr.io).
+#
+# Publishing is driven by tags: `git tag v0.1.0 && git push --tags` produces
+# ghcr.io/<owner>/<repo>:0.1.0, :0.1, and :latest, multi-arch, with an SBOM and
+# a signed build-provenance attestation.
+#
+# Each repository owns its copy of this file: there is no shared workflow repo
+# and nothing here is consumed by `workflow_call` from elsewhere, so a component
+# that needs to differ just edits it. (The migration workspace keeps a template
+# of this file and a script that seeds it into a checkout, but that is a
+# one-time copy living outside this repository — nothing in this repo depends
+# on it, and it will not overwrite an edit made here.)
+#
+# Requires a Dockerfile at the repository root; a component that keeps one
+# elsewhere has to edit the build step. Repositories that pin private
+# submodules need a SUBMODULE_TOKEN secret with read access, plus the
+# RAIL_SUBMODULES variable — GITHUB_TOKEN cannot read another repository.
+name: container-release
+
+on:
+  push:
+    # A shape check rather than the `v*` glob, which also matched `vfoo` and
+    # `v1` — neither of which can produce a version tag. It is deliberately
+    # not the whole rule: the trailing `*` still admits `v1.2.3.4` and
+    # `v1.2.3rc1`, because a tag filter cannot express "end of string" while
+    # still allowing the `-rc.1` and `+build` suffixes semver permits. The
+    # `version` job is the actual validator, and it runs before anything is
+    # checked out or built.
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version to publish, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+# Keyed on the repository, not the ref. Every tag is a distinct ref, so a
+# ref-keyed group lets `v0.1.0` and `v0.1.1` publish concurrently — and both
+# write the same mutable `:0.1` and `:latest` tags, which is a last-write-wins
+# race on exactly the pointers people pull by.
+#
+# Known cost of that choice: a group keeps only one *pending* run, and
+# `cancel-in-progress: false` does not protect it — a third tag pushed while one
+# release is running and another is queued silently cancels the queued one. So
+# three tags in quick succession publish the first and the last, not the middle.
+# Serialising and never-dropping are not both available from one group; this
+# picks serialising, because a dropped release is visible (no package appears)
+# while a raced `:latest` is not (it points at the wrong build). Push release
+# tags one at a time and confirm each.
+concurrency:
+  group: container-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  # Its own job, not a step inside `publish`, for two reasons: the CI gate below
+  # needs the resolved tag to know *what* to test, and a malformed tag should
+  # fail in seconds rather than after a full test-and-build.
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      latest: ${{ steps.version.outputs.latest }}
+    steps:
+      # Resolve the version before anything is checked out or built, and refuse
+      # anything that is not a release tag.
+      #
+      # This is load-bearing for workflow_dispatch. metadata-action derives its
+      # tags from the *event's* ref, not from what we checked out, so a manual
+      # run would tag whatever the "use workflow from" branch is — `type=semver`
+      # would match nothing and emit no version, while `latest` (a branch name
+      # has no hyphen) would fire anyway. Republishing v0.1.0 by hand would
+      # quietly push the branch head as `:latest` and nothing else.
+      #
+      # It also backstops the tag filter, which cannot express the whole semver
+      # shape: `v1.2.3.4` still matches the trigger and is refused here.
+      - id: version
+        env:
+          RAW_REF: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RAW_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$RAW_REF' is not a vMAJOR.MINOR.PATCH release tag; refusing to publish."
+            exit 1
+          fi
+          echo "tag=$RAW_REF" >> "$GITHUB_OUTPUT"
+          # A prerelease must not move `latest` — someone pulling the
+          # unqualified name is asking for the newest stable build.
+          if [[ "$RAW_REF" == *-* ]]; then
+            echo "latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "latest=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Gate the publish on the same checks a pull request gets, rather than
+  # duplicating them here. A tag can sit on any commit, including one that
+  # never went through a PR, so "it passed on the PR" is not something this
+  # workflow can assume.
+  #
+  # `ref` is passed explicitly: a called workflow's `github.ref` is the
+  # *caller's*, which for workflow_dispatch is the branch chosen in "use
+  # workflow from", not the tag being published. Without this the gate would
+  # test one tree and publish another — precisely the divergence the version
+  # job exists to close.
+  #
+  # No `secrets:` block. Only GITHUB_TOKEN reaches a called workflow
+  # automatically, and that is all ci.yml uses: neither of its checkout steps
+  # passes `submodules:` or `token:`, and it references no secret anywhere. The
+  # submodule machinery that would need SUBMODULE_TOKEN lives in the `publish`
+  # job below, not here, so `secrets: inherit` would hand every repository and
+  # organisation secret to a workflow that has no use for one. A component
+  # whose ci.yml grows a private-submodule checkout adds `secrets:
+  # SUBMODULE_TOKEN: ${{ secrets.SUBMODULE_TOKEN }}` here — the one secret, not
+  # all of them.
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.version.outputs.tag }}
+    permissions:
+      contents: read
+
+  publish:
+    needs: [version, ci]
+    runs-on: ubuntu-latest
+    steps:
+      # Submodules are off by default. GITHUB_TOKEN cannot read another
+      # repository, so a recursive checkout fails on any repo that declares a
+      # private submodule. RailDash declares none; the machinery stays so this
+      # file remains a faithful copy of the shared pattern (each repo owns its
+      # copy — see the header). A component whose image genuinely needs a
+      # submodule sets RAIL_SUBMODULES to `recursive` and adds a
+      # SUBMODULE_TOKEN with read access.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.tag }}
+          submodules: ${{ vars.RAIL_SUBMODULES || false }}
+          fetch-depth: 0
+          token: ${{ vars.RAIL_SUBMODULES && secrets.SUBMODULE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          # `value=` pins every tag to the version resolved above, so a manual
+          # dispatch tags what it built rather than what it was launched from.
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.version.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.version.outputs.tag }}
+            type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          # buildx would attach its own *unsigned* provenance, which the signed
+          # attestation below makes redundant — the org's docker-build-push
+          # action documents that same choice and lands on leaving this off.
+          provenance: false
+          # Shared with ci.yml's build job on purpose: the CI leg of this same
+          # run has just built amd64, and this multi-arch build reuses those
+          # layers rather than repeating the work.
+          #
+          # A literal name rather than `github.workflow`. Inside this run that
+          # would work — a called workflow sees the caller's name — but ci.yml
+          # also runs directly on master, where it resolves to `ci`, so those
+          # warm caches would systematically never be visible to a release.
+          cache-from: type=gha,scope=image
+          cache-to: type=gha,mode=max,scope=image
+
+      # Signed, verifiable statement that this digest came from this workflow:
+      # `gh attestation verify oci://ghcr.io/<owner>/<repo>:<tag> --owner <org>`.
+      #
+      # GitHub only offers attestations on public repos or a paid org plan, and
+      # every datrail repo is private until DR-25. The image is already pushed by
+      # the time this runs, so a hard failure here would mark a successful
+      # publish as failed; it warns instead, and starts working on its own once
+      # the repos are flipped. Note this swallows every failure of the step, not
+      # only the plan one — the warning is the only signal either way.
+      - id: attest
+        continue-on-error: true
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - if: steps.attest.outcome == 'failure'
+        run: echo "::warning::Image published without a provenance attestation — private repo on a plan that does not include them (DR-25 flips these public)."
+
+      # Values reach the shell through env, never through `${{ }}` inside run:,
+      # which is substituted as raw text before bash sees it.
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "### Published"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo
+            echo "digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
