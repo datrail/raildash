@@ -1,0 +1,498 @@
+openapi: 3.1.0
+info:
+  title: RailDash Webhook API
+  description: |
+    Wave 1 dashboard API for receiving DatRail capture events.
+
+    RailMon captures and parses runtime traffic, then forwards structured
+    events to this webhook for inspection.
+
+    Data flows: Claude Code → Anthropic API (HTTPS) → eBPF sslsniff captures → Python collector parses → POST to this webhook.
+  version: 0.1.0
+  contact:
+    name: DatRail
+
+servers:
+  - url: http://localhost:8000
+    description: Local development webhook server
+
+paths:
+  /api/profile:
+    get:
+      operationId: downloadObservedProfile
+      summary: Download an observed-only Agent Security Profile draft
+      description: |
+        Summarises facts observed in one RailMon capture. The versioned JSON
+        has source=raildash-observed, contains no credential values, and is not
+        an authoritative Rail Center score.
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Portable observed profile JSON
+          headers:
+            Content-Disposition:
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ObservedProfile'
+        '404':
+          description: Session not found
+
+  /api/interactions/{row_id}:
+    get:
+      operationId: investigateInteraction
+      summary: Inspect an interaction in its captured sequence
+      description: |
+        Returns the credential-redacted exchange, nearby interactions from the
+        same session and pid/tid in timestamp order, captured tool_use names,
+        and previous/next error and tool-call row identifiers.
+      parameters:
+        - name: row_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Interaction investigation detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InteractionInvestigation'
+        '404':
+          description: Interaction not found
+
+  /webhook/events:
+    post:
+      operationId: receiveEvents
+      summary: Receive a batch of captured SSL events
+      description: |
+        Receives a batch of raw SSL events captured by eBPF sslsniff.
+        Each event contains the raw decrypted SSL data (which may be HTTP request/response).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EventBatch'
+      responses:
+        '200':
+          description: Events received successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventBatchResponse'
+        '400':
+          description: Invalid request body
+        '500':
+          description: Server error
+
+  /webhook/http-interactions:
+    post:
+      operationId: receiveHttpInteractions
+      summary: Receive parsed HTTP request/response pairs
+      description: |
+        Receives HTTP interactions that have been parsed from raw SSL events.
+        The Python collector correlates WRITE/SEND (request) and READ/RECV (response)
+        events by PID/TID and parses them into structured HTTP objects.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HttpInteractionBatch'
+      responses:
+        '200':
+          description: Interactions received successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HttpInteractionBatchResponse'
+        '400':
+          description: Invalid request body
+        '500':
+          description: Server error
+
+  /webhook/health:
+    get:
+      operationId: healthCheck
+      summary: Health check endpoint
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+components:
+  schemas:
+    ObservedValueCount:
+      type: object
+      required: [value, count]
+      properties:
+        value: {type: string}
+        count: {type: integer}
+
+    ObservedProfile:
+      type: object
+      required: [schema_version, source, authoritative, disclaimer, session, observed]
+      properties:
+        schema_version: {type: string, const: '1.0'}
+        source: {type: string, const: raildash-observed}
+        authoritative: {type: boolean, const: false}
+        disclaimer: {type: string}
+        session:
+          type: object
+          required: [id, agent, capture_start]
+          properties:
+            id: {type: string}
+            agent: {type: string}
+            capture_start: {type: string}
+        observed:
+          type: object
+          required: [interaction_count, error_count, error_rate, x_rail, hosts, methods, models, tool_names, tool_names_truncated, truncated_dimensions]
+          properties:
+            interaction_count: {type: integer}
+            error_count: {type: integer}
+            error_rate: {type: number, minimum: 0, maximum: 1}
+            x_rail:
+              type: object
+              required: [present, interaction_count]
+              properties:
+                present: {type: boolean}
+                interaction_count: {type: integer}
+            hosts:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedValueCount'}
+            methods:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedValueCount'}
+            models:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedValueCount'}
+            tool_names:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedValueCount'}
+            tool_names_truncated:
+              type: boolean
+              description: True when safety limits prevented a complete tool-name summary.
+            truncated_dimensions:
+              type: array
+              items: {type: string, enum: [hosts, methods, models, tool_names]}
+              description: Dimensions whose cardinality or value-length safety limit was reached.
+
+    InteractionSummary:
+      type: object
+      required: [id, session_id, tool_calls, has_ticket, tool_names]
+      properties:
+        id: {type: integer}
+        session_id: {type: string}
+        interaction_id: {type: [string, 'null']}
+        timestamp: {type: [string, 'null']}
+        timestamp_ns: {type: [integer, 'null']}
+        pid: {type: [integer, 'null']}
+        tid: {type: [integer, 'null']}
+        method: {type: [string, 'null']}
+        host: {type: [string, 'null']}
+        path: {type: [string, 'null']}
+        status_code: {type: [integer, 'null']}
+        latency_ms: {type: [number, 'null']}
+        tool_calls: {type: integer}
+        has_ticket:
+          type: integer
+          description: Ticket presence as 0 or 1; the credential value is never returned.
+        tool_names:
+          type: array
+          items: {type: string}
+          description: Untrusted text derived from captured tool_use blocks.
+
+    InteractionNavigation:
+      type: object
+      required: [previous_error, next_error, previous_tool_call, next_tool_call]
+      properties:
+        previous_error: {type: [integer, 'null']}
+        next_error: {type: [integer, 'null']}
+        previous_tool_call: {type: [integer, 'null']}
+        next_tool_call: {type: [integer, 'null']}
+
+    InteractionInvestigation:
+      allOf:
+        - $ref: '#/components/schemas/InteractionSummary'
+        - type: object
+          required: [raw, nearby, navigation]
+          properties:
+            raw:
+              type: object
+              description: Captured interaction with credential headers redacted.
+            nearby:
+              type: array
+              description: Same-session pid/tid interactions ordered by timestamp.
+              items:
+                $ref: '#/components/schemas/InteractionSummary'
+            navigation:
+              $ref: '#/components/schemas/InteractionNavigation'
+
+    # ---- Raw SSL Event (directly from sslsniff) ----
+    SslEvent:
+      type: object
+      required:
+        - function
+        - timestamp_ns
+        - pid
+        - tid
+        - uid
+        - comm
+        - len
+        - buf_size
+        - is_handshake
+        - truncated
+      properties:
+        function:
+          type: string
+          enum: ["WRITE/SEND", "READ/RECV", "HANDSHAKE"]
+          description: SSL operation type
+        timestamp_ns:
+          type: integer
+          format: uint64
+          description: Nanoseconds since system boot (bpf_ktime_get_ns)
+        comm:
+          type: string
+          maxLength: 16
+          description: Thread name (not process name). Claude Code shows "HTTP Client".
+        pid:
+          type: integer
+          format: uint32
+          description: Process ID
+        tid:
+          type: integer
+          format: uint32
+          description: Thread ID
+        uid:
+          type: integer
+          format: uint32
+          description: User ID
+        len:
+          type: integer
+          format: uint32
+          description: Total bytes returned by the SSL function
+        buf_size:
+          type: integer
+          format: uint32
+          description: Actual bytes captured (capped at 512KB)
+        latency_ms:
+          type: number
+          format: float
+          description: SSL function call latency in milliseconds
+        is_handshake:
+          type: boolean
+          description: Whether this is a handshake event
+        data:
+          type: string
+          nullable: true
+          description: Decrypted plaintext payload (JSON-escaped). Null if no data captured.
+        truncated:
+          type: boolean
+          description: True if data exceeded 512KB capture buffer
+        bytes_lost:
+          type: integer
+          description: Bytes not captured (only present when truncated)
+
+    EventBatch:
+      type: object
+      required:
+        - session_id
+        - events
+      properties:
+        session_id:
+          type: string
+          format: uuid
+          description: Unique capture session ID
+        agent:
+          type: string
+          description: Agent being monitored (e.g. "claude-code")
+          example: claude-code
+        capture_start:
+          type: string
+          format: date-time
+          description: Session start timestamp (wall clock)
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/SslEvent'
+
+    EventBatchResponse:
+      type: object
+      properties:
+        received:
+          type: integer
+          description: Number of events accepted
+        session_id:
+          type: string
+
+    # ---- Parsed HTTP Interaction ----
+    HttpRequest:
+      type: object
+      required:
+        - method
+        - path
+      properties:
+        method:
+          type: string
+          enum: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"]
+        path:
+          type: string
+          description: Request path (e.g. "/v1/messages?beta=true")
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+          description: HTTP headers (auth headers redacted)
+        body:
+          description: Parsed request body (JSON object if Content-Type is application/json, string otherwise)
+        body_raw:
+          type: string
+          description: Raw body string (only if body parsing failed)
+
+    HttpResponse:
+      type: object
+      required:
+        - status_code
+      properties:
+        status_code:
+          type: integer
+          description: HTTP status code
+        status_text:
+          type: string
+          description: HTTP status text (e.g. "OK")
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        body:
+          description: Parsed response body. For SSE streams, this is the merged content.
+        body_raw:
+          type: string
+          description: Raw body string (only if body parsing failed)
+        is_sse:
+          type: boolean
+          description: Whether the response was an SSE stream
+
+    HttpInteraction:
+      type: object
+      required:
+        - timestamp
+        - pid
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          description: Wall-clock time of the interaction
+        timestamp_ns:
+          type: integer
+          format: uint64
+          description: Original eBPF timestamp (nanoseconds since boot)
+        pid:
+          type: integer
+          format: uint32
+        tid:
+          type: integer
+          format: uint32
+        uid:
+          type: integer
+          format: uint32
+        comm:
+          type: string
+        request:
+          $ref: '#/components/schemas/HttpRequest'
+        response:
+          $ref: '#/components/schemas/HttpResponse'
+        latency_ms:
+          type: number
+          description: Total request-to-response latency
+        request_size:
+          type: integer
+          description: Request body size in bytes
+        response_size:
+          type: integer
+          description: Response body size in bytes
+        truncated:
+          type: boolean
+          description: Whether any part of the interaction was truncated
+
+    HttpInteractionBatch:
+      type: object
+      required:
+        - session_id
+        - interactions
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        agent:
+          type: string
+          example: claude-code
+        capture_start:
+          type: string
+          format: date-time
+        interactions:
+          type: array
+          items:
+            $ref: '#/components/schemas/HttpInteraction'
+
+    HttpInteractionBatchResponse:
+      type: object
+      properties:
+        received:
+          type: integer
+        session_id:
+          type: string
+
+    # ---- Standard Logistics Data Format (from rail-model-data) ----
+    TrackingLife:
+      type: object
+      properties:
+        time:
+          type: string
+          format: date-time
+          example: "2026-01-19 14:00:00"
+        context:
+          type: string
+          example: "Courier is out for delivery in the local area."
+        location:
+          type: string
+          example: "Singapore Central"
+
+    TrackingData:
+      type: object
+      description: Standard logistics data format (from rail-model-data)
+      properties:
+        carrier:
+          type: string
+          example: "SF Express"
+        tracking_num:
+          type: string
+          example: "SF1423300958742"
+        status:
+          type: string
+          example: "Delivering"
+        is_exception:
+          type: boolean
+        eta:
+          type: string
+          format: date-time
+          example: "2026-01-19 19:30:00"
+        lives:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrackingLife'

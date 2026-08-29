@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="auto">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RailDash</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <h1>RailDash</h1>
+    <span class="brand-sub">agent traffic</span>
+  </div>
+  <div class="topbar-actions">
+    <span class="conn" id="conn" data-state="live">
+      <span class="conn-dot" aria-hidden="true"></span>
+      <span id="conn-text">live</span>
+    </span>
+    <button type="button" id="refresh" class="btn">Refresh</button>
+    <button type="button" id="theme" class="btn btn-icon" aria-label="Switch theme">
+      <span aria-hidden="true">◐</span>
+    </button>
+  </div>
+</header>
+
+<div class="demo-banner" id="demo-banner" hidden>
+  <strong>Static fixture demo</strong>
+  <span>No live capture. Every value on this page comes from synthetic test data.</span>
+</div>
+
+<div class="shell">
+
+  <!-- Sessions ------------------------------------------------------------ -->
+  <nav class="rail" aria-label="Capture sessions">
+    <div class="rail-head">
+      <h2>Sessions</h2>
+      <span class="count" id="session-count">—</span>
+    </div>
+    <ul class="session-list" id="sessions"></ul>
+    <p class="rail-empty" id="rail-empty" hidden>
+      Nothing captured yet.
+    </p>
+  </nav>
+
+  <main class="main">
+
+    <!-- Summary --------------------------------------------------------- -->
+    <section class="strip" aria-label="Summary">
+      <div class="tile">
+        <span class="tile-label">Interactions</span>
+        <span class="tile-value" id="stat-interactions">—</span>
+      </div>
+      <div class="tile">
+        <span class="tile-label">Hosts</span>
+        <span class="tile-value" id="stat-hosts">—</span>
+      </div>
+      <div class="tile" id="tile-errors">
+        <span class="tile-label">Failed</span>
+        <span class="tile-value" id="stat-errors">—</span>
+        <span class="tile-note" id="stat-error-rate"></span>
+      </div>
+      <div class="tile">
+        <span class="tile-label">Tool calls</span>
+        <span class="tile-value" id="stat-tools">—</span>
+      </div>
+      <div class="tile">
+        <span class="tile-label">Latency avg / max</span>
+        <span class="tile-value" id="stat-latency">—</span>
+      </div>
+      <div class="tile">
+        <span class="tile-label">Transferred</span>
+        <span class="tile-value" id="stat-bytes">—</span>
+        <span class="tile-note" id="stat-bytes-note"></span>
+      </div>
+    </section>
+
+    <!-- Observed profile ------------------------------------------------ -->
+    <section class="panel profile" aria-labelledby="profile-h">
+      <div class="panel-head">
+        <div>
+          <h2 id="profile-h">Observed security profile</h2>
+          <span class="hint">Capture facts only — not an authoritative Rail Center score</span>
+        </div>
+        <a class="btn" id="profile-download" href="#" download>Download JSON</a>
+      </div>
+      <div class="profile-grid" id="profile-grid">
+        <p class="muted">Select a captured session.</p>
+      </div>
+    </section>
+
+    <!-- Capture drift --------------------------------------------------- -->
+    <section class="panel drift" aria-labelledby="drift-h">
+      <div class="panel-head">
+        <div>
+          <h2 id="drift-h">Capture drift</h2>
+          <span class="hint">Neutral observed changes between two sessions</span>
+        </div>
+        <div class="drift-selectors">
+          <label class="field">
+            <span>From</span>
+            <select id="drift-left"></select>
+          </label>
+          <span aria-hidden="true">→</span>
+          <label class="field">
+            <span>To</span>
+            <select id="drift-right"></select>
+          </label>
+        </div>
+      </div>
+      <div class="drift-body" id="drift-body">
+        <p class="muted">Two captured sessions are needed for comparison.</p>
+      </div>
+    </section>
+
+    <!-- Hosts ----------------------------------------------------------- -->
+    <section class="panel" aria-labelledby="hosts-h">
+      <div class="panel-head">
+        <h2 id="hosts-h">Where the agent went</h2>
+        <span class="hint">Click a host to filter the log</span>
+      </div>
+      <div class="scroll-x">
+        <table class="hosts">
+          <thead>
+            <tr>
+              <th scope="col">Host</th>
+              <th scope="col" class="num">Calls</th>
+              <th scope="col" class="num">Failed</th>
+              <th scope="col" class="num">Avg</th>
+              <th scope="col" class="bar-col">Share</th>
+            </tr>
+          </thead>
+          <tbody id="hosts"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Log ------------------------------------------------------------- -->
+    <section class="panel" aria-labelledby="log-h">
+      <div class="panel-head">
+        <h2 id="log-h">Interaction log</h2>
+        <div class="filters">
+          <label class="field">
+            <span class="sr-only">Search host or path</span>
+            <input type="search" id="f-q" placeholder="host or path" autocomplete="off">
+          </label>
+          <label class="field">
+            <span class="sr-only">Method</span>
+            <select id="f-method"><option value="">any method</option></select>
+          </label>
+          <label class="field">
+            <span class="sr-only">Status class</span>
+            <select id="f-status">
+              <option value="">any status</option>
+              <option value="2">2xx</option>
+              <option value="3">3xx</option>
+              <option value="4">4xx</option>
+              <option value="5">5xx</option>
+            </select>
+          </label>
+          <label class="check">
+            <input type="checkbox" id="f-errors">
+            <span>failures only</span>
+          </label>
+          <button type="button" class="btn btn-quiet" id="f-clear">Clear</button>
+        </div>
+      </div>
+
+      <div class="active-filter" id="active-filter" hidden>
+        <span id="active-filter-text"></span>
+        <button type="button" class="chip-x" id="active-filter-clear"
+                aria-label="Clear host filter">×</button>
+      </div>
+
+      <div class="scroll-x">
+        <table class="log">
+          <thead>
+            <tr>
+              <th scope="col" class="c-when">Time</th>
+              <th scope="col" class="c-method">Method</th>
+              <th scope="col">Host</th>
+              <th scope="col">Path</th>
+              <th scope="col" class="c-status">Status</th>
+              <th scope="col" class="num c-lat">Latency</th>
+              <th scope="col" class="num c-size">Size</th>
+              <th scope="col" class="c-flags">Flags</th>
+            </tr>
+          </thead>
+          <tbody id="log"></tbody>
+        </table>
+      </div>
+
+      <p class="empty" id="log-empty" hidden></p>
+
+      <div class="pager">
+        <button type="button" class="btn btn-quiet" id="prev" disabled>Previous</button>
+        <span class="pager-text" id="pager-text">—</span>
+        <button type="button" class="btn btn-quiet" id="next" disabled>Next</button>
+      </div>
+    </section>
+
+    <footer class="foot">
+      <p>
+        RailDash reads a RailMon capture — a file via <code>raildash load</code>,
+        or a live webhook. It needs no control plane.
+      </p>
+    </footer>
+  </main>
+</div>
+
+<!-- Detail ---------------------------------------------------------------- -->
+<div class="scrim" id="scrim" hidden></div>
+<aside class="detail" id="detail" hidden aria-labelledby="detail-h" tabindex="-1">
+  <div class="detail-head">
+    <div>
+      <span class="detail-eyebrow" id="detail-eyebrow">Interaction</span>
+      <h2 id="detail-h">—</h2>
+    </div>
+    <button type="button" class="btn btn-icon" id="detail-close" aria-label="Close">×</button>
+  </div>
+  <nav class="investigation-nav" aria-label="Notable interaction navigation">
+    <button type="button" class="btn btn-quiet" id="previous-error">← Error</button>
+    <button type="button" class="btn btn-quiet" id="next-error">Error →</button>
+    <button type="button" class="btn btn-quiet" id="previous-tool">← Tool call</button>
+    <button type="button" class="btn btn-quiet" id="next-tool">Tool call →</button>
+  </nav>
+  <div class="detail-body" id="detail-body"></div>
+</aside>
+
+<script src="/app.js"></script>
+</body>
+</html>

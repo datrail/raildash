@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+tests
+docs
+# A leftover ./railmon checkout (earlier DR-81 iterations cloned one here)
+# must not ride into the build context.
+railmon

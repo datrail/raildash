@@ -1,0 +1,300 @@
+# RailDash
+
+A local view of what an agent actually did.
+
+RailDash reads a [RailMon](https://github.com/datrail/railmon) capture and
+shows the traffic in it: which hosts the agent reached, what it sent, what came
+back, which calls failed, and where it called a tool. **It needs no control
+plane.** If you have installed only the open-source components, this is the
+thing that shows you the report.
+
+## Quick start
+
+One command from a clean checkout. No cloud, no account, no Rail Center — and
+no other component running, not even RailMon. You need Python 3.10+ with the
+`venv` module, and `make`. On Debian and Ubuntu (WSL included) `venv` is a
+separate package — if the first run fails with *"ensurepip is not
+available"*, install the package that error names (for example
+`sudo apt install python3.14-venv`) and run `make demo` again.
+
+```bash
+git clone https://github.com/datrail/raildash.git
+cd raildash
+make demo
+```
+
+`make demo` builds a virtualenv, installs the two dependencies (FastAPI and
+uvicorn), loads `tests/fixtures/capture.jsonl` — a small capture shaped
+exactly like RailMon's output — into a local `demo.db`, and serves the
+dashboard.
+
+Open <http://127.0.0.1:8000/>. **You should see** a populated dashboard, not
+an empty one: 8 interactions across 4 hosts, 3 failures and 2 tool calls in
+the summary; a host list topped by `api.anthropic.com`; and an interaction
+log whose status codes include a 429, a 403 and a 500 — the 500, against
+`exfil.attacker.net`, is the fixture's deliberately alarming row. Two rows
+are flagged `1 tool` and four are flagged `x-rail`. If that is what you see,
+it works.
+
+## Installing
+
+```bash
+pip install -e .
+
+# a capture you already have
+raildash load capture.jsonl --serve
+
+# or leave it running and point RailMon at it
+raildash serve
+```
+
+Without installing, every command below also works as
+`python -m raildash.cli …` once `pip install -r requirements.txt` has run.
+
+Then open <http://127.0.0.1:8000/>.
+
+## Getting a capture into it
+
+RailMon has two outputs and RailDash takes both.
+
+**A file** — the usual case, and the one that still works after the run is
+over:
+
+```bash
+sudo railmon collect --mode http --output capture.jsonl
+raildash load capture.jsonl
+```
+
+Re-loading the same file is a no-op rather than a duplicate: interactions are
+keyed on RailMon's content-hashed `interaction_id`.
+
+**A live webhook** — the dashboard updates while the agent runs:
+
+```bash
+sudo railmon collect --mode http \
+  --webhook http://127.0.0.1:8000/webhook/http-interactions
+```
+
+## Running both together (DR-81)
+
+The two sections above are RailMon and RailDash run and wired by hand. This
+repo also ships a `docker compose` stack that does both automatically, with
+both of RailMon's output paths wired at once. It runs in two modes.
+
+> **Prerequisite, not yet on `master`.** Both modes need RailMon's demo
+> env-var passthrough,
+> [datrail/railmon#9](https://github.com/datrail/railmon/pull/9), which is
+> still an open pull request. Until it merges and a release is tagged,
+> `railmon`'s `master` does not have it and no published `RAILMON_TAG`
+> contains it — check out the branch, as below, and expect registry mode to
+> be unusable. `make stack-local` verifies the checkout and stops with
+> instructions rather than running half a stack.
+
+**Local-built** — build from source. Assumes the component repos are already
+checked out: this one, and a RailMon checkout at `../railmon` (override with
+`RAILMON_SRC=/path/to/railmon`).
+
+```bash
+git clone https://github.com/datrail/raildash.git
+git clone https://github.com/datrail/railmon.git
+# until railmon#9 merges, master lacks the passthrough this stack needs:
+git -C railmon checkout dr-81-demo-env-passthrough
+cd raildash
+make stack-local
+```
+
+**From published images** — no source builds; pulls
+`ghcr.io/datrail/railmon` and `ghcr.io/datrail/raildash` at the tags you
+name. Git-style (`v0.1.0-m2`) and image-style (`0.1.0-m2`) tags both work —
+the leading `v` is stripped to match what the release workflow publishes.
+
+```bash
+make stack RAILMON_TAG=v0.1.1 RAILDASH_TAG=v0.1.0
+```
+
+Both tags are required — there is no `latest` default, here or in
+`docker-compose.yml`, because RailMon runs privileged with the host PID
+namespace and a moving tag there is a moving root-equivalent process.
+
+While the datrail repos are private their packages are too, so `docker login
+ghcr.io` with a GitHub PAT (`read:packages`) first. The RailMon tag must
+contain the passthrough from railmon#9 — an older image starts, but its demo
+never posts the webhook; there is no way to check an image up front, so
+`make stack-test` catches that case at run time rather than letting it pass.
+RailDash's own image is published by this repository's
+`.github/workflows/container-release.yml` (added alongside this stack, copied
+from RailMon's): pushing a `vX.Y.Z` git tag is what produces it.
+
+**You should see**, in either mode, a few seconds after `docker compose ps`
+prints: RailMon's container ran once and exited 0 (expected — the demo
+capture finishes and stops, it is not a long-running collector), the
+file-import step reporting `6 already present, skipped`, and
+<http://127.0.0.1:8000> showing **6 interactions** against `127.0.0.1:8443`,
+all `POST`, all `200`, across `/v1/demo` and `/v1/demo/other`.
+
+Six, from three requests, is correct and worth understanding before you read
+it as a bug. RailMon's demo taps by process name (`--comm python3`), and both
+ends of the exchange — `demo_server.py` and `demo_client.py` — are `python3`,
+so each request is captured twice: once as the client sent it, once as the
+server received it. They are two genuine observations of one exchange, with
+different `pid`s, not one row written twice; in the interaction log they show
+as pairs sharing a timestamp to the millisecond. See RailMon's
+`tools/local-demo/README.md` for why the demo filters that broadly.
+
+**Double-counting would look like 12, not 6** — and that is what the two
+ingestion paths would produce if they were wired naively. The file-import
+step reporting `6 already present, skipped` is the dedup working: the webhook
+delivered those 6 while RailMon ran, and the import then recognised every one
+rather than adding a second copy. Both wirings land on the same interactions
+only because they are told the same session id — `DEMO_SESSION_ID` in the
+`Makefile` is the single source, reaching RailMon as `RAILMON_SESSION_ID` and
+the import step as `--session-id`. The JSONL file carries no session id of
+its own, and this dashboard's dedup index is `(session_id, interaction_id)`,
+not `interaction_id` alone; mismatched ids silently double every count
+instead of erroring. `make stack-test` asserts all of this — including that
+the webhook actually delivered — rather than leaving it to be eyeballed.
+
+The stack briefly stops the dashboard to run that import, and you will see it
+in the output. That follows from the single-process rule in **Storage**
+above: RailDash holds an exclusive SQLite lock, so `raildash load` cannot
+open the database while the server has it, wherever that database lives.
+Pausing the server makes the import the sole owner for those few seconds,
+keeping the file path on `raildash load` — the real documented import
+command — rather than faking it by POSTing the file to the webhook. If the
+import fails, the dashboard is started again before the command exits. The
+separate `--db` path the Storage section suggests would defeat the point
+here: the two ingestion paths have to land in one database to be
+deduplicated against each other.
+
+Those first-run numbers describe empty volumes. `make stack-down` stops the
+stack but keeps them, and RailMon's capture file appends rather than
+truncating, so a second run shows both runs — 12 interactions, and correctly
+so. `make stack-clean` removes the volumes, which is what makes the counts
+above true again; `make stack-test` always tears its volumes down, so its
+assertions never depend on what ran before it.
+
+Stopping RailMon (`docker compose stop railmon`) leaves the dashboard serving
+what it already has, same as the "no control plane" reasoning above — the
+file path is passive and the webhook path only ever pushed.
+
+## What it shows
+
+| | |
+| --- | --- |
+| **Summary** | interactions, distinct hosts, failures and failure rate, tool calls, latency, bytes each way |
+| **Where the agent went** | every host, ranked, with its failure count and average latency — click one to filter the log |
+| **Interaction log** | one row per request/response pair, filterable by host, method, status class, and failures only |
+| **Detail** | the full exchange, captured tool names, nearby calls on the same pid/tid, and previous/next error or tool-call navigation; credential headers are redacted before storage, while bodies remain exactly as RailMon captured them |
+| **Observed security profile** | hosts, methods, tool names, models, x-rail presence, and error rate for the selected capture; downloadable as versioned JSON |
+| **Capture drift** | neutral added/removed hosts, tools, and models plus error-rate, average-latency, and byte deltas between two sessions |
+
+Two flags on a row are worth knowing. `n tool` counts `tool_use` blocks in the
+exchange, which is the closest thing in the payload to *the agent took an
+action*. `x-rail` means the request carried a ticket — **whether**, never the
+value.
+
+Open a row to investigate its sequence. Nearby calls are the captured calls
+from the same session, process and thread, ordered oldest to newest around the
+selected call. Tool names come only from captured `tool_use` blocks and are
+shown as plain text. The error and tool-call buttons move across the selected
+session even when the relevant interaction is outside the visible log page.
+
+The observed security profile is a portable draft generated from one capture.
+Its JSON identifies itself with `schema_version: "1.0"` and
+`source: "raildash-observed"`. It is intentionally a summary of observed
+facts, not an authoritative Agent Security Profile schema or Rail Center
+score. Credential values are never included; `x-rail` is presence and count
+only. Tool-name aggregation is bounded for availability; the JSON sets
+`tool_names_truncated` if an unusually large capture exceeds that bound.
+Host, method, and model cardinality is bounded similarly, with any affected
+names listed in `truncated_dimensions`. Individual captured labels are also
+bounded there so an adversarial capture cannot create an enormous export.
+
+Capture drift compares two observed profiles and their overview totals. It
+reports additions, removals, and numeric deltas without assigning a risk
+score. Selecting the same session, an empty capture, or unavailable comparison
+data produces an explicit message rather than an invented zero.
+
+## What it does not do
+
+- **No control plane.** It does not register agents, issue tickets, or score
+  posture. DR-9's ticket text describes that view; this is the other one, and
+  the one an OSS-only install can actually populate — with no proxy or gateway
+  in the deployment there are no refusals to display.
+- **No authentication.** It binds `127.0.0.1` by default for that reason. The
+  database holds captured prompts, tool arguments and response bodies; do not
+  put it on a shared interface without something in front of it.
+- **No log ingestion.** It reads interactions, not agent stdout.
+
+## Storage
+
+SQLite, at `./raildash.db` — override with `--db` or `RAILDASH_DB`. It
+persists because the question "what did the agent do" is normally asked after
+something has already gone wrong, and an in-memory store can only answer it if
+you still have the process.
+
+One process owns a database at a time. RailDash keeps an exclusive SQLite lock
+so an older process cannot write unredacted rows around a schema migration; use
+a separate `--db` path if you intentionally run another process.
+
+On first open, version 0.2.0 removes credential headers left by older RailDash
+databases and purges the active SQLite/WAL files. That cannot reach backups,
+volume snapshots, or exported copies: delete those separately and rotate any
+credential that may have been captured before upgrading.
+
+## Docker
+
+```bash
+docker build -t raildash .
+docker run --rm -p 127.0.0.1:8000:8000 -v raildash-data:/data raildash
+```
+
+The image binds `0.0.0.0`, where the network namespace is the boundary and the
+operator chooses what to publish. The example maps it only onto the host's
+loopback interface because RailDash has no authentication and contains captured
+request and response bodies. Without the volume it forgets on restart.
+
+Unlike `make demo`, a fresh container starts empty: the image ships no
+fixture, so a first run shows an empty dashboard until a capture arrives —
+via the webhook, or by mounting a directory with a capture in it and loading
+it with `docker exec <container> python -m raildash.cli load <file>`.
+
+## Development
+
+```bash
+make test     # pytest + py_compile
+make lint     # static check of the three front-end files
+make demo     # load the test fixture and serve it
+make static-demo  # build a hosting-ready synthetic fixture site under dist/
+```
+
+`make static-demo` is deterministic and does not deploy anything. It exports
+the current UI assets plus precomputed JSON from
+`tests/fixtures/capture.jsonl` only. The generated site has no FastAPI or
+SQLite process: filtering and pagination run in the browser, and a visible
+banner identifies it as a static fixture with no live capture. The output is
+ready to upload to an approved static host later; this repository does not
+assume a public host or deployment credential exists.
+
+`tests/fixtures/capture.jsonl` is shaped exactly like RailMon's output,
+including the two fields that are routinely null in a real capture — a
+`request` whose HTTP/2 HEADERS frame was never decoded, and a `latency_ms`
+with no paired request. Both are ordinary; both have tests.
+
+The front end is three static files with no build step. `make lint` checks
+what a build step otherwise would: that every CSS token is defined, every id
+the script reaches for exists, and no code path assigns markup — captured
+traffic is untrusted input, so every value reaches the page via `textContent`.
+
+## Compatibility
+
+`uvicorn webhook_server:app` still starts the server and every `/webhook/*`
+route keeps its path and meaning. Two visible differences:
+`POST /webhook/http-interactions` also returns `stored` alongside `received`,
+which distinguishes a retry from a first delivery, and
+`GET /webhook/sessions/{id}` returns 404 for a missing session rather than 200
+with an `error` key.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
