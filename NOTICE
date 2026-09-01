@@ -1,0 +1,26 @@
+RailDash
+Copyright (c) 2026 DatRail
+
+This product is part of the DatRail open-source agent-security toolchain
+(https://github.com/datrail).
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+FastAPI and Uvicorn — declared in requirements.txt
+    RailDash's HTTP surface. Starlette and Pydantic come in transitively via
+    FastAPI. Their permissive licences permit distribution of RailDash under
+    Apache-2.0; each dependency remains under its own licence.
+
+Contributor Covenant — https://www.contributor-covenant.org
+    CODE_OF_CONDUCT.md adopts version 2.1 by reference.
+
+--------------------------------------------------------------------------------
+
+This repository is the Wave 1 baseline split from `monitor-poc/webhook/` during
+the DatRail split (2026-07-20). The PoC collector that accompanied it was
+removed at the split because it depended on monorepo-only paths; RailMon is the
+component that produces the runtime interactions RailDash displays.
