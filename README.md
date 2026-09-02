@@ -34,6 +34,13 @@ sudo railmon collect --mode http \
   --webhook http://127.0.0.1:8000/webhook/http-interactions
 ```
 
+## Running the full stack
+
+To run RailMon and RailDash together, or to install from published images, see
+**[INSTALL.md](INSTALL.md)** — the full install guide, covering the source-built
+stack (`make stack-local`), the registry stack (`make stack`), platform support,
+verification, and troubleshooting.
+
 ## Architecture
 
 ```mermaid
