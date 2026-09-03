@@ -37,7 +37,7 @@ sudo railmon collect --mode http \
 ## Running the full stack
 
 To run RailMon and RailDash together, or to install from published images, see
-**[INSTALL.md](https://github.com/datrail/datrail-project/blob/main/INSTALL.md)** — the full install guide, covering the source-built
+**[INSTALL.md](https://github.com/datrail/datrail-project/blob/master/INSTALL.md)** — the full install guide, covering the source-built
 stack (`make stack-local`), the registry stack (`make stack`), platform support,
 verification, and troubleshooting.
 
