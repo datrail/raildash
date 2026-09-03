@@ -37,7 +37,7 @@ sudo railmon collect --mode http \
 ## Running the full stack
 
 To run RailMon and RailDash together, or to install from published images, see
-**[INSTALL.md](INSTALL.md)** — the full install guide, covering the source-built
+**[INSTALL.md](https://github.com/datrail/datrail-project/blob/main/INSTALL.md)** — the full install guide, covering the source-built
 stack (`make stack-local`), the registry stack (`make stack`), platform support,
 verification, and troubleshooting.
 
@@ -74,9 +74,9 @@ pip install -r requirements-dev.txt
 make test
 ```
 
-The OpenAPI contract is [`openapi.yaml`](openapi.yaml). Docker examples are in
-[`docker-compose.yml`](docker-compose.yml) and
-[`docker-compose.build.yml`](docker-compose.build.yml).
+The OpenAPI contract is [`openapi.yaml`](openapi.yaml). The compose files that
+run RailDash alongside RailMon live in
+[datrail-project](https://github.com/datrail/datrail-project).
 
 ## Related projects
 
