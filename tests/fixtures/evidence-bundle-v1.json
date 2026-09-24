@@ -1,0 +1,57 @@
+{
+  "attestations": [],
+  "attributes": {
+    "approval_policy": {"note": "absence is NOT evidence of restriction — assume no approval gate", "reason": "GATEWAY_MANAGED", "status": "BLIND", "tier": "declared", "value": null},
+    "container_identity": {
+      "authored_by": "platform",
+      "method": "host_id: flag; sandbox_name: flag",
+      "note": "the pair rail-center files the bundle under",
+      "status": "ANSWERED",
+      "tier": "declared",
+      "value": {"host_id": "fixture-host", "sandbox_name": "fixture-agent"}
+    },
+    "credential_inventory": {"authored_by": "none", "method": "env scan; no credential material found", "note": "an empty list that means none, not unobserved", "status": "ANSWERED", "tier": "observed", "value": []},
+    "credential_provenance": {"note": "injected-vs-baked provenance needs image layer analysis", "reason": "NOT_COLLECTED_BY_PACK", "status": "BLIND", "tier": "declared", "value": null},
+    "declared_destinations": {"method": "no declared hosts in the MCP config or env", "status": "ABSENT", "tier": "declared", "value": null},
+    "deployment": {
+      "authored_by": "subject",
+      "method": "scanned subject environment",
+      "note": "operator-set deployment signal; complete environment pair takes precedence over any Compose pair",
+      "status": "ANSWERED",
+      "tier": "declared",
+      "value": {"RAIL_DEPLOYMENT": "payments-agent", "RAIL_NAMESPACE": "production"}
+    },
+    "framework_identity": {"authored_by": "subject", "method": "runtime versions reported by the harness", "note": "the runtime versions observed", "status": "ANSWERED", "tier": "observed", "value": {"python": "Python 3.13.5"}},
+    "harness_identity": {"note": "no versioned harness in the runtime", "reason": "UNKNOWN_HARNESS", "status": "BLIND", "tier": "declared", "value": null},
+    "image_digest": {"note": "no image layer access in this mode", "reason": "NO_SOURCE_ACCESS", "status": "BLIND", "tier": "observed", "value": null},
+    "in_layer_deleted_secrets": {"note": "registry image layers were not pulled", "reason": "NO_SOURCE_ACCESS", "status": "BLIND", "tier": "observed", "value": null},
+    "inference_endpoint": {"method": "no base URL in the env", "status": "ABSENT", "tier": "observed", "value": null},
+    "mcp_servers_declared": {"method": "scanned the standard MCP config roots", "note": "no MCP config found", "status": "ABSENT", "tier": "declared", "value": null},
+    "mcp_servers_observed": {"note": "no AgentSight snapshot was provided", "reason": "NOT_COLLECTED_BY_PACK", "status": "BLIND", "tier": "observed", "value": null},
+    "model_name": {"method": "model not detected in env, config or capture files", "status": "ABSENT", "tier": "observed", "value": null},
+    "mounts": {"note": "container mounts are not observable from a bare process", "reason": "NO_SOURCE_ACCESS", "status": "BLIND", "tier": "declared", "value": null},
+    "observed_destinations": {"method": "no AgentSight snapshot was provided", "status": "ABSENT", "tier": "observed", "value": null},
+    "permissions": {"note": "privilege and RBAC are not readable from a bare process", "reason": "NO_SOURCE_ACCESS", "status": "BLIND", "tier": "declared", "value": null},
+    "sandbox_network_policy": {"method": "container network mode not observable in this mode", "status": "ABSENT", "tier": "observed", "value": null},
+    "skills_inventory": {"method": "scanned the standard skills roots", "note": "no skills found", "status": "ABSENT", "tier": "declared", "value": null},
+    "system_prompt_present": {"note": "the prompt is not read by this pack", "reason": "NOT_COLLECTED_BY_PACK", "status": "BLIND", "tier": "observed", "value": null},
+    "system_prompt_text": {"reason": "NOT_COLLECTED_BY_PACK", "status": "BLIND", "tier": "observed", "value": null},
+    "tool_allow_deny": {"reason": "GATEWAY_MANAGED", "status": "BLIND", "tier": "declared", "value": null},
+    "tool_capability_envelope": {"note": "repo AST only", "reason": "NO_SOURCE_ACCESS", "status": "BLIND", "tier": "declared", "value": null},
+    "tool_names": {"note": "wire observation requires an AgentSight snapshot", "reason": "NOT_COLLECTED_BY_PACK", "status": "BLIND", "tier": "observed", "value": null},
+    "undeclared_destinations": {"note": "needs declared and observed destinations", "reason": "NOT_COLLECTED_BY_PACK", "status": "BLIND", "tier": "declared", "value": null},
+    "user": {"note": "the process user is not reported by this pack", "reason": "NOT_COLLECTED_BY_PACK", "status": "BLIND", "tier": "observed", "value": null}
+  },
+  "bundle_id": "bnd-fixture-001",
+  "bundle_version": 1,
+  "collected_at": "2026-09-24T00:00:00Z",
+  "host_id": "fixture-host",
+  "inputs_attempted": {
+    "image": {"attempted": false, "reason": "NO_SOURCE_ACCESS"},
+    "manifest": {"attempted": true, "reached": true},
+    "repo": {"attempted": false, "reason": "NOT_FIRST_PARTY"},
+    "runtime": {"attempted": true, "reached": true}
+  },
+  "rule_pack_version": 1,
+  "sandbox_name": "fixture-agent"
+}
