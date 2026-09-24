@@ -6,6 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY raildash/ ./raildash/
 COPY webhook_server.py openapi.yaml ./
+COPY tests/fixtures/evidence-bundle-v1.json /usr/local/share/raildash/evidence-bundle-v1.json
 
 # The database lives on a volume or it does not survive the container. Left
 # unmounted it still works — it just forgets, which is the behaviour the old
