@@ -685,6 +685,7 @@ class Store:
             return None
         result = json.loads(row["result_json"])
         changes = result.pop("changes")
+        result["available_change_count"] = len(changes)
         result["changes"] = changes[offset : offset + limit]
         result["offset"] = offset
         result["limit"] = limit

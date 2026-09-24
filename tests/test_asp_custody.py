@@ -101,6 +101,31 @@ def test_switch_recomputes_latest_asp_against_the_new_active_version(tmp_path):
     store.close()
 
 
+def test_drift_page_distinguishes_retained_detail_from_total_changes(tmp_path):
+    store = Store(tmp_path / "raildash.db")
+    baseline = store.load_asp(FIXTURE.read_bytes())
+    version = store.lock_alignment(baseline["asp_id"], "v1.0")
+    store.switch_alignment(version["alignment_version_id"])
+    value = json.loads(FIXTURE.read_bytes())
+    value["bundle_id"] = "bnd-truncated-detail"
+    value["collected_at"] = "2026-09-24T03:00:00Z"
+    for index in range(501):
+        value["attributes"][f"added_{index:03d}"] = {
+            "value": index,
+            "status": "ANSWERED",
+            "tier": "observed",
+            "authored_by": "none",
+        }
+    current = store.load_asp(json.dumps(value).encode())
+
+    page = store.drift_page(current["asp_id"], limit=20, offset=500)
+    assert page["change_count"] == 501
+    assert page["available_change_count"] == 500
+    assert page["changes"] == []
+    assert page["truncated"] is True
+    store.close()
+
+
 def test_alignment_and_locked_asp_are_immutable(tmp_path):
     path = tmp_path / "raildash.db"
     store = Store(path)

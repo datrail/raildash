@@ -18,6 +18,7 @@ const state = {
   total: 0,
   driftLeft: null,
   driftRight: null,
+  aspDriftOffsets: {},
 };
 
 const $ = (id) => document.getElementById(id);
@@ -140,6 +141,203 @@ function setConn(stateName, text) {
   const node = $("conn");
   node.dataset.state = stateName;
   $("conn-text").textContent = text;
+}
+
+/* ----------------------------------------------------------- ASP alignment */
+
+const ASP_DRIFT_PAGE_SIZE = 20;
+let lastAspAnnouncement = null;
+
+function identityLabel(identity) {
+  const value = identity && identity.value;
+  if (!identity) return "Unknown agent";
+  if (identity.kind === "deployment_environment") {
+    return `${value.deployment} / ${value.namespace}`;
+  }
+  if (identity.kind === "deployment_compose") {
+    return `${value.project} / ${value.service} @ ${value.host_id}`;
+  }
+  return String(value);
+}
+
+function aspCommand(command) {
+  const block = el("code", "asp-command", command);
+  block.tabIndex = 0;
+  return block;
+}
+
+function statePresentation(name) {
+  const states = {
+    NO_ACTIVE_ALIGNMENT: ["No active alignment", "neutral"],
+    ALIGNMENT_ACTIVE: ["Alignment active", "neutral"],
+    ALIGNED: ["Aligned", "ok"],
+    DRIFT_DETECTED: ["Drift detected", "fail"],
+    COMPARISON_UNAVAILABLE: ["Comparison unavailable", "warn"],
+  };
+  return states[name] || ["Comparison unavailable", "warn"];
+}
+
+function renderDriftGroups(result) {
+  const wrapper = el("div", "asp-drift-groups");
+  const groups = new Map();
+  (result.changes || []).forEach((change) => {
+    const kind = change.type.split("_")[0].toLowerCase();
+    if (!groups.has(kind)) groups.set(kind, []);
+    groups.get(kind).push(change);
+  });
+  groups.forEach((changes, kind) => {
+    const group = el("section", "asp-drift-group");
+    group.append(el("h4", null, kind));
+    const list = el("ul");
+    changes.forEach((change) => {
+      const item = el("li");
+      item.append(el("span", "asp-change-name", change.name));
+      item.append(el("span", "asp-change-type", change.type));
+      if ((change.fields || []).length) {
+        item.append(el("span", "asp-change-fields", change.fields.join(", ")));
+      }
+      list.append(item);
+    });
+    group.append(list);
+    wrapper.append(group);
+  });
+  return wrapper;
+}
+
+async function loadAspAlignments(focusKey = null, focusAction = null) {
+  const body = $("asp-alignment-body");
+  // Polling must not destroy a keyboard user's focused command or pager.
+  // Explicit pager navigation supplies focusKey and is allowed to rebuild.
+  if (focusKey === null && body.contains(document.activeElement)) return;
+  body.replaceChildren();
+  if (staticDemo) {
+    body.append(el("p", "muted", "ASP alignment is available in the live local dashboard."));
+    return;
+  }
+
+  const asps = [];
+  let aspOffset = 0;
+  let aspTotal = 0;
+  do {
+    const page = await getJSON("/api/asps", { limit: 500, offset: aspOffset });
+    asps.push(...page.items);
+    aspTotal = page.total;
+    if (!page.items.length) break;
+    aspOffset += page.items.length;
+  } while (aspOffset < aspTotal);
+  if (!asps.length) {
+    const empty = el("section", "asp-empty");
+    empty.append(el("h3", null, "No ASP loaded"));
+    empty.append(el("p", "muted", "Stop RailDash, load a validated RailMon evidence bundle, then restart."));
+    empty.append(aspCommand("raildash asp load evidence-bundle.json"));
+    body.append(empty);
+    return;
+  }
+
+  const latest = new Map();
+  asps.forEach((asp) => {
+    const key = JSON.stringify(asp.agent_identity);
+    if (!latest.has(key)) latest.set(key, asp);
+  });
+
+  const states = await Promise.all([...latest.entries()].map(async ([key, asp]) => {
+    const alignment = await getJSON(`/api/asps/${encodeURIComponent(asp.asp_id)}/state`);
+    let drift = null;
+    if (alignment.drift) {
+      const offset = state.aspDriftOffsets[key] || 0;
+      drift = await getJSON(`/api/asps/${encodeURIComponent(asp.asp_id)}/drift`, {
+        limit: ASP_DRIFT_PAGE_SIZE,
+        offset,
+      });
+      if (!drift.changes.length && drift.available_change_count > 0 && offset > 0) {
+        const lastOffset = Math.floor(
+          (drift.available_change_count - 1) / ASP_DRIFT_PAGE_SIZE
+        ) * ASP_DRIFT_PAGE_SIZE;
+        state.aspDriftOffsets[key] = lastOffset;
+        drift = await getJSON(`/api/asps/${encodeURIComponent(asp.asp_id)}/drift`, {
+          limit: ASP_DRIFT_PAGE_SIZE,
+          offset: lastOffset,
+        });
+      }
+    }
+    return { key, alignment, drift };
+  }));
+
+  let focusTarget = null;
+  states.forEach(({ key, alignment, drift }) => {
+    const card = el("article", "asp-state-card");
+    const head = el("div", "asp-state-head");
+    const title = el("div");
+    title.append(el("h3", null, identityLabel(alignment.asp.agent_identity)));
+    title.append(el("span", "asp-subject",
+      `${alignment.asp.subject.host_id} / ${alignment.asp.subject.sandbox_name}`));
+    const [label, tone] = statePresentation(alignment.state);
+    const status = el("span", `asp-state asp-state-${tone}`, label);
+    head.append(title, status);
+    card.append(head);
+
+    if (alignment.state === "NO_ACTIVE_ALIGNMENT") {
+      card.append(el("p", "muted", "Stop the server, review this ASP locally, lock it, select it, then restart."));
+      card.append(aspCommand("raildash asp list"));
+      card.append(aspCommand(`raildash asp lock ${alignment.asp.asp_id} --version v1.0`));
+      card.append(aspCommand("raildash asp switch aspver-..."));
+      card.append(aspCommand("raildash serve"));
+    } else if (alignment.state === "COMPARISON_UNAVAILABLE") {
+      card.append(el("p", "asp-reason", `Reason: ${alignment.drift.reason}`));
+      card.append(el("p", "muted", "Stop the server and review compatible stored ASPs before locking or switching."));
+      card.append(aspCommand("raildash asp list"));
+      card.append(aspCommand("raildash asp lock asp-... --version v2.0"));
+      card.append(aspCommand("raildash asp switch aspver-..."));
+      card.append(aspCommand("raildash serve"));
+    } else if (alignment.state === "ALIGNMENT_ACTIVE") {
+      card.append(el("p", "muted", "Load a later ASP for this agent to run the first comparison."));
+      card.append(aspCommand("raildash asp load evidence-bundle.json"));
+    }
+
+    if (drift && drift.change_count > 0) {
+      card.append(renderDriftGroups(drift));
+      const offset = drift.offset || 0;
+      const pager = el("div", "asp-drift-pager");
+      const previous = el("button", "btn btn-quiet", "Previous changes");
+      previous.type = "button";
+      previous.disabled = offset === 0;
+      previous.addEventListener("click", () => {
+        state.aspDriftOffsets[key] = Math.max(0, offset - ASP_DRIFT_PAGE_SIZE);
+        loadAspAlignments(key, "previous").catch((error) => console.error(error));
+      });
+      const next = el("button", "btn btn-quiet", "Next changes");
+      next.type = "button";
+      next.disabled = offset + drift.changes.length >= drift.available_change_count;
+      next.addEventListener("click", () => {
+        state.aspDriftOffsets[key] = offset + ASP_DRIFT_PAGE_SIZE;
+        loadAspAlignments(key, "next").catch((error) => console.error(error));
+      });
+      const availableLabel = drift.available_change_count === drift.change_count
+        ? `${drift.change_count}`
+        : `${drift.available_change_count} retained · ${drift.change_count} detected`;
+      pager.append(previous,
+        el("span", "pager-text", `${offset + 1}–${offset + drift.changes.length} of ${availableLabel}`),
+        next);
+      card.append(pager);
+      if (key === focusKey) {
+        focusTarget = focusAction === "previous" ? previous : next;
+        if (focusTarget.disabled) {
+          focusTarget = focusAction === "previous" ? next : previous;
+        }
+      }
+    }
+    body.append(card);
+  });
+  const announcement = states
+    .map(({ alignment }) => (
+      `${identityLabel(alignment.asp.agent_identity)}: ${statePresentation(alignment.state)[0]}`
+    ))
+    .join("; ");
+  if (announcement !== lastAspAnnouncement) {
+    $("asp-status-announcement").textContent = announcement;
+    lastAspAnnouncement = announcement;
+  }
+  if (focusTarget) focusTarget.focus();
 }
 
 /* ----------------------------------------------------------------- filters */
@@ -684,7 +882,7 @@ async function refresh() {
   try {
     await loadSessions();
     renderActiveFilter();
-    await Promise.all([loadOverview(), loadProfile(), loadLog()]);
+    await Promise.all([loadOverview(), loadProfile(), loadLog(), loadAspAlignments()]);
     await loadDrift();
     await loadFilterOptions();
     setConn("live", staticDemo ? "fixture" : "live");
