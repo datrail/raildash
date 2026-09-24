@@ -125,6 +125,27 @@ def test_railmon_interaction_id_is_preferred_when_present():
     assert row["interaction_id"] == "abc123"
 
 
+def test_multi_agent_attribution_is_normalised():
+    row = normalise({
+        "runtime_identity_version": 1,
+        "agent_ref": {"host_id": "h", "sandbox_name": "s", "agent_key": "planner"},
+        "attribution": {"state": "attributed", "method": "process_target"},
+        "request": {"method": "GET", "path": "/"},
+    })
+    assert (row["agent_host_id"], row["sandbox_name"], row["agent_key"]) == ("h", "s", "planner")
+    assert row["attribution_state"] == "attributed"
+
+
+def test_invalid_attributed_reference_fails_closed():
+    row = normalise({
+        "runtime_identity_version": 1,
+        "agent_ref": {"host_id": "h", "agent_key": "planner"},
+        "attribution": {"state": "attributed", "method": "process_target"},
+    })
+    assert row["agent_key"] is None
+    assert row["attribution_state"] == "unknown"
+
+
 def test_a_truncated_final_line_is_skipped_not_fatal(tmp_path):
     path = tmp_path / "partial.jsonl"
     path.write_text('{"request":{"method":"GET","path":"/a"},"response":{}}\n{"req')

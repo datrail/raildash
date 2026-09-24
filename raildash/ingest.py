@@ -374,6 +374,24 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
     request_body = request.get("body")
     response_body = response.get("body")
 
+    state = None
+    method_name = None
+    agent_host_id = sandbox_name = agent_key = None
+    attribution = interaction.get("attribution")
+    if interaction.get("runtime_identity_version") == 1 and isinstance(attribution, dict):
+        candidate_state = attribution.get("state")
+        if candidate_state in {"attributed", "ambiguous", "unknown", "conflict"}:
+            state = candidate_state
+            candidate_method = attribution.get("method")
+            method_name = candidate_method if isinstance(candidate_method, str) else None
+            ref = interaction.get("agent_ref")
+            if state == "attributed" and isinstance(ref, dict):
+                values = [ref.get(k) for k in ("host_id", "sandbox_name", "agent_key")]
+                if all(isinstance(value, str) and value for value in values):
+                    agent_host_id, sandbox_name, agent_key = values
+                else:
+                    state, method_name = "unknown", None
+
     return {
         "interaction_id": interaction_id,
         "timestamp": interaction.get("timestamp"),
@@ -390,6 +408,11 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
         "model": _model(request_body) or _model(response_body),
         "tool_calls": _count_tool_calls(request_body) + _count_tool_calls(response_body),
         "has_ticket": int(interaction_has_ticket(interaction)),
+        "agent_host_id": agent_host_id,
+        "sandbox_name": sandbox_name,
+        "agent_key": agent_key,
+        "attribution_state": state,
+        "attribution_method": method_name,
         "raw": json.dumps(redact_credential_headers(interaction), default=str),
     }
 
