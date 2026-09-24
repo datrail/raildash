@@ -15,8 +15,11 @@ locally with no control plane behind it.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -25,6 +28,14 @@ from .json_safety import (
     MAX_SAFE_JSON_BYTES,
     JSONStructureTooComplex,
     check_json_structure,
+)
+from .asp import (
+    DEFAULT_DRIFT_PAGE_SIZE,
+    MAX_DRIFT_PAGE_SIZE,
+    bundle_digest,
+    compare_alignment,
+    parse_bundle,
+    resolve_identity,
 )
 
 CREDENTIAL_REDACTION_SCHEMA_VERSION = 1
@@ -38,6 +49,8 @@ MAX_PROFILE_TOOL_ROWS = 10_000
 MAX_PROFILE_TOOL_NAMES = 1_000
 MAX_PROFILE_DIMENSION_VALUES = 100
 MAX_PROFILE_VALUE_CHARS = 256
+ASP_RETENTION_COUNT = 100
+ASP_RETENTION_DAYS = 30
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -91,6 +104,78 @@ CREATE TABLE IF NOT EXISTS raw_events (
     raw        TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS raw_events_session ON raw_events(session_id);
+
+CREATE TABLE IF NOT EXISTS asps (
+    asp_id            TEXT PRIMARY KEY,
+    bundle_id         TEXT NOT NULL UNIQUE,
+    digest            TEXT NOT NULL UNIQUE,
+    exact_bundle      BLOB NOT NULL,
+    collected_at      TEXT NOT NULL,
+    stored_at         TEXT NOT NULL,
+    host_id           TEXT NOT NULL,
+    sandbox_name      TEXT NOT NULL,
+    bundle_version    INTEGER NOT NULL,
+    rule_pack_version INTEGER NOT NULL,
+    identity_kind     TEXT NOT NULL,
+    identity_value    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS asps_identity
+    ON asps(identity_kind, identity_value, stored_at DESC);
+
+CREATE TABLE IF NOT EXISTS alignment_versions (
+    alignment_version_id TEXT PRIMARY KEY,
+    version              TEXT NOT NULL,
+    locked_at            TEXT NOT NULL,
+    identity_kind        TEXT NOT NULL,
+    identity_value       TEXT NOT NULL,
+    bundle_version       INTEGER NOT NULL,
+    rule_pack_version    INTEGER NOT NULL,
+    asp_id               TEXT NOT NULL,
+    digest               TEXT NOT NULL,
+    FOREIGN KEY (asp_id) REFERENCES asps(asp_id),
+    UNIQUE(identity_kind, identity_value, version)
+);
+
+CREATE TABLE IF NOT EXISTS active_bindings (
+    identity_kind        TEXT NOT NULL,
+    identity_value       TEXT NOT NULL,
+    alignment_version_id TEXT NOT NULL,
+    switched_at          TEXT NOT NULL,
+    PRIMARY KEY(identity_kind, identity_value),
+    FOREIGN KEY (alignment_version_id)
+        REFERENCES alignment_versions(alignment_version_id)
+);
+
+CREATE TABLE IF NOT EXISTS drift_results (
+    drift_result_id      TEXT PRIMARY KEY,
+    current_asp_id       TEXT NOT NULL,
+    alignment_version_id TEXT NOT NULL,
+    compared_at          TEXT NOT NULL,
+    comparable           INTEGER NOT NULL,
+    has_drift            INTEGER,
+    reason               TEXT,
+    change_count         INTEGER NOT NULL,
+    result_json          TEXT NOT NULL,
+    FOREIGN KEY (current_asp_id) REFERENCES asps(asp_id),
+    FOREIGN KEY (alignment_version_id)
+        REFERENCES alignment_versions(alignment_version_id),
+    UNIQUE(current_asp_id, alignment_version_id)
+);
+CREATE INDEX IF NOT EXISTS drift_results_current
+    ON drift_results(current_asp_id, compared_at DESC);
+
+CREATE TRIGGER IF NOT EXISTS asps_immutable_update
+BEFORE UPDATE ON asps BEGIN SELECT RAISE(ABORT, 'ASPs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS asps_immutable_delete
+BEFORE DELETE ON asps
+WHEN EXISTS (SELECT 1 FROM alignment_versions WHERE asp_id = OLD.asp_id)
+BEGIN SELECT RAISE(ABORT, 'locked ASPs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS alignment_versions_immutable_update
+BEFORE UPDATE ON alignment_versions
+BEGIN SELECT RAISE(ABORT, 'alignment versions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS alignment_versions_immutable_delete
+BEFORE DELETE ON alignment_versions
+BEGIN SELECT RAISE(ABORT, 'alignment versions are immutable'); END;
 """
 
 
@@ -105,6 +190,13 @@ class Store:
 
     def __init__(self, path: str | Path = "raildash.db") -> None:
         self.path = str(path)
+        self._prepare_private_database_path(Path(path))
+        self._asp_retention_count = self._retention_setting(
+            "RAILDASH_ASP_RETENTION_COUNT", ASP_RETENTION_COUNT
+        )
+        self._asp_retention_days = self._retention_setting(
+            "RAILDASH_ASP_RETENTION_DAYS", ASP_RETENTION_DAYS
+        )
         self._lock = threading.Lock()
         self._db = sqlite3.connect(self.path, timeout=1.0, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
@@ -121,6 +213,47 @@ class Store:
         self._db.executescript(SCHEMA)
         self._migrate()
         self._db.commit()
+        self._secure_database_files()
+
+    @staticmethod
+    def _prepare_private_database_path(path: Path) -> None:
+        """Refuse a database directory another local account can modify."""
+        parent = path.resolve().parent
+        if not parent.is_dir():
+            raise RuntimeError(f"database parent does not exist: {parent}")
+        mode = parent.stat().st_mode
+        if mode & 0o022:
+            raise RuntimeError(
+                f"database parent must not be group/other writable: {parent}"
+            )
+        if path.exists() and hasattr(os, "geteuid"):
+            if path.stat().st_uid != os.geteuid():
+                raise RuntimeError("RailDash database must be owned by the current user")
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(str(path) + suffix)
+            if candidate.exists():
+                if hasattr(os, "geteuid") and candidate.stat().st_uid != os.geteuid():
+                    raise RuntimeError("RailDash database files must be owned by the current user")
+                candidate.chmod(0o600)
+
+    @staticmethod
+    def _retention_setting(name: str, default: int) -> int:
+        try:
+            value = int(os.environ.get(name, str(default)))
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be a non-negative integer") from exc
+        if value <= 0:
+            raise RuntimeError(f"{name} must be a positive integer")
+        return value
+
+    def _secure_database_files(self) -> None:
+        """Keep the database and SQLite sidecars readable only by their owner."""
+        if self.path == ":memory:":
+            return
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(self.path + suffix)
+            if candidate.exists():
+                candidate.chmod(0o600)
 
     def _migrate(self) -> None:
         """Remove credentials written by versions predating DR-20.
@@ -246,7 +379,418 @@ class Store:
 
     def close(self) -> None:
         with self._lock:
+            self._secure_database_files()
             self._db.close()
+
+    # --------------------------------------------------------------- ASP v1
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _identity_columns(identity: dict[str, Any]) -> tuple[str, str]:
+        return identity["kind"], json.dumps(
+            identity["value"], ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+
+    @staticmethod
+    def _identity_object(kind: str, value: str) -> dict[str, Any]:
+        return {"kind": kind, "value": json.loads(value)}
+
+    def load_asp(self, raw: bytes, *, agent_key: str | None = None) -> dict[str, Any]:
+        """Validate and atomically retain exact evidence bytes as an immutable ASP."""
+        bundle = parse_bundle(raw)
+        identity = resolve_identity(bundle, agent_key)
+        identity_kind, identity_value = self._identity_columns(identity)
+        digest = bundle_digest(raw)
+        with self._lock:
+            existing = self._db.execute(
+                "SELECT * FROM asps WHERE digest = ?", (digest,)
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["identity_kind"] != identity_kind
+                    or existing["identity_value"] != identity_value
+                ):
+                    raise ValueError(
+                        "exact bundle is already stored under a different agent identity"
+                    )
+                return self._asp_summary(existing, replayed=True)
+            collision = self._db.execute(
+                "SELECT digest FROM asps WHERE bundle_id = ?", (bundle["bundle_id"],)
+            ).fetchone()
+            if collision is not None:
+                raise ValueError("bundle_id already exists with different exact bytes")
+
+            asp_id = f"asp-{uuid.uuid4()}"
+            stored_at = self._now()
+            self._db.execute(
+                """INSERT INTO asps (
+                       asp_id, bundle_id, digest, exact_bundle, collected_at, stored_at,
+                       host_id, sandbox_name, bundle_version, rule_pack_version,
+                       identity_kind, identity_value
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    asp_id,
+                    bundle["bundle_id"],
+                    digest,
+                    raw,
+                    bundle["collected_at"],
+                    stored_at,
+                    bundle["host_id"],
+                    bundle["sandbox_name"],
+                    bundle["bundle_version"],
+                    bundle["rule_pack_version"],
+                    identity_kind,
+                    identity_value,
+                ),
+            )
+            self._compare_active_locked(asp_id, raw, identity_kind, identity_value)
+            self._prune_asp_history_locked(
+                keep_count=self._asp_retention_count,
+                max_age_days=self._asp_retention_days,
+            )
+            self._db.commit()
+            row = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
+            self._secure_database_files()
+            return self._asp_summary(row, replayed=False)
+
+    def _compare_active_locked(
+        self, asp_id: str, raw: bytes, identity_kind: str, identity_value: str
+    ) -> None:
+        active = self._db.execute(
+            """SELECT v.*, a.exact_bundle AS baseline_bundle
+               FROM active_bindings b
+               JOIN alignment_versions v USING (alignment_version_id)
+               JOIN asps a ON a.asp_id = v.asp_id
+               WHERE b.identity_kind = ? AND b.identity_value = ?""",
+            (identity_kind, identity_value),
+        ).fetchone()
+        if active is None:
+            return
+        alignment = self._alignment_contract(active)
+        local_key = json.loads(identity_value) if identity_kind == "local_agent_key" else None
+        result = compare_alignment(
+            alignment, bytes(active["baseline_bundle"]), raw, current_agent_key=local_key
+        )
+        self._db.execute(
+            """INSERT OR IGNORE INTO drift_results (
+                   drift_result_id, current_asp_id, alignment_version_id, compared_at,
+                   comparable, has_drift, reason, change_count, result_json
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f"drift-{uuid.uuid4()}",
+                asp_id,
+                active["alignment_version_id"],
+                self._now(),
+                int(result["comparable"]),
+                None if result["has_drift"] is None else int(result["has_drift"]),
+                result["reason"],
+                result["change_count"],
+                json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+
+    def lock_alignment(self, asp_id: str, version: str) -> dict[str, Any]:
+        if not version or len(version) > 128 or version.strip() != version:
+            raise ValueError("version must be a non-empty trimmed string of at most 128 characters")
+        with self._lock:
+            asp = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
+            if asp is None:
+                raise KeyError("no such ASP")
+            alignment_id = f"aspver-{uuid.uuid4()}"
+            locked_at = self._now()
+            try:
+                self._db.execute(
+                    """INSERT INTO alignment_versions (
+                       alignment_version_id, version, locked_at, identity_kind,
+                       identity_value, bundle_version, rule_pack_version, asp_id, digest
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        alignment_id,
+                        version,
+                        locked_at,
+                        asp["identity_kind"],
+                        asp["identity_value"],
+                        asp["bundle_version"],
+                        asp["rule_pack_version"],
+                        asp_id,
+                        asp["digest"],
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                self._db.rollback()
+                raise ValueError(
+                    "that alignment version already exists for this agent identity"
+                ) from exc
+            self._db.commit()
+            row = self._db.execute(
+                "SELECT * FROM alignment_versions WHERE alignment_version_id = ?",
+                (alignment_id,),
+            ).fetchone()
+            return self._alignment_contract(row)
+
+    def switch_alignment(self, alignment_version_id: str) -> dict[str, Any]:
+        with self._lock:
+            version = self._db.execute(
+                "SELECT * FROM alignment_versions WHERE alignment_version_id = ?",
+                (alignment_version_id,),
+            ).fetchone()
+            if version is None:
+                raise KeyError("no such alignment version")
+            switched_at = self._now()
+            self._db.execute(
+                """INSERT INTO active_bindings (
+                       identity_kind, identity_value, alignment_version_id, switched_at
+                   ) VALUES (?, ?, ?, ?)
+                   ON CONFLICT(identity_kind, identity_value) DO UPDATE SET
+                       alignment_version_id = excluded.alignment_version_id,
+                       switched_at = excluded.switched_at""",
+                (
+                    version["identity_kind"],
+                    version["identity_value"],
+                    alignment_version_id,
+                    switched_at,
+                ),
+            )
+            latest = self._db.execute(
+                """SELECT asp_id, exact_bundle FROM asps
+                   WHERE identity_kind = ? AND identity_value = ?
+                   ORDER BY stored_at DESC, rowid DESC LIMIT 1""",
+                (version["identity_kind"], version["identity_value"]),
+            ).fetchone()
+            if latest is not None:
+                self._compare_active_locked(
+                    latest["asp_id"],
+                    bytes(latest["exact_bundle"]),
+                    version["identity_kind"],
+                    version["identity_value"],
+                )
+            self._db.commit()
+            return {
+                "binding_contract_version": 1,
+                "agent_identity": self._identity_object(
+                    version["identity_kind"], version["identity_value"]
+                ),
+                "alignment_version_id": alignment_version_id,
+                "switched_at": switched_at,
+            }
+
+    def asp_summaries(
+        self,
+        *,
+        include_digest: bool = True,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM asps ORDER BY stored_at DESC, rowid DESC"
+        params: tuple[int, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params = (limit, offset)
+        rows = self._db.execute(sql, params).fetchall()
+        return [
+            self._asp_summary(row, replayed=False, include_digest=include_digest)
+            for row in rows
+        ]
+
+    def alignment_summaries(
+        self,
+        *,
+        include_digest: bool = True,
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        sql = (
+            """SELECT v.*, b.alignment_version_id IS NOT NULL AS active
+               FROM alignment_versions v
+               LEFT JOIN active_bindings b
+                 ON b.alignment_version_id = v.alignment_version_id
+               ORDER BY v.locked_at DESC, v.rowid DESC"""
+        )
+        params: tuple[int, ...] = ()
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params = (limit, offset)
+        rows = self._db.execute(sql, params).fetchall()
+        return [
+            {
+                **self._alignment_contract(row, include_digest=include_digest),
+                "active": bool(row["active"]),
+            }
+            for row in rows
+        ]
+
+    def asp_state(self, asp_id: str) -> dict[str, Any] | None:
+        asp = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
+        if asp is None:
+            return None
+        active = self._db.execute(
+            """SELECT v.alignment_version_id, v.version
+               FROM active_bindings b JOIN alignment_versions v USING (alignment_version_id)
+               WHERE b.identity_kind = ? AND b.identity_value = ?""",
+            (asp["identity_kind"], asp["identity_value"]),
+        ).fetchone()
+        latest = None
+        if active is not None:
+            latest = self._db.execute(
+                """SELECT result_json FROM drift_results
+                   WHERE current_asp_id = ? AND alignment_version_id = ?
+                   ORDER BY compared_at DESC LIMIT 1""",
+                (asp_id, active["alignment_version_id"]),
+            ).fetchone()
+        if active is None:
+            state, result = "NO_ACTIVE_ALIGNMENT", None
+        elif latest is None:
+            state, result = "ALIGNMENT_ACTIVE", None
+        else:
+            result = json.loads(latest["result_json"])
+            state = (
+                "COMPARISON_UNAVAILABLE"
+                if not result["comparable"]
+                else "DRIFT_DETECTED"
+                if result["has_drift"]
+                else "ALIGNED"
+            )
+        return {
+            "asp": self._asp_summary(asp, replayed=False, include_digest=False),
+            "state": state,
+            "active_alignment": dict(active) if active is not None else None,
+            "drift": result,
+        }
+
+    def asp_count(self) -> int:
+        return int(self._db.execute("SELECT COUNT(*) FROM asps").fetchone()[0])
+
+    def alignment_count(self) -> int:
+        return int(
+            self._db.execute("SELECT COUNT(*) FROM alignment_versions").fetchone()[0]
+        )
+
+    def drift_page(self, asp_id: str, *, limit: int = DEFAULT_DRIFT_PAGE_SIZE, offset: int = 0) -> dict[str, Any] | None:
+        if limit < 1 or limit > MAX_DRIFT_PAGE_SIZE or offset < 0:
+            raise ValueError("invalid drift page")
+        row = self._db.execute(
+            """SELECT d.result_json FROM drift_results d
+               JOIN asps a ON a.asp_id = d.current_asp_id
+               JOIN active_bindings b
+                 ON b.identity_kind = a.identity_kind
+                AND b.identity_value = a.identity_value
+                AND b.alignment_version_id = d.alignment_version_id
+               WHERE d.current_asp_id = ? ORDER BY d.compared_at DESC LIMIT 1""",
+            (asp_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        result = json.loads(row["result_json"])
+        changes = result.pop("changes")
+        result["changes"] = changes[offset : offset + limit]
+        result["offset"] = offset
+        result["limit"] = limit
+        return result
+
+    def asp_exact_bytes(self, asp_id: str) -> bytes | None:
+        row = self._db.execute("SELECT exact_bundle FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
+        return None if row is None else bytes(row["exact_bundle"])
+
+    def drift_detail(self, asp_id: str) -> dict[str, Any] | None:
+        """Return full local evidence for an owner-only CLI export."""
+        row = self._db.execute(
+            """SELECT d.result_json, d.compared_at,
+                      current.exact_bundle AS current_bundle,
+                      baseline.exact_bundle AS baseline_bundle,
+                      v.alignment_version_id
+               FROM drift_results d
+               JOIN asps current ON current.asp_id = d.current_asp_id
+               JOIN alignment_versions v
+                 ON v.alignment_version_id = d.alignment_version_id
+               JOIN asps baseline ON baseline.asp_id = v.asp_id
+               JOIN active_bindings active
+                 ON active.identity_kind = current.identity_kind
+                AND active.identity_value = current.identity_value
+                AND active.alignment_version_id = d.alignment_version_id
+               WHERE d.current_asp_id = ?
+               ORDER BY d.compared_at DESC LIMIT 1""",
+            (asp_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "alignment_version_id": row["alignment_version_id"],
+            "current_asp_id": asp_id,
+            "compared_at": row["compared_at"],
+            "summary": json.loads(row["result_json"]),
+            "baseline": parse_bundle(bytes(row["baseline_bundle"])),
+            "current": parse_bundle(bytes(row["current_bundle"])),
+        }
+
+    def prune_asp_history(self, *, keep_count: int = ASP_RETENTION_COUNT, max_age_days: int = ASP_RETENTION_DAYS) -> int:
+        if keep_count < 0 or max_age_days < 0:
+            raise ValueError("retention bounds must be non-negative")
+        with self._lock:
+            removed = self._prune_asp_history_locked(
+                keep_count=keep_count, max_age_days=max_age_days
+            )
+            self._db.commit()
+            return removed
+
+    def _prune_asp_history_locked(self, *, keep_count: int, max_age_days: int) -> int:
+        rows = self._db.execute(
+                """SELECT asp_id, stored_at FROM asps
+                   WHERE asp_id NOT IN (SELECT asp_id FROM alignment_versions)
+                   ORDER BY stored_at DESC"""
+        ).fetchall()
+        cutoff = datetime.now(timezone.utc).timestamp() - max_age_days * 86400
+        remove = []
+        for index, row in enumerate(rows):
+            when = datetime.fromisoformat(row["stored_at"].replace("Z", "+00:00")).timestamp()
+            if index >= keep_count or when < cutoff:
+                remove.append((row["asp_id"],))
+        self._db.executemany(
+            "DELETE FROM drift_results WHERE current_asp_id = ?", remove
+        )
+        self._db.executemany("DELETE FROM asps WHERE asp_id = ?", remove)
+        return len(remove)
+
+    def _asp_summary(
+        self, row: sqlite3.Row, *, replayed: bool, include_digest: bool = True
+    ) -> dict[str, Any]:
+        result = {
+            "asp_id": row["asp_id"],
+            "bundle_id": row["bundle_id"],
+            "collected_at": row["collected_at"],
+            "stored_at": row["stored_at"],
+            "subject": {"host_id": row["host_id"], "sandbox_name": row["sandbox_name"]},
+            "contract": {
+                "bundle_version": row["bundle_version"],
+                "rule_pack_version": row["rule_pack_version"],
+            },
+            "agent_identity": self._identity_object(row["identity_kind"], row["identity_value"]),
+            "replayed": replayed,
+        }
+        if include_digest:
+            result["digest"] = row["digest"]
+        return result
+
+    def _alignment_contract(
+        self, row: sqlite3.Row, *, include_digest: bool = True
+    ) -> dict[str, Any]:
+        result = {
+            "alignment_contract_version": 1,
+            "alignment_version_id": row["alignment_version_id"],
+            "version": row["version"],
+            "locked_at": row["locked_at"],
+            "agent_identity": self._identity_object(row["identity_kind"], row["identity_value"]),
+            "contract": {
+                "bundle_version": row["bundle_version"],
+                "rule_pack_version": row["rule_pack_version"],
+            },
+            "asp": {"asp_id": row["asp_id"], "digest": row["digest"]},
+        }
+        if not include_digest:
+            result["asp"] = {"asp_id": row["asp_id"]}
+        return result
 
     # ---------------------------------------------------------------- write
 

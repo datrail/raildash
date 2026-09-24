@@ -12,6 +12,7 @@ from raildash.ingest import normalise, read_jsonl
 from raildash.store import SCHEMA, Store
 
 FIXTURE = Path(__file__).parent / "fixtures" / "capture.jsonl"
+ASP_FIXTURE = Path(__file__).parent / "fixtures" / "evidence-bundle-v1.json"
 
 
 @pytest.fixture()
@@ -29,6 +30,41 @@ def test_health(client):
     body = client.get("/webhook/health").json()
     assert body["status"] == "ok"
     assert body["sessions"] == 1
+
+
+def test_asp_http_surface_is_read_only_bounded_and_redacted(client):
+    baseline = app_module.store.load_asp(ASP_FIXTURE.read_bytes())
+    version = app_module.store.lock_alignment(baseline["asp_id"], "v1.0")
+    app_module.store.switch_alignment(version["alignment_version_id"])
+    current_value = json.loads(ASP_FIXTURE.read_bytes())
+    current_value["bundle_id"] = "bnd-api-current"
+    current_value["collected_at"] = "2026-09-24T01:00:00Z"
+    current_value["attributes"]["declared_destinations"]["value"] = [
+        "private.example"
+    ]
+    current = app_module.store.load_asp(json.dumps(current_value).encode())
+
+    asps = client.get("/api/asps")
+    alignments = client.get("/api/alignments")
+    state = client.get(f"/api/asps/{current['asp_id']}/state")
+    drift = client.get(
+        f"/api/asps/{current['asp_id']}/drift", params={"limit": 1, "offset": 0}
+    )
+
+    for response in (asps, alignments, state, drift):
+        assert response.status_code == 200
+        assert "private.example" not in response.text
+        assert "exact_bundle" not in response.text
+        assert "sha256:" not in response.text
+    assert state.json()["state"] == "DRIFT_DETECTED"
+    assert drift.json()["limit"] == 1
+    assert asps.json()["total"] == 2
+    assert alignments.json()["total"] == 1
+    assert client.post("/api/asps", json={}).status_code == 405
+    assert client.get("/api/asps", params={"limit": 501}).status_code == 422
+    assert client.get(
+        f"/api/asps/{current['asp_id']}/drift", params={"limit": 501}
+    ).status_code == 422
 
 
 def test_sessions_carry_counts(client):

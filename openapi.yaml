@@ -17,6 +17,78 @@ servers:
     description: Local development webhook server
 
 paths:
+  /api/asps:
+    get:
+      operationId: listAsps
+      summary: List redacted immutable ASP metadata
+      parameters:
+        - {$ref: '#/components/parameters/PageLimit'}
+        - {$ref: '#/components/parameters/PageOffset'}
+      responses:
+        '200':
+          description: Bounded ASP metadata page; evidence values and digests are omitted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: '#/components/schemas/Page'}
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: {$ref: '#/components/schemas/AspSummary'}
+
+  /api/alignments:
+    get:
+      operationId: listAlignmentVersions
+      summary: List redacted immutable alignment-version metadata
+      parameters:
+        - {$ref: '#/components/parameters/PageLimit'}
+        - {$ref: '#/components/parameters/PageOffset'}
+      responses:
+        '200':
+          description: Bounded alignment-version metadata page; digests are omitted.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: '#/components/schemas/Page'}
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: {$ref: '#/components/schemas/AlignmentSummary'}
+
+  /api/asps/{asp_id}/state:
+    get:
+      operationId: getAspState
+      summary: Get the redacted active-alignment state for one ASP
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+      responses:
+        '200':
+          description: Current alignment state and bounded redacted drift summary.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AspState'}
+        '404': {description: ASP not found}
+
+  /api/asps/{asp_id}/drift:
+    get:
+      operationId: getAspDrift
+      summary: Get one bounded page of redacted drift changes
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+        - {$ref: '#/components/parameters/PageLimit'}
+        - {$ref: '#/components/parameters/PageOffset'}
+      responses:
+        '200':
+          description: Drift result whose changes contain names and field names, never evidence values.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/DriftPage'}
+        '404': {description: No active-alignment drift result for the ASP}
+
   /api/profile:
     get:
       operationId: downloadObservedProfile
@@ -136,7 +208,136 @@ paths:
                     example: ok
 
 components:
+  parameters:
+    AspId:
+      name: asp_id
+      in: path
+      required: true
+      schema: {type: string, minLength: 1}
+    PageLimit:
+      name: limit
+      in: query
+      schema: {type: integer, minimum: 1, maximum: 500, default: 100}
+    PageOffset:
+      name: offset
+      in: query
+      schema: {type: integer, minimum: 0, default: 0}
+
   schemas:
+    Page:
+      type: object
+      required: [total, items, limit, offset]
+      properties:
+        total: {type: integer, minimum: 0}
+        items: {type: array}
+        limit: {type: integer, minimum: 1, maximum: 500}
+        offset: {type: integer, minimum: 0}
+
+    AgentIdentity:
+      type: object
+      required: [kind, value]
+      properties:
+        kind:
+          type: string
+          enum: [deployment_environment, deployment_compose, local_agent_key]
+        value:
+          description: Closed identity value for the named kind; never evidence content.
+          oneOf:
+            - {type: string, maxLength: 128}
+            - {type: object}
+
+    AspSummary:
+      type: object
+      required: [asp_id, bundle_id, collected_at, stored_at, subject, contract, agent_identity, replayed]
+      properties:
+        asp_id: {type: string}
+        bundle_id: {type: string}
+        collected_at: {type: string, format: date-time}
+        stored_at: {type: string, format: date-time}
+        subject:
+          type: object
+          required: [host_id, sandbox_name]
+          properties:
+            host_id: {type: string}
+            sandbox_name: {type: string}
+        contract:
+          type: object
+          required: [bundle_version, rule_pack_version]
+          properties:
+            bundle_version: {type: integer, const: 1}
+            rule_pack_version: {type: integer, minimum: 1}
+        agent_identity: {$ref: '#/components/schemas/AgentIdentity'}
+        replayed: {type: boolean}
+
+    AlignmentSummary:
+      type: object
+      required: [alignment_contract_version, alignment_version_id, version, locked_at, agent_identity, contract, asp, active]
+      properties:
+        alignment_contract_version: {type: integer, const: 1}
+        alignment_version_id: {type: string}
+        version: {type: string}
+        locked_at: {type: string, format: date-time}
+        agent_identity: {$ref: '#/components/schemas/AgentIdentity'}
+        contract: {type: object}
+        asp:
+          type: object
+          required: [asp_id]
+          properties:
+            asp_id: {type: string}
+        active: {type: boolean}
+
+    DriftChange:
+      type: object
+      required: [type, name, fields]
+      properties:
+        type:
+          type: string
+          enum: [ATTRIBUTE_ADDED, ATTRIBUTE_REMOVED, ATTRIBUTE_CHANGED, SOURCE_ADDED, SOURCE_REMOVED, SOURCE_CHANGED, ATTESTATION_ADDED, ATTESTATION_REMOVED, ATTESTATION_CHANGED]
+        name: {type: string}
+        fields:
+          type: array
+          items: {type: string}
+
+    DriftResult:
+      type: object
+      required: [drift_contract_version, comparable, has_drift, reason, change_count, changes, truncated]
+      properties:
+        drift_contract_version: {type: integer, const: 1}
+        comparable: {type: boolean}
+        has_drift: {type: [boolean, 'null']}
+        reason:
+          type: [string, 'null']
+          enum: [IDENTITY_MISMATCH, CONTRACT_MISMATCH, INVALID_BUNDLE, ALIGNMENT_INTEGRITY_FAILED, NO_ACTIVE_ALIGNMENT, null]
+        change_count: {type: integer, minimum: 0}
+        changes:
+          type: array
+          maxItems: 500
+          items: {$ref: '#/components/schemas/DriftChange'}
+        truncated: {type: boolean}
+
+    DriftPage:
+      allOf:
+        - {$ref: '#/components/schemas/DriftResult'}
+        - type: object
+          required: [limit, offset]
+          properties:
+            limit: {type: integer, minimum: 1, maximum: 500}
+            offset: {type: integer, minimum: 0}
+
+    AspState:
+      type: object
+      required: [asp, state, active_alignment, drift]
+      properties:
+        asp: {$ref: '#/components/schemas/AspSummary'}
+        state:
+          type: string
+          enum: [NO_ACTIVE_ALIGNMENT, ALIGNMENT_ACTIVE, ALIGNED, DRIFT_DETECTED, COMPARISON_UNAVAILABLE]
+        active_alignment: {type: [object, 'null']}
+        drift:
+          oneOf:
+            - {$ref: '#/components/schemas/DriftResult'}
+            - {type: 'null'}
+
     ObservedValueCount:
       type: object
       required: [value, count]

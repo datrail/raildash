@@ -74,19 +74,34 @@ pip install -r requirements-dev.txt
 make test
 ```
 
-## ASP v1 contract layer
+## ASP v1 local custody
 
-`raildash.asp` contains the pure, storage-independent ASP v1 validator and
-comparator. It validates exact RailMon evidence-bundle bytes, binds identity by
-complete environment deployment pair, then host-scoped Compose pair, then an
-explicit local `agent_key`, verifies the locked exact-byte digest, and returns
-stable redacted drift changes. The versioned JSON Schemas live under
-`raildash/schemas/`.
+RailDash retains validated RailMon evidence bundles as immutable ASPs and can
+lock any stored ASP as an alignment version. Stop the server before each
+database-owner operation:
 
-This slice is intentionally not connected to HTTP or SQLite yet. ASP loading,
-locking, active-version switching, summaries, and UI alerting will use this
-layer through the offline database-owner workflow; the existing capture and
-`/api/profile` paths are unchanged.
+```bash
+raildash asp load evidence-bundle.json
+raildash asp list
+raildash asp lock asp-... --version v1.0
+raildash asp switch aspver-...
+```
+
+For a bundle without a complete deployment or host-scoped Compose identity,
+pass `--agent-key NAME` to `asp load`. Replaying identical bytes is idempotent;
+reusing a bundle ID with different bytes is rejected. `asp export` preserves
+the exact received bytes, and `asp drift-export` writes full baseline/current
+evidence. Both refuse public output directories and create owner-only files.
+Use `asp prune --keep-count 100 --max-age-days 30` to apply the default
+independent retention bounds; the same defaults run after each load. Set
+`RAILDASH_ASP_RETENTION_COUNT` and `RAILDASH_ASP_RETENTION_DAYS` independently
+to change them. Locked versions and their ASPs are never pruned.
+
+Read-only `/api/asps`, `/api/alignments`, and per-ASP state/drift routes expose
+bounded metadata and redacted change names only. Evidence values and digests
+remain on the owner-only CLI. The existing capture and `/api/profile` paths
+are unchanged. The pure validator/comparator and versioned JSON Schemas live
+under `raildash.asp` and `raildash/schemas/`.
 
 The OpenAPI contract is [`openapi.yaml`](openapi.yaml). The compose files that
 run RailDash alongside RailMon live in
