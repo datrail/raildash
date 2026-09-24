@@ -333,19 +333,11 @@ def _bundle_changes(
     baseline: dict[str, Any], current: dict[str, Any]
 ) -> list[dict[str, Any]]:
     changes: list[dict[str, Any]] = []
-    # The producer repeats copy identity as an attribute. It is audit evidence,
-    # not drift after the explicit logical-identity gate, just like the four
-    # collection-instance envelope fields omitted from this projection.
-    baseline_attributes = {
-        key: value
-        for key, value in baseline["attributes"].items()
-        if key != "container_identity"
-    }
-    current_attributes = {
-        key: value
-        for key, value in current["attributes"].items()
-        if key != "container_identity"
-    }
+    # The producer repeats copy identity in this attribute's value. Preserve
+    # its evidence qualifiers as drift, but omit only that copy-specific value
+    # after the explicit logical-identity gate.
+    baseline_attributes = _comparison_attributes(baseline["attributes"])
+    current_attributes = _comparison_attributes(current["attributes"])
     changes.extend(
         _map_changes(
             baseline_attributes,
@@ -374,6 +366,18 @@ def _bundle_changes(
         )
     )
     return changes
+
+
+def _comparison_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
+    projected = dict(attributes)
+    container_identity = projected.get("container_identity")
+    if isinstance(container_identity, dict):
+        projected["container_identity"] = {
+            key: value
+            for key, value in container_identity.items()
+            if key != "value"
+        }
+    return projected
 
 
 def _map_changes(
