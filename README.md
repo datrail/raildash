@@ -74,6 +74,20 @@ pip install -r requirements-dev.txt
 make test
 ```
 
+## ASP v1 contract layer
+
+`raildash.asp` contains the pure, storage-independent ASP v1 validator and
+comparator. It validates exact RailMon evidence-bundle bytes, binds identity by
+complete environment deployment pair, then host-scoped Compose pair, then an
+explicit local `agent_key`, verifies the locked exact-byte digest, and returns
+stable redacted drift changes. The versioned JSON Schemas live under
+`raildash/schemas/`.
+
+This slice is intentionally not connected to HTTP or SQLite yet. ASP loading,
+locking, active-version switching, summaries, and UI alerting will use this
+layer through the offline database-owner workflow; the existing capture and
+`/api/profile` paths are unchanged.
+
 The OpenAPI contract is [`openapi.yaml`](openapi.yaml). The compose files that
 run RailDash alongside RailMon live in
 [datrail-project](https://github.com/datrail/datrail-project).

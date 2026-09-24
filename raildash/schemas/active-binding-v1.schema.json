@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:datrail:asp:active-binding:1",
+  "title": "DatRail ASP active binding v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["binding_contract_version", "agent_identity", "alignment_version_id", "switched_at"],
+  "properties": {
+    "binding_contract_version": {"const": 1},
+    "agent_identity": {"$ref": "#/$defs/identity"},
+    "alignment_version_id": {"type": "string", "minLength": 1},
+    "switched_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "identity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": {"const": "deployment_environment"},
+            "value": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["deployment", "namespace"],
+              "properties": {"deployment": {"type": "string", "minLength": 1}, "namespace": {"type": "string", "minLength": 1}}
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": {"const": "deployment_compose"},
+            "value": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["host_id", "project", "service"],
+              "properties": {"host_id": {"type": "string", "minLength": 1}, "project": {"type": "string", "minLength": 1}, "service": {"type": "string", "minLength": 1}}
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {"kind": {"const": "local_agent_key"}, "value": {"type": "string", "minLength": 1, "maxLength": 128}}
+        }
+      ]
+    }
+  }
+}
