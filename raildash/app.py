@@ -32,6 +32,7 @@ from .json_safety import (
     JSONStructureTooComplex,
 )
 from .store import Store
+from .asp import DEFAULT_DRIFT_PAGE_SIZE, MAX_DRIFT_PAGE_SIZE
 
 STATIC = Path(__file__).parent / "static"
 # A companion RailMon sender change splits batches by their serialized size,
@@ -266,6 +267,60 @@ def api_interaction(row_id: int) -> dict[str, Any]:
     if found is None:
         raise HTTPException(404, "no such interaction")
     return found
+
+
+@app.get("/api/asps")
+def api_asps(
+    limit: int = Query(DEFAULT_DRIFT_PAGE_SIZE, ge=1, le=MAX_DRIFT_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """Return redacted ASP metadata; exact evidence remains CLI-only."""
+    db = get_store()
+    return {
+        "total": db.asp_count(),
+        "items": db.asp_summaries(
+            include_digest=False, limit=limit, offset=offset
+        ),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/alignments")
+def api_alignments(
+    limit: int = Query(DEFAULT_DRIFT_PAGE_SIZE, ge=1, le=MAX_DRIFT_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """Return immutable alignment metadata and active-binding state."""
+    db = get_store()
+    return {
+        "total": db.alignment_count(),
+        "items": db.alignment_summaries(
+            include_digest=False, limit=limit, offset=offset
+        ),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/asps/{asp_id}/state")
+def api_asp_state(asp_id: str) -> dict[str, Any]:
+    state = get_store().asp_state(asp_id)
+    if state is None:
+        raise HTTPException(404, "no such ASP")
+    return state
+
+
+@app.get("/api/asps/{asp_id}/drift")
+def api_asp_drift(
+    asp_id: str,
+    limit: int = Query(DEFAULT_DRIFT_PAGE_SIZE, ge=1, le=MAX_DRIFT_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    result = get_store().drift_page(asp_id, limit=limit, offset=offset)
+    if result is None:
+        raise HTTPException(404, "no drift result for ASP")
+    return result
 
 
 # --------------------------------------------------------- legacy JSON routes
