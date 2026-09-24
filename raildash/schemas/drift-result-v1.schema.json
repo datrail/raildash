@@ -11,7 +11,7 @@
     "has_drift": {"type": ["boolean", "null"]},
     "reason": {"type": ["string", "null"], "enum": [null, "IDENTITY_MISMATCH", "CONTRACT_MISMATCH", "INVALID_BUNDLE", "ALIGNMENT_INTEGRITY_FAILED", "NO_ACTIVE_ALIGNMENT"]},
     "change_count": {"type": "integer", "minimum": 0},
-    "changes": {"type": "array", "maxItems": 1000, "items": {"$ref": "#/$defs/change"}},
+    "changes": {"type": "array", "maxItems": 500, "items": {"$ref": "#/$defs/change"}},
     "truncated": {"type": "boolean"}
   },
   "allOf": [
