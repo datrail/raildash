@@ -4,6 +4,8 @@ import copy
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -237,3 +239,48 @@ def test_cli_load_lock_switch_and_list_round_trip(tmp_path, capsys):
     listed = json.loads(capsys.readouterr().out)
     assert listed["asps"][0]["asp_id"] == loaded["asp_id"]
     assert listed["alignment_versions"][0]["active"] is True
+
+
+def test_standalone_acceptance_oracle_passes_without_exposing_evidence_values():
+    root = Path(__file__).parents[1]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(root)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "raildash.acceptance",
+            "--fixture",
+            "tests/fixtures/evidence-bundle-v1.json",
+        ],
+        cwd=root,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    report = json.loads(result.stdout)
+    assert report["acceptance"] == "passed"
+    assert all(report["checks"].values())
+    assert "acceptance-change.example" not in result.stdout
+    assert "sha256:" not in result.stdout
+
+
+def test_acceptance_oracle_refuses_an_existing_database(tmp_path):
+    database = tmp_path / "existing.db"
+    database.touch()
+    with pytest.raises(SystemExit):
+        from raildash.acceptance import main
+
+        old_argv = sys.argv
+        try:
+            sys.argv = [
+                "raildash-asp-acceptance",
+                "--fixture",
+                str(FIXTURE),
+                "--database",
+                str(database),
+            ]
+            main()
+        finally:
+            sys.argv = old_argv

@@ -1,4 +1,4 @@
-.PHONY: test lint serve demo static-demo clean
+.PHONY: test lint serve demo static-demo asp-acceptance clean
 
 VENV := .venv
 PY   := $(VENV)/bin/python
@@ -35,6 +35,9 @@ demo: $(VENV)
 static-demo: $(VENV)
 	$(PY) tools/build_static_demo.py --output dist/static-demo
 
+asp-acceptance: $(VENV)
+	PYTHONPATH=. $(PY) -m raildash.acceptance \
+		--fixture tests/fixtures/evidence-bundle-v1.json
+
 clean:
 	rm -rf $(VENV) .pytest_cache **/__pycache__ demo.db raildash.db *.db-wal *.db-shm dist
-

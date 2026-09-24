@@ -22,6 +22,7 @@ dev = ["httpx>=0.28.0", "jsonschema>=4.25.0", "pytest>=8.0"]
 # whose first command does not run is worse than no README.
 [project.scripts]
 raildash = "raildash.cli:main"
+raildash-asp-acceptance = "raildash.acceptance:main"
 
 [tool.setuptools]
 # Explicit, because the repo root also holds webhook_server.py and tools/,
@@ -31,3 +32,6 @@ py-modules = ["webhook_server"]
 
 [tool.setuptools.package-data]
 raildash = ["static/*", "schemas/*.json"]
+
+[tool.setuptools.data-files]
+"share/raildash" = ["tests/fixtures/evidence-bundle-v1.json"]

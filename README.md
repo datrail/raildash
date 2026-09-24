@@ -103,6 +103,10 @@ remain on the owner-only CLI. The existing capture and `/api/profile` paths
 are unchanged. The pure validator/comparator and versioned JSON Schemas live
 under `raildash.asp` and `raildash/schemas/`.
 
+Run `make asp-acceptance` for the deterministic replay, controlled-drift,
+version-switch, and incompatible-rule-pack flow. The clean-build and live demo
+handoff is documented in [`docs/asp-v1-acceptance.md`](docs/asp-v1-acceptance.md).
+
 The OpenAPI contract is [`openapi.yaml`](openapi.yaml). The compose files that
 run RailDash alongside RailMon live in
 [datrail-project](https://github.com/datrail/datrail-project).
