@@ -67,6 +67,26 @@ def test_static_demo_contains_only_fixture_data_and_static_assets(tmp_path):
     assert "REDACTED-BY-RAILMON" not in rendered
 
 
+def test_asp_alignment_ui_is_accessible_redacted_and_uses_offline_commands():
+    html = (ROOT / "raildash" / "static" / "index.html").read_text()
+    js = (ROOT / "raildash" / "static" / "app.js").read_text()
+
+    assert 'id="asp-status-announcement" aria-live="polite"' in html
+    assert 'id="asp-alignment-body" aria-live=' not in html
+    assert 'role", "status"' not in js
+    assert 'getJSON("/api/asps"' in js
+    assert '/state`' in js
+    assert '/drift`' in js
+    assert "raildash asp lock" in js
+    assert "raildash asp switch" in js
+    assert "innerHTML" not in js.replace("never innerHTML", "")
+    assert "sha256:" not in js
+    assert "available_change_count" in js
+    assert "while (aspOffset < aspTotal)" in js
+    assert "focusTarget.focus()" in js
+    assert "body.contains(document.activeElement)" in js
+
+
 def test_static_demo_rebuild_removes_unknown_stale_content(tmp_path):
     output = tmp_path / "site"
     build(output)

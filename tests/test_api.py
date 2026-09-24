@@ -58,6 +58,7 @@ def test_asp_http_surface_is_read_only_bounded_and_redacted(client):
         assert "sha256:" not in response.text
     assert state.json()["state"] == "DRIFT_DETECTED"
     assert drift.json()["limit"] == 1
+    assert drift.json()["available_change_count"] == 1
     assert asps.json()["total"] == 2
     assert alignments.json()["total"] == 1
     assert client.post("/api/asps", json={}).status_code == 405
