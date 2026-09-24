@@ -218,6 +218,21 @@ def test_exact_replay_is_aligned_after_copy_identity_fields_change():
     }
 
 
+def test_container_identity_qualifier_change_is_still_drift():
+    current = bundle()
+    current["attributes"]["container_identity"]["method"] = "new-collector"
+    result = compare_alignment(alignment(), BASELINE_RAW, raw(current))
+    assert result["comparable"] is True
+    assert result["has_drift"] is True
+    assert result["changes"] == [
+        {
+            "type": "ATTRIBUTE_CHANGED",
+            "name": "container_identity",
+            "fields": ["method"],
+        }
+    ]
+
+
 def test_attribute_qualifiers_and_sources_produce_stable_redacted_changes():
     current = bundle()
     current["attributes"]["tool_names"] = {
