@@ -1,4 +1,4 @@
-.PHONY: test lint serve demo static-demo asp-acceptance clean
+.PHONY: test browser-test lint serve demo static-demo asp-acceptance clean
 
 VENV := .venv
 PY   := $(VENV)/bin/python
@@ -14,7 +14,13 @@ $(VENV):
 
 test: $(VENV)
 	$(PY) -m py_compile webhook_server.py raildash/*.py
-	$(PY) -m pytest -q
+	$(PY) -m pytest -q --ignore=tests/test_browser.py
+
+# Browser installation is intentionally separate from ordinary unit tests:
+# Playwright's Chromium is a large host dependency, while CI and acceptance
+# environments explicitly install it before exercising the real dashboard.
+browser-test: $(VENV)
+	$(PY) -m pytest -q tests/test_browser.py
 
 # The front end ships as three static files with no build step, so the check
 # that matters is that they parse and that every id the script reaches for

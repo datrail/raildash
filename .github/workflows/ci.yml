@@ -48,6 +48,12 @@ jobs:
       # unlike the stdlib-only scanner.
       - run: make test
 
+      # Exercise the real local server and ASP database in Chromium. Keeping
+      # this in the existing test job makes a UI regression a required PR
+      # signal without adding browser weight to the runtime image.
+      - run: .venv/bin/playwright install --with-deps chromium
+      - run: make browser-test
+
       # The front end has no build step, so nothing else would catch a CSS
       # token that was renamed, an id the script reaches for that no longer
       # exists, or a code path that assigns markup. All three fail silently in
