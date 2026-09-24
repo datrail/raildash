@@ -16,6 +16,7 @@ from raildash.store import Store
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "evidence-bundle-v1.json"
+REPO_ROOT = Path(__file__).parents[1]
 
 
 def changed_bundle(*, bundle_id: str, destination: str | None = None) -> bytes:
@@ -25,6 +26,36 @@ def changed_bundle(*, bundle_id: str, destination: str | None = None) -> bytes:
     if destination is not None:
         value["attributes"]["declared_destinations"]["value"] = [destination]
     return json.dumps(value, sort_keys=True).encode()
+
+
+def test_default_database_launch_still_uses_private_working_directory_path(tmp_path):
+    environment = os.environ.copy()
+    environment.pop("RAILDASH_DB", None)
+    python_paths = [str(REPO_ROOT)]
+    for entry in environment.get("PYTHONPATH", "").split(os.pathsep):
+        if entry:
+            path = Path(entry)
+            python_paths.append(str(path if path.is_absolute() else REPO_ROOT / path))
+    environment["PYTHONPATH"] = os.pathsep.join(python_paths)
+    launched = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from pathlib import Path; from raildash import app; "
+                "print(Path(app.store.path).resolve()); app.store.close()"
+            ),
+        ],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    database = tmp_path / "raildash.db"
+    assert launched.stdout.strip() == str(database)
+    assert database.stat().st_mode & 0o077 == 0
 
 
 def test_load_is_exact_idempotent_and_rejects_bundle_id_collision(tmp_path):
