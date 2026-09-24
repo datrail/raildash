@@ -9,7 +9,11 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
 from raildash.asp import (
+    DEFAULT_DRIFT_PAGE_SIZE,
+    MAX_ASP_BUNDLE_BYTES,
     MAX_DRIFT_CHANGES,
+    MAX_DRIFT_PAGE_SIZE,
+    MAX_DRIFT_RESULT_BYTES,
     BundleValidationError,
     IdentityRequiredError,
     alignment_problems,
@@ -388,4 +392,48 @@ def test_result_detail_is_bounded_without_losing_total_count():
     assert result["change_count"] == MAX_DRIFT_CHANGES + 1
     assert len(result["changes"]) == MAX_DRIFT_CHANGES
     assert result["truncated"] is True
+    validate("drift-result-v1.schema.json", result)
+
+
+def test_measured_bundle_headroom_and_request_bound_are_explicit():
+    # The checked-in fixture is a real redacted RailMon bundle.  This expanded
+    # fixture models a high-cardinality observation without manufacturing a
+    # second schema: every added entry is a valid evidence attribute.
+    representative = bundle()
+    for index in range(1_000):
+        representative["attributes"][f"representative_{index:04d}"] = {
+            "value": [f"destination-{item:03d}.example" for item in range(10)],
+            "status": "ANSWERED",
+            "tier": "observed",
+            "authored_by": "none",
+            "method": "representative high-cardinality collection",
+        }
+    representative_raw = raw(representative)
+    assert len(BASELINE_RAW) < 16 * 1024
+    assert 128 * 1024 < len(representative_raw) < MAX_ASP_BUNDLE_BYTES // 2
+    assert parse_bundle(representative_raw)["bundle_version"] == 1
+
+    with pytest.raises(BundleValidationError, match=str(MAX_ASP_BUNDLE_BYTES)):
+        parse_bundle(b" " * (MAX_ASP_BUNDLE_BYTES + 1))
+
+
+def test_result_has_serialized_byte_bound_and_shared_pagination_limits():
+    current = bundle()
+    # Long attribute names make the byte cap bind before the count cap while
+    # keeping the result redacted and the input below its independent limit.
+    for index in range(MAX_DRIFT_CHANGES):
+        current["attributes"][f"changed_{index:04d}_" + ("x" * 700)] = {
+            "value": index,
+            "status": "ANSWERED",
+            "tier": "observed",
+            "authored_by": "none",
+        }
+    result = compare_alignment(alignment(), BASELINE_RAW, raw(current))
+    wire = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode()
+
+    assert result["change_count"] == MAX_DRIFT_CHANGES
+    assert len(result["changes"]) < result["change_count"]
+    assert result["truncated"] is True
+    assert len(wire) <= MAX_DRIFT_RESULT_BYTES
+    assert (DEFAULT_DRIFT_PAGE_SIZE, MAX_DRIFT_PAGE_SIZE) == (100, 500)
     validate("drift-result-v1.schema.json", result)

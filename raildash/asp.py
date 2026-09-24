@@ -14,12 +14,21 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from .json_safety import MAX_SAFE_JSON_BYTES, check_json_structure
+from .json_safety import check_json_structure
 
 BUNDLE_VERSION = 1
 ALIGNMENT_CONTRACT_VERSION = 1
 DRIFT_CONTRACT_VERSION = 1
-MAX_DRIFT_CHANGES = 1_000
+# The shipped redacted RailMon sample is about 5 KiB.  The contract suite's
+# valid 1,000-attribute high-cardinality bundle is about 432 KiB, so 1 MiB gives
+# it more than 2x headroom while avoiding the webhook's much larger interaction
+# allowance.  That allowance exists for escaped request/response payloads that
+# ASPs do not contain.
+MAX_ASP_BUNDLE_BYTES = 1 * 1024 * 1024
+MAX_DRIFT_CHANGES = 500
+MAX_DRIFT_RESULT_BYTES = 256 * 1024
+DEFAULT_DRIFT_PAGE_SIZE = 100
+MAX_DRIFT_PAGE_SIZE = 500
 MAX_AGENT_KEY_CHARS = 128
 
 STATUSES = frozenset({"ANSWERED", "ABSENT", "TEMPLATED", "PARTIAL", "BLIND", "FAILED"})
@@ -138,9 +147,9 @@ def parse_bundle(raw: bytes) -> dict[str, Any]:
     """Bound, decode, parse, and validate one exact evidence-bundle payload."""
     if not isinstance(raw, bytes):
         raise TypeError("evidence bundle must be bytes")
-    if len(raw) > MAX_SAFE_JSON_BYTES:
+    if len(raw) > MAX_ASP_BUNDLE_BYTES:
         raise BundleValidationError(
-            [f"bundle exceeds the {MAX_SAFE_JSON_BYTES}-byte input bound"]
+            [f"bundle exceeds the {MAX_ASP_BUNDLE_BYTES}-byte input bound"]
         )
     try:
         check_json_structure(raw)
@@ -304,15 +313,29 @@ def compare_alignment(
 
     changes = _bundle_changes(baseline, current)
     total = len(changes)
-    return {
+    result = {
         "drift_contract_version": DRIFT_CONTRACT_VERSION,
         "comparable": True,
         "has_drift": bool(changes),
         "reason": None,
         "change_count": total,
-        "changes": changes[:MAX_DRIFT_CHANGES],
-        "truncated": total > MAX_DRIFT_CHANGES,
+        "changes": [],
+        "truncated": False,
     }
+    for change in changes[:MAX_DRIFT_CHANGES]:
+        result["changes"].append(change)
+        if _serialized_size(result) > MAX_DRIFT_RESULT_BYTES:
+            result["changes"].pop()
+            break
+    result["truncated"] = len(result["changes"]) < total
+    return result
+
+
+def _serialized_size(value: dict[str, Any]) -> int:
+    """Return the compact UTF-8 wire size used for the public JSON result."""
+    return len(
+        json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    )
 
 
 def _not_comparable(reason: str) -> dict[str, Any]:
