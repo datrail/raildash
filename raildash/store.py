@@ -168,6 +168,11 @@ CREATE TABLE IF NOT EXISTS drift_results (
 CREATE INDEX IF NOT EXISTS drift_results_current
     ON drift_results(current_asp_id, compared_at DESC);
 
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TRIGGER IF NOT EXISTS asps_immutable_update
 BEFORE UPDATE ON asps BEGIN SELECT RAISE(ABORT, 'ASPs are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS asps_immutable_delete
@@ -217,6 +222,12 @@ class Store:
         self._db.executescript(SCHEMA)
         self._ensure_multi_agent_columns()
         self._migrate()
+        # A UI-driven retention change (`set_asp_retention`) persists here so it
+        # survives a restart without re-exporting an env var. It only overrides
+        # the env-var/default value computed above once the settings table
+        # actually holds one -- an env var alone, with no prior UI change, still
+        # behaves exactly as it always has.
+        self._apply_stored_retention_overrides()
         self._db.commit()
         self._secure_database_files()
 
@@ -273,6 +284,55 @@ class Store:
         if value <= 0:
             raise RuntimeError(f"{name} must be a positive integer")
         return value
+
+    _RETENTION_SETTINGS_KEYS = {
+        "keep_count": "asp_retention_keep_count",
+        "max_age_days": "asp_retention_max_age_days",
+    }
+
+    def _apply_stored_retention_overrides(self) -> None:
+        attrs = {"keep_count": "_asp_retention_count", "max_age_days": "_asp_retention_days"}
+        for name, key in self._RETENTION_SETTINGS_KEYS.items():
+            row = self._db.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                value = int(row["value"])
+            except ValueError:
+                continue
+            if value > 0:
+                setattr(self, attrs[name], value)
+
+    def get_asp_retention(self) -> dict[str, int]:
+        """Current retention bounds -- env-var/default unless a UI change overrode them."""
+        return {
+            "keep_count": self._asp_retention_count,
+            "max_age_days": self._asp_retention_days,
+        }
+
+    def set_asp_retention(self, *, keep_count: int, max_age_days: int) -> dict[str, int]:
+        """Persist a UI/CLI-driven retention change so it survives a restart.
+
+        This is the one ASP setting that used to be environment-variable-only
+        (`RAILDASH_ASP_RETENTION_COUNT`/`_DAYS`); a value set here is stored
+        alongside the ASPs it governs so the dashboard's settings panel does
+        not depend on re-exporting an env var and restarting the process.
+        """
+        if keep_count <= 0 or max_age_days <= 0:
+            raise ValueError("keep_count and max_age_days must be positive integers")
+        with self._lock:
+            for name, value in (("keep_count", keep_count), ("max_age_days", max_age_days)):
+                self._db.execute(
+                    """INSERT INTO settings (key, value) VALUES (?, ?)
+                       ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                    (self._RETENTION_SETTINGS_KEYS[name], str(value)),
+                )
+            self._db.commit()
+        self._asp_retention_count = keep_count
+        self._asp_retention_days = max_age_days
+        return self.get_asp_retention()
 
     def _secure_database_files(self) -> None:
         """Keep the database and SQLite sidecars readable only by their owner."""
@@ -723,6 +783,16 @@ class Store:
         row = self._db.execute("SELECT exact_bundle FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
         return None if row is None else bytes(row["exact_bundle"])
 
+    def asp_bundle(self, asp_id: str) -> dict[str, Any] | None:
+        """The full parsed evidence bundle for one ASP -- the UI's inspect view.
+
+        Same exact bytes `asp export` writes to a private file, parsed instead
+        of written, so the caller (an HTTP route gated by the local write
+        token, same as export needs filesystem access) can render it inline.
+        """
+        raw = self.asp_exact_bytes(asp_id)
+        return None if raw is None else parse_bundle(raw)
+
     def drift_detail(self, asp_id: str) -> dict[str, Any] | None:
         """Return full local evidence for an owner-only CLI export."""
         row = self._db.execute(
@@ -752,6 +822,60 @@ class Store:
             "summary": json.loads(row["result_json"]),
             "baseline": parse_bundle(bytes(row["baseline_bundle"])),
             "current": parse_bundle(bytes(row["current_bundle"])),
+        }
+
+    def drift_explained(
+        self, asp_id: str, *, limit: int = DEFAULT_DRIFT_PAGE_SIZE, offset: int = 0
+    ) -> dict[str, Any] | None:
+        """Per-attribute drift with old/new values and evidence tier, paginated.
+
+        `drift_page`/`/api/asps/{id}/drift` stay redacted to field names only
+        (an existing, intentional, unauthenticated-read property some tests
+        pin) -- this builds the fuller explanation the UI's drift view needs
+        on top of `drift_detail`'s full baseline/current evidence, which is
+        already owner-only (CLI: `asp drift-export`; HTTP: token-gated).
+        """
+        if limit < 1 or limit > MAX_DRIFT_PAGE_SIZE or offset < 0:
+            raise ValueError("invalid drift page")
+        detail = self.drift_detail(asp_id)
+        if detail is None:
+            return None
+        summary = detail["summary"]
+        baseline = detail["baseline"]
+        current = detail["current"]
+
+        def lookup(kind: str, name: str) -> tuple[Any, Any]:
+            if kind == "ATTRIBUTE":
+                return baseline["attributes"].get(name), current["attributes"].get(name)
+            if kind == "SOURCE":
+                return (
+                    baseline["inputs_attempted"].get(name),
+                    current["inputs_attempted"].get(name),
+                )
+            baseline_by_id = {a["id"]: a for a in baseline.get("attestations", [])}
+            current_by_id = {a["id"]: a for a in current.get("attestations", [])}
+            return baseline_by_id.get(name), current_by_id.get(name)
+
+        all_changes = summary["changes"]
+        explained = []
+        for change in all_changes[offset : offset + limit]:
+            kind = change["type"].split("_")[0]
+            before, after = lookup(kind, change["name"])
+            explained.append({**change, "baseline": before, "current": after})
+
+        return {
+            "alignment_version_id": detail["alignment_version_id"],
+            "current_asp_id": asp_id,
+            "compared_at": detail["compared_at"],
+            "comparable": summary["comparable"],
+            "has_drift": summary["has_drift"],
+            "reason": summary["reason"],
+            "change_count": summary["change_count"],
+            "available_change_count": len(all_changes),
+            "truncated": summary["truncated"],
+            "changes": explained,
+            "limit": limit,
+            "offset": offset,
         }
 
     def prune_asp_history(self, *, keep_count: int = ASP_RETENTION_COUNT, max_age_days: int = ASP_RETENTION_DAYS) -> int:

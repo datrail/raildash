@@ -25,6 +25,16 @@ const $ = (id) => document.getElementById(id);
 const staticDemo = window.RAIL_DASH_STATIC_DEMO === true;
 let staticDataPromise = null;
 
+// DR-120: the per-start local write token RailDash injects into the page it
+// serves (see app.py's `index()`/`require_local_token`). Every write route,
+// plus the two reads that carry exact evidence (bundle/drift-explained),
+// check this header; a cross-site page cannot read it because it cannot read
+// this page's own DOM.
+const LOCAL_TOKEN = (() => {
+  const meta = document.querySelector('meta[name="raildash-token"]');
+  return meta ? meta.content : "";
+})();
+
 /* --------------------------------------------------------------- utilities */
 
 function el(tag, className, text) {
@@ -88,6 +98,62 @@ async function getJSON(path, params) {
   });
   const res = await fetch(url, { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.json();
+}
+
+// Same as getJSON, but for the two token-gated reads that carry exact
+// evidence (ASP bundle inspect, drift-explained) rather than redacted
+// summaries.
+async function getJSONWithToken(path, params) {
+  const url = new URL(path, window.location.origin);
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (v !== null && v !== undefined && v !== "" && v !== false) {
+      url.searchParams.set(k, v);
+    }
+  });
+  const res = await fetch(url, {
+    headers: { Accept: "application/json", "X-RailDash-Token": LOCAL_TOKEN },
+  });
+  if (!res.ok) throw await _apiError(res);
+  return res.json();
+}
+
+async function _apiError(res) {
+  let detail = `${res.status} ${res.statusText}`;
+  try {
+    const body = await res.json();
+    if (body && typeof body.detail === "string") detail = body.detail;
+  } catch (e) {
+    /* body was not JSON; keep the status text */
+  }
+  return new Error(detail);
+}
+
+async function postJSON(path, body, params) {
+  const url = new URL(path, window.location.origin);
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (v !== null && v !== undefined && v !== "") url.searchParams.set(k, v);
+  });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-RailDash-Token": LOCAL_TOKEN },
+    body: JSON.stringify(body || {}),
+  });
+  if (!res.ok) throw await _apiError(res);
+  return res.status === 204 ? null : res.json();
+}
+
+async function postRawBody(path, rawBytes, params) {
+  const url = new URL(path, window.location.origin);
+  Object.entries(params || {}).forEach(([k, v]) => {
+    if (v !== null && v !== undefined && v !== "") url.searchParams.set(k, v);
+  });
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "X-RailDash-Token": LOCAL_TOKEN },
+    body: rawBytes,
+  });
+  if (!res.ok) throw await _apiError(res);
   return res.json();
 }
 
@@ -204,10 +270,182 @@ function renderDriftGroups(result) {
   return wrapper;
 }
 
+// DR-120: every one of these calls a write route wrapping the same
+// Store/asp.py function the CLI subcommand named beside it calls. Each write
+// action carries the local token (postJSON/postRawBody, above) and, on
+// success, forces a rebuild of this identity's card (loadAspAlignments with a
+// non-null focusKey bypasses the keyboard-focus poll guard the same way the
+// existing drift pager buttons already do below).
+
+function setInlineStatus(node, message, tone) {
+  node.textContent = message || "";
+  if (tone) node.dataset.tone = tone;
+  else delete node.dataset.tone;
+}
+
+function suggestNextVersion(existingVersions) {
+  return `v${(existingVersions || []).length + 1}.0`;
+}
+
+async function fetchAllPages(path, extraParams) {
+  const items = [];
+  let offset = 0;
+  let total = 0;
+  do {
+    const page = await getJSON(path, { ...(extraParams || {}), limit: 500, offset });
+    items.push(...page.items);
+    total = page.total;
+    if (!page.items.length) break;
+    offset += page.items.length;
+  } while (offset < total);
+  return items;
+}
+
+function renderLockForm({ suggestedVersion, buttonLabel, onLock }) {
+  const form = el("div", "asp-inline-form");
+  const input = el("input");
+  input.type = "text";
+  input.value = suggestedVersion;
+  input.setAttribute("aria-label", "Alignment version label");
+  const button = el("button", "btn", buttonLabel || "Lock as baseline");
+  button.type = "button";
+  const status = el("span", "asp-status-msg");
+  status.setAttribute("aria-live", "polite");
+  button.addEventListener("click", async () => {
+    const version = input.value.trim();
+    if (!version) {
+      setInlineStatus(status, "A version label is required.", "err");
+      return;
+    }
+    button.disabled = true;
+    setInlineStatus(status, "Working…");
+    try {
+      await onLock(version);
+      setInlineStatus(status, "Done.", "ok");
+    } catch (error) {
+      setInlineStatus(status, error.message, "err");
+    } finally {
+      button.disabled = false;
+    }
+  });
+  form.append(input, button, status);
+  return form;
+}
+
+function renderVersionPicker(versions, activeId, onSwitch) {
+  const wrap = el("div", "asp-version-picker");
+  if (!versions.length) {
+    wrap.append(el("span", "muted", "No alignment version locked yet."));
+    return wrap;
+  }
+  const select = el("select");
+  select.setAttribute("aria-label", "Alignment version");
+  versions.forEach((version) => {
+    const opt = el("option", null, `${version.version}${version.active ? " (active)" : ""}`);
+    opt.value = version.alignment_version_id;
+    if (version.alignment_version_id === activeId) opt.selected = true;
+    select.append(opt);
+  });
+  const button = el("button", "btn btn-quiet", "Switch");
+  button.type = "button";
+  const status = el("span", "asp-status-msg");
+  status.setAttribute("aria-live", "polite");
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    setInlineStatus(status, "Switching…");
+    try {
+      await onSwitch(select.value);
+      setInlineStatus(status, "Switched.", "ok");
+    } catch (error) {
+      setInlineStatus(status, error.message, "err");
+    } finally {
+      button.disabled = false;
+    }
+  });
+  wrap.append(select, button, status);
+  return wrap;
+}
+
+function describeEvidenceRecord(record) {
+  if (!record) return "(absent)";
+  if (record && typeof record === "object" && "value" in record) {
+    const qualifiers = [record.status, record.tier].filter(Boolean).join(", ");
+    return `${JSON.stringify(record.value)}${qualifiers ? ` [${qualifiers}]` : ""}`;
+  }
+  return JSON.stringify(record);
+}
+
+function renderDiffRow(change) {
+  const row = el("div", "asp-diff-row");
+  row.append(el("span", "asp-change-name", `${change.type} · ${change.name}`));
+  const dl = el("dl");
+  dl.append(el("dt", null, "Before"));
+  dl.append(el("dd", "asp-diff-old", describeEvidenceRecord(change.baseline)));
+  dl.append(el("dt", null, "After"));
+  dl.append(el("dd", "asp-diff-new", describeEvidenceRecord(change.current)));
+  if ((change.fields || []).length) {
+    dl.append(el("dt", null, "Fields changed"));
+    dl.append(el("dd", null, change.fields.join(", ")));
+  }
+  row.append(dl);
+  return row;
+}
+
+async function renderDriftExplained(aspId) {
+  const wrapper = el("div", "asp-diff-table");
+  try {
+    const explained = await getJSONWithToken(
+      `/api/asps/${encodeURIComponent(aspId)}/drift/explained`,
+      { limit: ASP_DRIFT_PAGE_SIZE }
+    );
+    (explained.changes || []).forEach((change) => wrapper.append(renderDiffRow(change)));
+    if (!(explained.changes || []).length) {
+      wrapper.append(el("p", "muted", "No per-attribute detail available for this page."));
+    }
+  } catch (error) {
+    const msg = el("p", "asp-status-msg", `Could not load per-attribute detail: ${error.message}`);
+    msg.dataset.tone = "err";
+    wrapper.append(msg);
+  }
+  return wrapper;
+}
+
+function renderInspectToggle(aspId) {
+  const wrap = el("div");
+  const button = el("button", "btn btn-quiet", "Inspect evidence");
+  button.type = "button";
+  let view = null;
+  button.addEventListener("click", async () => {
+    if (view) {
+      view.remove();
+      view = null;
+      button.textContent = "Inspect evidence";
+      return;
+    }
+    button.disabled = true;
+    try {
+      const bundle = await getJSONWithToken(`/api/asps/${encodeURIComponent(aspId)}/bundle`);
+      view = el("div", "asp-bundle-view");
+      view.append(el("pre", null, JSON.stringify(bundle, null, 2)));
+      wrap.append(view);
+      button.textContent = "Hide evidence";
+    } catch (error) {
+      const msg = el("p", "asp-status-msg", error.message);
+      msg.dataset.tone = "err";
+      wrap.append(msg);
+    } finally {
+      button.disabled = false;
+    }
+  });
+  wrap.append(button);
+  return wrap;
+}
+
 async function loadAspAlignments(focusKey = null, focusAction = null) {
   const body = $("asp-alignment-body");
   // Polling must not destroy a keyboard user's focused command or pager.
-  // Explicit pager navigation supplies focusKey and is allowed to rebuild.
+  // Explicit pager navigation, and a write action's own refresh, supply a
+  // focusKey and are allowed to rebuild.
   if (focusKey === null && body.contains(document.activeElement)) return;
   body.replaceChildren();
   if (staticDemo) {
@@ -215,24 +453,23 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
     return;
   }
 
-  const asps = [];
-  let aspOffset = 0;
-  let aspTotal = 0;
-  do {
-    const page = await getJSON("/api/asps", { limit: 500, offset: aspOffset });
-    asps.push(...page.items);
-    aspTotal = page.total;
-    if (!page.items.length) break;
-    aspOffset += page.items.length;
-  } while (aspOffset < aspTotal);
+  const asps = await fetchAllPages("/api/asps");
   if (!asps.length) {
     const empty = el("section", "asp-empty");
     empty.append(el("h3", null, "No ASP loaded"));
-    empty.append(el("p", "muted", "Stop RailDash, load a validated RailMon evidence bundle, then restart."));
+    empty.append(el("p", "muted", "Drop a validated RailMon evidence bundle on the box above, or:"));
     empty.append(aspCommand("raildash asp load evidence-bundle.json"));
     body.append(empty);
     return;
   }
+
+  const allVersions = await fetchAllPages("/api/alignments");
+  const versionsByIdentity = new Map();
+  allVersions.forEach((version) => {
+    const key = JSON.stringify(version.agent_identity);
+    if (!versionsByIdentity.has(key)) versionsByIdentity.set(key, []);
+    versionsByIdentity.get(key).push(version);
+  });
 
   const latest = new Map();
   asps.forEach((asp) => {
@@ -260,11 +497,11 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
         });
       }
     }
-    return { key, alignment, drift };
+    return { key, asp, alignment, drift };
   }));
 
   let focusTarget = null;
-  states.forEach(({ key, alignment, drift }) => {
+  for (const { key, asp, alignment, drift } of states) {
     const card = el("article", "asp-state-card");
     const head = el("div", "asp-state-head");
     const title = el("div");
@@ -276,26 +513,104 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
     head.append(title, status);
     card.append(head);
 
-    if (alignment.state === "NO_ACTIVE_ALIGNMENT") {
-      card.append(el("p", "muted", "Stop the server, review this ASP locally, lock it, select it, then restart."));
-      card.append(aspCommand("raildash asp list"));
-      card.append(aspCommand(`raildash asp lock ${alignment.asp.asp_id} --version v1.0`));
+    const versions = versionsByIdentity.get(key) || [];
+    const activeVersion = versions.find((v) => v.active);
+    const refresh = () => loadAspAlignments(key, "action");
+    const doLock = async (version) => {
+      await postJSON(`/api/asps/${encodeURIComponent(asp.asp_id)}/lock`, { version });
+      refresh();
+    };
+    const doLockAndActivate = async (version) => {
+      const locked = await postJSON(`/api/asps/${encodeURIComponent(asp.asp_id)}/lock`, { version });
+      await postJSON(
+        `/api/alignments/${encodeURIComponent(locked.alignment_version_id)}/switch`, {}
+      );
+      refresh();
+    };
+    const doSwitch = async (alignmentVersionId) => {
+      await postJSON(`/api/alignments/${encodeURIComponent(alignmentVersionId)}/switch`, {});
+      refresh();
+    };
+    const doAccept = async (version) => {
+      await postJSON(`/api/asps/${encodeURIComponent(asp.asp_id)}/accept-drift`, { version });
+      refresh();
+    };
+
+    if (alignment.state === "NO_ACTIVE_ALIGNMENT" && versions.length === 0) {
+      // The first ASP ever loaded for this identity: auto-offer locking it as
+      // the alignment baseline in one click (standing decision: every ASP
+      // workflow -- including this one -- works from the UI, not just the CLI).
+      const banner = el("section", "asp-banner");
+      banner.append(el("h4", null, "Lock this as your alignment baseline?"));
+      banner.append(el("p", "muted",
+        "This is the first Agent Security Profile loaded for this agent identity. " +
+        "Locking it activates it immediately as the version everything else is compared against."));
+      banner.append(renderLockForm({
+        suggestedVersion: "v1.0",
+        buttonLabel: "Lock this as your alignment baseline",
+        onLock: doLockAndActivate,
+      }));
+      banner.append(aspCommand(
+        `raildash asp lock ${alignment.asp.asp_id} --version v1.0 && raildash asp switch <returned-id>`
+      ));
+      card.append(banner);
+    } else if (alignment.state === "NO_ACTIVE_ALIGNMENT") {
+      card.append(el("p", "muted", "No alignment version is active yet for this agent identity."));
+      card.append(renderVersionPicker(versions, null, doSwitch));
+      card.append(renderLockForm({
+        suggestedVersion: suggestNextVersion(versions),
+        buttonLabel: "Lock this ASP as a new version",
+        onLock: doLock,
+      }));
       card.append(aspCommand("raildash asp switch aspver-..."));
-      card.append(aspCommand("raildash serve"));
     } else if (alignment.state === "COMPARISON_UNAVAILABLE") {
       card.append(el("p", "asp-reason", `Reason: ${alignment.drift.reason}`));
-      card.append(el("p", "muted", "Stop the server and review compatible stored ASPs before locking or switching."));
-      card.append(aspCommand("raildash asp list"));
-      card.append(aspCommand("raildash asp lock asp-... --version v2.0"));
+      card.append(el("p", "muted",
+        "This ASP cannot be compared with the active alignment. Lock it as a new version, then switch to it."));
+      card.append(renderVersionPicker(
+        versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
+      ));
+      card.append(renderLockForm({
+        suggestedVersion: suggestNextVersion(versions),
+        buttonLabel: "Lock as new baseline",
+        onLock: doLock,
+      }));
+      card.append(aspCommand(`raildash asp lock ${alignment.asp.asp_id} --version ${suggestNextVersion(versions)}`));
       card.append(aspCommand("raildash asp switch aspver-..."));
-      card.append(aspCommand("raildash serve"));
     } else if (alignment.state === "ALIGNMENT_ACTIVE") {
       card.append(el("p", "muted", "Load a later ASP for this agent to run the first comparison."));
+      card.append(renderVersionPicker(
+        versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
+      ));
       card.append(aspCommand("raildash asp load evidence-bundle.json"));
+    } else if (alignment.state === "ALIGNED") {
+      card.append(renderVersionPicker(
+        versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
+      ));
     }
+
+    if (alignment.state === "DRIFT_DETECTED") {
+      card.append(renderVersionPicker(
+        versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
+      ));
+      const acceptWrap = el("div", "asp-actions");
+      acceptWrap.append(renderLockForm({
+        suggestedVersion: suggestNextVersion(versions),
+        buttonLabel: "Accept new state as new baseline",
+        onLock: doAccept,
+      }));
+      card.append(acceptWrap);
+      card.append(aspCommand(`raildash asp lock ${alignment.asp.asp_id} --version ${suggestNextVersion(versions)}`));
+      card.append(aspCommand("raildash asp switch aspver-..."));
+    }
+
+    card.append(renderInspectToggle(asp.asp_id));
 
     if (drift && drift.change_count > 0) {
       card.append(renderDriftGroups(drift));
+      if (alignment.state === "DRIFT_DETECTED") {
+        card.append(await renderDriftExplained(asp.asp_id));
+      }
       const offset = drift.offset || 0;
       const pager = el("div", "asp-drift-pager");
       const previous = el("button", "btn btn-quiet", "Previous changes");
@@ -327,7 +642,7 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
       }
     }
     body.append(card);
-  });
+  }
   const announcement = states
     .map(({ alignment }) => (
       `${identityLabel(alignment.asp.agent_identity)}: ${statePresentation(alignment.state)[0]}`
@@ -338,6 +653,84 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
     lastAspAnnouncement = announcement;
   }
   if (focusTarget) focusTarget.focus();
+}
+
+function initAspUpload() {
+  const zone = $("asp-upload");
+  const input = $("asp-upload-input");
+  const status = $("asp-upload-status");
+
+  const ingest = async (file) => {
+    setInlineStatus(status, `Loading ${file.name}…`);
+    try {
+      const raw = await file.arrayBuffer();
+      const result = await postRawBody("/v1/evidence-bundles", raw);
+      setInlineStatus(
+        status,
+        result.duplicate ? `Already stored as ${result.asp_id}.` : `Loaded as ${result.asp_id}.`,
+        "ok"
+      );
+      loadAspAlignments("upload", "action").catch((error) => console.error(error));
+    } catch (error) {
+      setInlineStatus(status, error.message, "err");
+    }
+  };
+
+  zone.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    zone.classList.add("dragover");
+  });
+  zone.addEventListener("dragleave", () => zone.classList.remove("dragover"));
+  zone.addEventListener("drop", (event) => {
+    event.preventDefault();
+    zone.classList.remove("dragover");
+    const file = event.dataTransfer.files && event.dataTransfer.files[0];
+    if (file) ingest(file);
+  });
+  input.addEventListener("change", () => {
+    const file = input.files && input.files[0];
+    if (file) ingest(file);
+    input.value = "";
+  });
+}
+
+async function loadAspRetentionSettings() {
+  const settings = await getJSON("/api/settings/asp-retention");
+  $("asp-retention-keep").value = settings.keep_count;
+  $("asp-retention-days").value = settings.max_age_days;
+}
+
+function initAspRetention() {
+  const status = $("asp-retention-status");
+  $("asp-retention-save").addEventListener("click", async () => {
+    const keepCount = parseInt($("asp-retention-keep").value, 10);
+    const maxAgeDays = parseInt($("asp-retention-days").value, 10);
+    if (!Number.isInteger(keepCount) || keepCount < 1 || !Number.isInteger(maxAgeDays) || maxAgeDays < 1) {
+      setInlineStatus(status, "Both values must be positive integers.", "err");
+      return;
+    }
+    setInlineStatus(status, "Saving…");
+    try {
+      // The CLI equivalent of this control is `raildash asp retention-set`.
+      await postJSON("/api/settings/asp-retention", {
+        keep_count: keepCount,
+        max_age_days: maxAgeDays,
+      });
+      setInlineStatus(status, "Saved.", "ok");
+    } catch (error) {
+      setInlineStatus(status, error.message, "err");
+    }
+  });
+  $("asp-retention-prune").addEventListener("click", async () => {
+    setInlineStatus(status, "Pruning…");
+    try {
+      const result = await postJSON("/api/asps/prune", {});
+      setInlineStatus(status, `Pruned ${result.removed} unlocked ASP(s).`, "ok");
+      loadAspAlignments("prune", "action").catch((error) => console.error(error));
+    } catch (error) {
+      setInlineStatus(status, error.message, "err");
+    }
+  });
 }
 
 /* ----------------------------------------------------------------- filters */
@@ -944,7 +1337,13 @@ function init() {
 
   if (staticDemo) {
     $("demo-banner").hidden = false;
+    $("asp-upload").hidden = true;
+    $("asp-retention").hidden = true;
     setConn("live", "fixture");
+  } else {
+    initAspUpload();
+    initAspRetention();
+    loadAspRetentionSettings().catch((error) => console.error(error));
   }
 
   $("refresh").addEventListener("click", refresh);

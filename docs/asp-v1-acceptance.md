@@ -22,11 +22,17 @@ No evidence values or digests are printed. Pass `--database` only with a new
 path beneath a private parent when the acceptance records need to be retained;
 the oracle refuses an existing database so it cannot alter operational state.
 
-For a live demonstration, stop RailDash and use `raildash asp load`, `list`,
-`lock`, and `switch` against real RailMon evidence, restart with
-`raildash serve`, then open the Agent Security Profile alignment panel. The
-panel shows the same aligned, drifted, or comparison-unavailable outcomes and
-keeps full evidence on the owner-only CLI.
+For a live demonstration, run `raildash serve` and drive the whole flow from
+the Agent Security Profile alignment panel against real RailMon evidence:
+drop an evidence bundle on the upload box (or deliver it to
+`POST /v1/evidence-bundles`), lock it as a baseline, switch versions, and
+accept a drifted state as a new baseline -- none of it needs the server
+stopped or the CLI, per DR-120 (`raildash asp load`/`list`/`lock`/`switch`
+remain equivalent CLI commands over the same calls). The panel shows the same
+aligned, drifted, or comparison-unavailable outcomes, now with the
+per-attribute old/new detail behind "drift explained"; exact evidence needs
+either the CLI/file access or the dashboard's local write token, never an
+unauthenticated read.
 
 ## Published-install gate
 
