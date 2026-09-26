@@ -12,11 +12,22 @@ import hashlib
 import json
 import re
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
+
+from jsonschema import Draft202012Validator, FormatChecker
 
 from .json_safety import check_json_structure
 
-BUNDLE_VERSION = 1
+# The published v1 schema, vendored byte-for-byte from the pinned RailMon
+# version (tests/test_asp.py asserts the copy hasn't drifted). It is the
+# single source of truth for the evidence bundle's structure; only the rules
+# it cannot express live in code below (`_semantic_problems`).
+SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "evidence-bundle-v1.schema.json"
+SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text())
+_VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
+
+BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 ALIGNMENT_CONTRACT_VERSION = 1
 DRIFT_CONTRACT_VERSION = 1
 # The shipped redacted RailMon sample is about 5 KiB.  The contract suite's
@@ -31,48 +42,6 @@ DEFAULT_DRIFT_PAGE_SIZE = 100
 MAX_DRIFT_PAGE_SIZE = 500
 MAX_AGENT_KEY_CHARS = 128
 
-STATUSES = frozenset({"ANSWERED", "ABSENT", "TEMPLATED", "PARTIAL", "BLIND", "FAILED"})
-REASONS = frozenset(
-    {
-        "NO_SOURCE_ACCESS",
-        "NOT_FIRST_PARTY",
-        "SOURCE_OK_NOT_PRESENT",
-        "UNKNOWN_HARNESS",
-        "NOT_COLLECTED_BY_PACK",
-        "PRIVATE_STORE",
-        "CODE_CONSTRUCTED",
-        "GATEWAY_MANAGED",
-        "ORCHESTRATOR_MANAGED",
-        "PROVIDER_HOSTED",
-        "TEMPLATE_UNRESOLVED",
-        "PARSE_FAILED",
-        "SIZE_CAP_EXCEEDED",
-    }
-)
-TIERS = frozenset({"declared", "interrogated", "observed"})
-AUTHORED_BY = frozenset({"subject", "platform", "external", "none"})
-INPUT_SOURCES = ("runtime", "image", "manifest", "repo")
-SOURCE_FIELDS = frozenset({"attempted", "reached", "reason", "window_seconds"})
-ATTRIBUTE_FIELDS = frozenset(
-    {"value", "status", "reason", "tier", "authored_by", "method", "note", "attestation_ref"}
-)
-ATTESTATION_FIELDS = frozenset(
-    {"id", "root", "claim", "subject", "verified_at", "verifier_version"}
-)
-ENVELOPE_FIELDS = frozenset(
-    {
-        "bundle_version",
-        "bundle_id",
-        "host_id",
-        "sandbox_name",
-        "collected_at",
-        "rule_pack_version",
-        "inputs_attempted",
-        "attributes",
-        "attestations",
-    }
-)
-REQUIRED_ENVELOPE_FIELDS = ENVELOPE_FIELDS - {"attestations"}
 DEPLOYMENT_ENV_KEYS = ("RAIL_DEPLOYMENT", "RAIL_NAMESPACE")
 DEPLOYMENT_COMPOSE_KEYS = (
     "com.docker.compose.project",
@@ -163,29 +132,63 @@ def parse_bundle(raw: bytes) -> dict[str, Any]:
 
 
 def bundle_problems(bundle: Any) -> list[str]:
-    """Validate the published v1 schema plus its attestation-reference rule."""
+    """Validate the published v1 schema plus the two rules it cannot express."""
     if not isinstance(bundle, dict):
         return ["bundle must be an object"]
+    problems = [
+        f"{'.'.join(str(part) for part in error.path) or 'bundle'}: {error.message}"
+        for error in sorted(_VALIDATOR.iter_errors(bundle), key=str)
+    ]
+    problems.extend(_semantic_problems(bundle))
+    return problems
+
+
+def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
+    """The rules the published schema cannot express, or deliberately
+    doesn't: every attestation_ref names a real attestation; two attestations
+    never share an id (`uniqueItems` checks whole-item equality, not one
+    field); a deployment value's byte length is measured in UTF-8 bytes,
+    which `maxLength` cannot — it counts Unicode code points; and
+    `collected_at` must be UTC, which RailDash requires but the shared
+    schema's `format: date-time` (any offset, per RFC 3339) does not — this
+    predates the shared schema and is kept for the same reason `_date_time`
+    still enforces it on `locked_at`."""
     problems: list[str] = []
-    keys = set(bundle)
-    for key in sorted(REQUIRED_ENVELOPE_FIELDS - keys):
-        problems.append(f"{key}: required envelope field is missing")
-    for key in sorted(keys - ENVELOPE_FIELDS):
-        problems.append(f"{key}: not a field of the envelope")
-    if bundle.get("bundle_version") != BUNDLE_VERSION:
-        problems.append(f"bundle_version: must be {BUNDLE_VERSION}")
-    _bounded_string(bundle.get("bundle_id"), "bundle_id", 1, None, problems)
-    _bounded_string(bundle.get("host_id"), "host_id", 1, 64, problems)
-    _bounded_string(bundle.get("sandbox_name"), "sandbox_name", 1, 255, problems)
-    _date_time(bundle.get("collected_at"), "collected_at", problems)
-    if not _positive_integer(bundle.get("rule_pack_version")):
-        problems.append("rule_pack_version: must be an integer of at least 1")
-    problems.extend(_source_problems(bundle.get("inputs_attempted")))
-    attestation_ids, attestation_problems = _attestation_problems(
-        bundle.get("attestations", [])
-    )
-    problems.extend(attestation_problems)
-    problems.extend(_attribute_problems(bundle.get("attributes"), attestation_ids))
+    collected_at = bundle.get("collected_at")
+    if isinstance(collected_at, str):
+        try:
+            parsed = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None and (parsed.tzinfo is None or parsed.utcoffset() != timedelta(0)):
+            problems.append("collected_at: date-time must be UTC")
+    attestations = bundle.get("attestations")
+    attestation_ids: set[str] = set()
+    for index, entry in enumerate(attestations if isinstance(attestations, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        identifier = entry.get("id")
+        if not isinstance(identifier, str):
+            continue
+        if identifier in attestation_ids:
+            problems.append(f"attestations[{index}].id: duplicate attestation id")
+        else:
+            attestation_ids.add(identifier)
+    attributes = bundle.get("attributes")
+    attributes = attributes if isinstance(attributes, dict) else {}
+    for name, attribute in attributes.items():
+        if not isinstance(attribute, dict):
+            continue
+        reference = attribute.get("attestation_ref")
+        if reference is not None and reference not in attestation_ids:
+            problems.append(f"attributes.{name}.attestation_ref: does not resolve")
+    deployment = attributes.get("deployment")
+    if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
+        value = deployment.get("value")
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
+                    problems.append(f"attributes.deployment.value.{key}: exceeds byte bound")
     return problems
 
 
@@ -433,129 +436,6 @@ def _map_changes(
     return changes
 
 
-def _source_problems(sources: Any) -> list[str]:
-    if not isinstance(sources, dict):
-        return ["inputs_attempted: must be an object"]
-    problems: list[str] = []
-    if set(sources) != set(INPUT_SOURCES):
-        problems.append("inputs_attempted: must contain exactly the four sources")
-    for name, source in sources.items():
-        where = f"inputs_attempted.{name}"
-        if name not in INPUT_SOURCES or not isinstance(source, dict):
-            problems.append(f"{where}: invalid source")
-            continue
-        if set(source) - SOURCE_FIELDS:
-            problems.append(f"{where}: contains an unknown field")
-        attempted = source.get("attempted")
-        if type(attempted) is not bool:
-            problems.append(f"{where}.attempted: must be a boolean")
-        if "reached" in source and type(source["reached"]) is not bool:
-            problems.append(f"{where}.reached: must be a boolean")
-        if attempted is True and type(source.get("reached")) is not bool:
-            problems.append(f"{where}.reached: required boolean when attempted")
-        if (attempted is False or source.get("reached") is False) and source.get(
-            "reason"
-        ) not in REASONS:
-            problems.append(f"{where}.reason: required closed reason")
-        if source.get("reason") is not None and source.get("reason") not in REASONS:
-            problems.append(f"{where}.reason: unknown reason")
-        if "window_seconds" in source and (
-            name != "runtime"
-            or not _non_negative_integer(source["window_seconds"])
-        ):
-            problems.append(f"{where}.window_seconds: invalid")
-    return problems
-
-
-def _attestation_problems(attestations: Any) -> tuple[set[str], list[str]]:
-    if not isinstance(attestations, list):
-        return set(), ["attestations: must be an array"]
-    ids: set[str] = set()
-    problems: list[str] = []
-    for index, attestation in enumerate(attestations):
-        where = f"attestations[{index}]"
-        if not isinstance(attestation, dict) or set(attestation) != ATTESTATION_FIELDS:
-            problems.append(f"{where}: fields do not match the contract")
-            continue
-        for key in ATTESTATION_FIELDS:
-            _bounded_string(
-                attestation.get(key),
-                f"{where}.{key}",
-                1 if key == "id" else 0,
-                None,
-                problems,
-            )
-        _date_time(attestation.get("verified_at"), f"{where}.verified_at", problems)
-        identifier = attestation.get("id")
-        if identifier in ids:
-            problems.append(f"{where}.id: duplicate attestation id")
-        elif isinstance(identifier, str):
-            ids.add(identifier)
-    return ids, problems
-
-
-def _attribute_problems(attributes: Any, attestation_ids: set[str]) -> list[str]:
-    if not isinstance(attributes, dict):
-        return ["attributes: must be an object"]
-    problems: list[str] = []
-    for name, attribute in attributes.items():
-        where = f"attributes.{name}"
-        if not isinstance(name, str) or not name or not isinstance(attribute, dict):
-            problems.append(f"{where}: invalid attribute")
-            continue
-        if set(attribute) - ATTRIBUTE_FIELDS:
-            problems.append(f"{where}: contains an unknown field")
-        if "value" not in attribute:
-            problems.append(f"{where}.value: required")
-        status = attribute.get("status")
-        if status not in STATUSES:
-            problems.append(f"{where}.status: unknown status")
-        if attribute.get("tier") not in TIERS:
-            problems.append(f"{where}.tier: unknown tier")
-        reason = attribute.get("reason")
-        if reason is not None and reason not in REASONS:
-            problems.append(f"{where}.reason: unknown reason")
-        if status in {"BLIND", "FAILED"} and reason not in REASONS:
-            problems.append(f"{where}.reason: required")
-        if status == "ANSWERED" and "reason" in attribute:
-            problems.append(f"{where}.reason: forbidden on ANSWERED")
-        if status == "ABSENT" and not attribute.get("method"):
-            problems.append(f"{where}.method: required on ABSENT")
-        if "method" in attribute and (
-            not isinstance(attribute["method"], str) or not attribute["method"]
-        ):
-            problems.append(f"{where}.method: must be a non-empty string")
-        if "note" in attribute and not isinstance(attribute["note"], str):
-            problems.append(f"{where}.note: must be a string")
-        if status in {"ANSWERED", "PARTIAL", "TEMPLATED"}:
-            if attribute.get("authored_by") not in AUTHORED_BY:
-                problems.append(f"{where}.authored_by: required closed value")
-        elif "authored_by" in attribute:
-            problems.append(f"{where}.authored_by: forbidden for status {status}")
-        reference = attribute.get("attestation_ref")
-        if reference is not None:
-            if not isinstance(reference, str) or not reference:
-                problems.append(
-                    f"{where}.attestation_ref: must be a non-empty string"
-                )
-            elif reference not in attestation_ids:
-                problems.append(f"{where}.attestation_ref: does not resolve")
-    deployment = attributes.get("deployment")
-    if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
-        value = deployment.get("value")
-        if not isinstance(value, dict) or not value:
-            problems.append("attributes.deployment.value: must be a non-empty object")
-        else:
-            for key, item in value.items():
-                if key not in DEPLOYMENT_KEYS:
-                    problems.append(f"attributes.deployment.value.{key}: unknown key")
-                elif not isinstance(item, str) or not item.strip():
-                    problems.append(f"attributes.deployment.value.{key}: non-empty string required")
-                elif len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
-                    problems.append(f"attributes.deployment.value.{key}: exceeds byte bound")
-    return problems
-
-
 def _identity_problems(identity: Any) -> list[str]:
     if not isinstance(identity, dict) or set(identity) != {"kind", "value"}:
         return ["agent_identity: must contain only kind and value"]
@@ -612,7 +492,3 @@ def _date_time(value: Any, where: str, problems: list[str]) -> None:
 
 def _positive_integer(value: Any) -> bool:
     return type(value) is int and value >= 1
-
-
-def _non_negative_integer(value: Any) -> bool:
-    return type(value) is int and value >= 0

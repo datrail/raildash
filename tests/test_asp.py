@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,14 +11,17 @@ from jsonschema.exceptions import ValidationError
 
 from raildash.asp import (
     DEFAULT_DRIFT_PAGE_SIZE,
+    DEPLOYMENT_KEYS,
     MAX_ASP_BUNDLE_BYTES,
     MAX_DRIFT_CHANGES,
     MAX_DRIFT_PAGE_SIZE,
     MAX_DRIFT_RESULT_BYTES,
+    SCHEMA,
     BundleValidationError,
     IdentityRequiredError,
     alignment_problems,
     bundle_digest,
+    bundle_problems,
     compare_alignment,
     parse_bundle,
     resolve_identity,
@@ -71,6 +75,90 @@ def test_real_railmon_fixture_passes_the_vendored_schema_and_runtime_validator()
     }
 
 
+def _sibling_railmon_schema() -> Path | None:
+    """A sibling RailMon checkout, if one is present next to this repo: the
+    workspace's `repo/datrail/{railmon,raildash}` layout, or dev-toolkits'
+    flat sibling clone under `$RAIL_WORKSPACE_HOME`. Both put RailMon two
+    directories up from this repo's own root. Standalone CI for this repo
+    alone checks out only raildash, so it has neither — the drift check
+    below skips there rather than failing for a reason outside the test's
+    control (see its skip message)."""
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates = [repo_root.parent / "railmon" / "schemas" / "evidence-bundle-v1.schema.json"]
+    workspace_home = os.environ.get("RAIL_WORKSPACE_HOME")
+    if workspace_home:
+        candidates.append(Path(workspace_home) / "railmon" / "schemas" / "evidence-bundle-v1.schema.json")
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def test_vendored_schema_is_byte_for_byte_identical_to_railmon():
+    railmon_schema = _sibling_railmon_schema()
+    if railmon_schema is None:
+        pytest.skip(
+            "no sibling RailMon checkout found next to this repo (checked "
+            "../railmon and $RAIL_WORKSPACE_HOME/railmon) — can't check for "
+            "drift from here; this repo's own standalone CI has the same gap"
+        )
+    vendored = SCHEMAS / "evidence-bundle-v1.schema.json"
+    assert vendored.read_bytes() == railmon_schema.read_bytes(), (
+        "raildash/schemas/evidence-bundle-v1.schema.json has drifted from "
+        "RailMon's copy — re-vendor it byte-for-byte from the pinned "
+        "RailMon version"
+    )
+
+
+def test_deployment_keys_match_the_schemas_closed_set():
+    # DEPLOYMENT_ENV_KEYS/DEPLOYMENT_COMPOSE_KEYS name the same four keys the
+    # vendored schema's deployment_value $def closes over. Nothing else ties
+    # the two together now that the schema enforces the closed set directly.
+    assert set(DEPLOYMENT_KEYS) == set(SCHEMA["$defs"]["deployment_value"]["properties"])
+
+
+def test_duplicate_attestation_id_is_rejected():
+    # uniqueItems checks whole-item equality, not one field, so two
+    # attestations sharing an id (everything else differing) is a rule only
+    # code can enforce — the schema alone would accept it.
+    changed = bundle()
+    changed["attestations"] = [
+        {
+            "id": "att-1",
+            "root": "sha256:aaaa",
+            "claim": "cosign-verified",
+            "subject": "sha256:aaaa",
+            "verified_at": "2026-09-24T00:00:00Z",
+            "verifier_version": "cosign/2.4.0",
+        },
+        {
+            "id": "att-1",
+            "root": "sha256:bbbb",
+            "claim": "cosign-verified",
+            "subject": "sha256:bbbb",
+            "verified_at": "2026-09-24T00:00:01Z",
+            "verifier_version": "cosign/2.4.0",
+        },
+    ]
+    problems = bundle_problems(changed)
+    assert any("duplicate attestation id" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("bad_attributes", [["not", "a", "dict"], "oops", True])
+def test_a_wrong_typed_attributes_field_is_reported_not_a_crash(bad_attributes):
+    # _semantic_problems used to reach `.items()`/`.get(...)` on whatever
+    # `attributes` or `attestations` held without checking its type first —
+    # a truthy non-dict/non-list value raised instead of being reported.
+    changed = bundle()
+    changed["attributes"] = bad_attributes
+    problems = bundle_problems(changed)
+    assert any("attributes" in p for p in problems), problems
+
+
+def test_a_non_list_attestations_field_is_reported_not_a_crash():
+    changed = bundle()
+    changed["attestations"] = 42
+    problems = bundle_problems(changed)
+    assert any("attestations" in p for p in problems), problems
+
+
 def test_schema_and_runtime_both_restrict_windows_to_the_runtime_source():
     changed = bundle()
     changed["inputs_attempted"]["manifest"]["window_seconds"] = 60
@@ -84,12 +172,12 @@ def test_schema_and_runtime_both_restrict_windows_to_the_runtime_source():
     ("mutation", "problem"),
     [
         (lambda item: item.update(bundle_version=2), "bundle_version"),
-        (lambda item: item["inputs_attempted"].pop("repo"), "four sources"),
+        (lambda item: item["inputs_attempted"].pop("repo"), "repo"),
         (
             lambda item: item["attributes"]["deployment"]["value"].update(
                 unexpected="value"
             ),
-            "unknown key",
+            "unexpected",
         ),
         (
             lambda item: item["attributes"]["approval_policy"].pop("reason"),

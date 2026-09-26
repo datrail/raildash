@@ -12,10 +12,11 @@ license = "Apache-2.0"
 dependencies = [
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
+    "jsonschema>=4.25.0",
 ]
 
 [project.optional-dependencies]
-dev = ["httpx>=0.28.0", "jsonschema>=4.25.0", "pytest>=8.0"]
+dev = ["httpx>=0.28.0", "pytest>=8.0"]
 
 # So `raildash` is a real command after `pip install -e .`. Without it the
 # documented invocation only works as `python -m raildash.cli`, and a README
