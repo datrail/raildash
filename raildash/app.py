@@ -246,6 +246,10 @@ def api_interactions(
     status_class: str | None = Query(None, pattern=r"^[1-5]$"),
     q: str | None = None,
     errors_only: bool = False,
+    agent_key: str | None = None,
+    attribution_state: str | None = Query(
+        None, pattern=r"^(attributed|ambiguous|unknown|conflict)$"
+    ),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -256,6 +260,8 @@ def api_interactions(
         status_class=status_class,
         q=q,
         errors_only=errors_only,
+        agent_key=agent_key,
+        attribution_state=attribution_state,
         limit=limit,
         offset=offset,
     )

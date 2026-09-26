@@ -80,6 +80,11 @@ CREATE TABLE IF NOT EXISTS interactions (
     model          TEXT,
     tool_calls     INTEGER NOT NULL DEFAULT 0,
     has_ticket     INTEGER NOT NULL DEFAULT 0,
+    agent_host_id  TEXT,
+    sandbox_name   TEXT,
+    agent_key      TEXT,
+    attribution_state TEXT,
+    attribution_method TEXT,
     raw            TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
@@ -94,7 +99,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS interactions_dedup
 CREATE INDEX IF NOT EXISTS interactions_session ON interactions(session_id);
 CREATE INDEX IF NOT EXISTS interactions_time    ON interactions(timestamp_ns);
 CREATE INDEX IF NOT EXISTS interactions_host    ON interactions(host);
-
 CREATE TABLE IF NOT EXISTS raw_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
@@ -211,9 +215,33 @@ class Store:
         # dashboard polls, and a stalled poll looks like a hung page.
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        self._ensure_multi_agent_columns()
         self._migrate()
         self._db.commit()
         self._secure_database_files()
+
+    def _ensure_multi_agent_columns(self) -> None:
+        """Add DR-109 read columns without rewriting existing capture rows."""
+        existing = {
+            row["name"] for row in self._db.execute("PRAGMA table_info(interactions)")
+        }
+        for name in (
+            "agent_host_id",
+            "sandbox_name",
+            "agent_key",
+            "attribution_state",
+            "attribution_method",
+        ):
+            if name not in existing:
+                self._db.execute(f"ALTER TABLE interactions ADD COLUMN {name} TEXT")
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS interactions_agent_ref "
+            "ON interactions(agent_host_id, sandbox_name, agent_key)"
+        )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS interactions_attribution "
+            "ON interactions(attribution_state)"
+        )
 
     @staticmethod
     def _prepare_private_database_path(path: Path) -> None:
@@ -834,12 +862,14 @@ class Store:
                         session_id, interaction_id, timestamp, timestamp_ns,
                         pid, tid, method, host, path, status_code, latency_ms,
                         request_size, response_size, model, tool_calls,
-                        has_ticket, raw
+                        has_ticket, agent_host_id, sandbox_name, agent_key,
+                        attribution_state, attribution_method, raw
                     ) VALUES (
                         :session_id, :interaction_id, :timestamp, :timestamp_ns,
                         :pid, :tid, :method, :host, :path, :status_code, :latency_ms,
                         :request_size, :response_size, :model, :tool_calls,
-                        :has_ticket, :raw
+                        :has_ticket, :agent_host_id, :sandbox_name, :agent_key,
+                        :attribution_state, :attribution_method, :raw
                     )
                     """,
                     {**row, "session_id": session_id},
@@ -1094,6 +1124,8 @@ class Store:
         status_class: str | None = None,
         q: str | None = None,
         errors_only: bool = False,
+        agent_key: str | None = None,
+        attribution_state: str | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -1110,6 +1142,12 @@ class Store:
             params.append(method.upper())
         if errors_only:
             clauses.append("status_code >= 400")
+        if agent_key:
+            clauses.append("agent_key = ?")
+            params.append(agent_key)
+        if attribution_state:
+            clauses.append("attribution_state = ?")
+            params.append(attribution_state)
         if status_class and status_class.isdigit():
             lo = int(status_class) * 100
             clauses.append("status_code >= ? AND status_code < ?")
@@ -1131,7 +1169,9 @@ class Store:
             f"""
             SELECT id, session_id, interaction_id, timestamp, pid, tid, method,
                    host, path, status_code, latency_ms, request_size,
-                   response_size, model, tool_calls, has_ticket
+                   response_size, model, tool_calls, has_ticket,
+                   agent_host_id, sandbox_name, agent_key,
+                   attribution_state, attribution_method
             FROM interactions {where}
             ORDER BY timestamp_ns DESC, id DESC
             LIMIT ? OFFSET ?
