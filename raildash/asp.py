@@ -145,12 +145,14 @@ def bundle_problems(bundle: Any) -> list[str]:
 
 def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
     """The rules the published schema cannot express, or deliberately
-    doesn't: every attestation_ref names a real attestation; a deployment
-    value's byte length is measured in UTF-8 bytes, which `maxLength` cannot
-    — it counts Unicode code points; and `collected_at` must be UTC, which
-    RailDash requires but the shared schema's `format: date-time` (any
-    offset, per RFC 3339) does not — this predates the shared schema and is
-    kept for the same reason `_date_time` still enforces it on `locked_at`."""
+    doesn't: every attestation_ref names a real attestation; two attestations
+    never share an id (`uniqueItems` checks whole-item equality, not one
+    field); a deployment value's byte length is measured in UTF-8 bytes,
+    which `maxLength` cannot — it counts Unicode code points; and
+    `collected_at` must be UTC, which RailDash requires but the shared
+    schema's `format: date-time` (any offset, per RFC 3339) does not — this
+    predates the shared schema and is kept for the same reason `_date_time`
+    still enforces it on `locked_at`."""
     problems: list[str] = []
     collected_at = bundle.get("collected_at")
     if isinstance(collected_at, str):
@@ -160,16 +162,27 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
             parsed = None
         if parsed is not None and (parsed.tzinfo is None or parsed.utcoffset() != timedelta(0)):
             problems.append("collected_at: date-time must be UTC")
-    attestation_ids = {
-        entry.get("id") for entry in (bundle.get("attestations") or []) if isinstance(entry, dict)
-    }
-    for name, attribute in (bundle.get("attributes") or {}).items():
+    attestations = bundle.get("attestations")
+    attestation_ids: set[str] = set()
+    for index, entry in enumerate(attestations if isinstance(attestations, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        identifier = entry.get("id")
+        if not isinstance(identifier, str):
+            continue
+        if identifier in attestation_ids:
+            problems.append(f"attestations[{index}].id: duplicate attestation id")
+        else:
+            attestation_ids.add(identifier)
+    attributes = bundle.get("attributes")
+    attributes = attributes if isinstance(attributes, dict) else {}
+    for name, attribute in attributes.items():
         if not isinstance(attribute, dict):
             continue
         reference = attribute.get("attestation_ref")
         if reference is not None and reference not in attestation_ids:
             problems.append(f"attributes.{name}.attestation_ref: does not resolve")
-    deployment = (bundle.get("attributes") or {}).get("deployment")
+    deployment = attributes.get("deployment")
     if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
         value = deployment.get("value")
         if isinstance(value, dict):

@@ -21,6 +21,7 @@ from raildash.asp import (
     IdentityRequiredError,
     alignment_problems,
     bundle_digest,
+    bundle_problems,
     compare_alignment,
     parse_bundle,
     resolve_identity,
@@ -111,6 +112,51 @@ def test_deployment_keys_match_the_schemas_closed_set():
     # vendored schema's deployment_value $def closes over. Nothing else ties
     # the two together now that the schema enforces the closed set directly.
     assert set(DEPLOYMENT_KEYS) == set(SCHEMA["$defs"]["deployment_value"]["properties"])
+
+
+def test_duplicate_attestation_id_is_rejected():
+    # uniqueItems checks whole-item equality, not one field, so two
+    # attestations sharing an id (everything else differing) is a rule only
+    # code can enforce — the schema alone would accept it.
+    changed = bundle()
+    changed["attestations"] = [
+        {
+            "id": "att-1",
+            "root": "sha256:aaaa",
+            "claim": "cosign-verified",
+            "subject": "sha256:aaaa",
+            "verified_at": "2026-09-24T00:00:00Z",
+            "verifier_version": "cosign/2.4.0",
+        },
+        {
+            "id": "att-1",
+            "root": "sha256:bbbb",
+            "claim": "cosign-verified",
+            "subject": "sha256:bbbb",
+            "verified_at": "2026-09-24T00:00:01Z",
+            "verifier_version": "cosign/2.4.0",
+        },
+    ]
+    problems = bundle_problems(changed)
+    assert any("duplicate attestation id" in p for p in problems), problems
+
+
+@pytest.mark.parametrize("bad_attributes", [["not", "a", "dict"], "oops", True])
+def test_a_wrong_typed_attributes_field_is_reported_not_a_crash(bad_attributes):
+    # _semantic_problems used to reach `.items()`/`.get(...)` on whatever
+    # `attributes` or `attestations` held without checking its type first —
+    # a truthy non-dict/non-list value raised instead of being reported.
+    changed = bundle()
+    changed["attributes"] = bad_attributes
+    problems = bundle_problems(changed)
+    assert any("attributes" in p for p in problems), problems
+
+
+def test_a_non_list_attestations_field_is_reported_not_a_crash():
+    changed = bundle()
+    changed["attestations"] = 42
+    problems = bundle_problems(changed)
+    assert any("attestations" in p for p in problems), problems
 
 
 def test_schema_and_runtime_both_restrict_windows_to_the_runtime_source():
