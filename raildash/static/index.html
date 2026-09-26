@@ -86,6 +86,36 @@
         </div>
         <span class="sr-only" id="asp-status-announcement" aria-live="polite"></span>
       </div>
+
+      <div class="asp-upload" id="asp-upload">
+        <p>
+          Drop an evidence bundle here, or
+          <label class="asp-upload-browse">
+            browse
+            <input type="file" id="asp-upload-input" accept="application/json,.json" hidden>
+          </label>.
+        </p>
+        <p class="hint">Loads it the same way as <code>raildash asp load evidence-bundle.json</code>.</p>
+        <p class="asp-status-msg" id="asp-upload-status" aria-live="polite"></p>
+      </div>
+
+      <details class="asp-retention" id="asp-retention">
+        <summary>Retention settings</summary>
+        <div class="asp-retention-body">
+          <label class="field">
+            <span>Keep count</span>
+            <input type="number" id="asp-retention-keep" min="1" step="1">
+          </label>
+          <label class="field">
+            <span>Max age (days)</span>
+            <input type="number" id="asp-retention-days" min="1" step="1">
+          </label>
+          <button type="button" class="btn" id="asp-retention-save">Save</button>
+          <button type="button" class="btn btn-quiet" id="asp-retention-prune">Prune now</button>
+          <p class="asp-status-msg" id="asp-retention-status" aria-live="polite"></p>
+        </div>
+      </details>
+
       <div class="asp-alignment-body" id="asp-alignment-body">
         <p class="muted">Loading ASP alignment state…</p>
       </div>

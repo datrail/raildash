@@ -5,6 +5,7 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+*.db.token
 *.egg-info/
 build/
 # A leftover ./railmon checkout (earlier DR-81 iterations cloned one here; the

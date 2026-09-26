@@ -391,6 +391,74 @@ code { font-family: var(--mono); }
 .asp-change-fields { color: var(--ink-faint); }
 .asp-drift-pager { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
 
+.asp-upload {
+  margin: 13px 13px 0;
+  padding: 12px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r);
+  text-align: center;
+  font-size: 12px;
+}
+.asp-upload p { margin: 2px 0; }
+.asp-upload.dragover { border-color: var(--accent); background: var(--surface-sunk); }
+.asp-upload-browse {
+  color: var(--accent); text-decoration: underline; cursor: pointer;
+}
+.asp-status-msg { min-height: 1em; font: 11px var(--mono); }
+.asp-status-msg[data-tone="err"] { color: var(--fail); }
+.asp-status-msg[data-tone="ok"] { color: var(--ok); }
+
+.asp-retention {
+  margin: 13px 13px 0;
+  padding: 0;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r);
+}
+.asp-retention summary {
+  cursor: pointer; padding: 8px 12px; font-size: 12px; color: var(--ink-soft);
+}
+.asp-retention-body {
+  display: flex; flex-wrap: wrap; align-items: end; gap: 10px;
+  padding: 0 12px 12px;
+}
+.asp-retention-body input[type="number"] { width: 90px; }
+
+.asp-banner {
+  display: grid; gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--accent);
+  border-radius: var(--r);
+  background: var(--ok-soft);
+}
+.asp-banner h4 { margin: 0; font-size: 12.5px; }
+.asp-inline-form {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+}
+.asp-inline-form input[type="text"] { width: 110px; }
+.asp-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.asp-version-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+.asp-diff-table { display: grid; gap: 8px; margin-top: 6px; }
+.asp-diff-row {
+  display: grid; gap: 4px;
+  padding: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r);
+  font: 11px var(--mono);
+}
+.asp-diff-row dl { display: grid; grid-template-columns: max-content 1fr; gap: 3px 8px; margin: 0; }
+.asp-diff-row dt { color: var(--ink-faint); }
+.asp-diff-row dd { margin: 0; overflow-wrap: anywhere; }
+.asp-diff-old { color: var(--fail); }
+.asp-diff-new { color: var(--ok); }
+
+.asp-bundle-view {
+  margin-top: 8px; padding: 8px;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+  max-height: 320px; overflow: auto;
+}
+.asp-bundle-view pre { margin: 0; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+
 @media (max-width: 680px) {
   .asp-state-head { display: grid; }
   .asp-state { justify-self: start; }

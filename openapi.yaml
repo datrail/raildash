@@ -89,6 +89,174 @@ paths:
               schema: {$ref: '#/components/schemas/DriftPage'}
         '404': {description: No active-alignment drift result for the ASP}
 
+  /api/asps/{asp_id}/bundle:
+    get:
+      operationId: getAspBundle
+      summary: Get the full parsed evidence bundle for one ASP (DR-120)
+      description: |
+        Token-gated (`X-RailDash-Token`): unlike the redacted routes above,
+        this returns exact evidence values -- the same content
+        `raildash asp export` writes to a private file.
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: The parsed evidence-bundle envelope}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: ASP not found}
+
+  /api/asps/{asp_id}/drift/explained:
+    get:
+      operationId: getAspDriftExplained
+      summary: Get one bounded page of drift changes with old/new values and tier (DR-120)
+      description: |
+        Token-gated (`X-RailDash-Token`): the per-attribute detail behind the
+        dashboard's "drift explained" view -- same full evidence
+        `raildash asp drift-export` writes to a private file, paginated.
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+        - {$ref: '#/components/parameters/PageLimit'}
+        - {$ref: '#/components/parameters/PageOffset'}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: Drift result whose changes carry baseline/current evidence values}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No drift result for the ASP}
+
+  /api/asps/{asp_id}/lock:
+    post:
+      operationId: lockAsp
+      summary: Lock one stored ASP as a new immutable alignment version (DR-120)
+      description: Token-gated. Equivalent to `raildash asp lock <asp_id> --version <version>`.
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties: {version: {type: string, minLength: 1, maxLength: 128}}
+      responses:
+        '201': {description: The new alignment version}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such ASP}
+        '409': {description: That version already exists for this agent identity}
+
+  /api/alignments/{alignment_version_id}/switch:
+    post:
+      operationId: switchAlignment
+      summary: Make one alignment version active for its agent identity (DR-120)
+      description: Token-gated. Equivalent to `raildash asp switch <alignment_version_id>`.
+      parameters:
+        - name: alignment_version_id
+          in: path
+          required: true
+          schema: {type: string, minLength: 1}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: The new active binding}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such alignment version}
+
+  /api/asps/{asp_id}/accept-drift:
+    post:
+      operationId: acceptDrift
+      summary: Lock the current drifted ASP as a new baseline and switch to it (DR-120)
+      description: |
+        Token-gated. Equivalent to `raildash asp lock` immediately followed by
+        `raildash asp switch` on the version it just locked.
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [version]
+              properties: {version: {type: string, minLength: 1, maxLength: 128}}
+      responses:
+        '201': {description: The new alignment version and its active binding}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such ASP}
+        '409': {description: That version already exists for this agent identity}
+
+  /api/settings/asp-retention:
+    get:
+      operationId: getAspRetention
+      summary: Get the current ASP retention bounds (DR-120)
+      responses:
+        '200': {description: Current keep_count and max_age_days}
+    post:
+      operationId: setAspRetention
+      summary: Persist a new ASP retention bound (DR-120)
+      description: |
+        Token-gated. Equivalent to `raildash asp retention-set`. Stored in the
+        database, so it survives a restart without an env var.
+      parameters:
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keep_count, max_age_days]
+              properties:
+                keep_count: {type: integer, minimum: 1}
+                max_age_days: {type: integer, minimum: 1}
+      responses:
+        '200': {description: The saved retention bounds}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '422': {description: keep_count/max_age_days must be positive integers}
+
+  /api/asps/prune:
+    post:
+      operationId: pruneAsps
+      summary: Prune unlocked ASP history now (DR-120)
+      description: Token-gated. Equivalent to `raildash asp prune`.
+      parameters:
+        - {$ref: '#/components/parameters/RailDashToken'}
+        - name: keep_count
+          in: query
+          schema: {type: integer, minimum: 1}
+        - name: max_age_days
+          in: query
+          schema: {type: integer, minimum: 1}
+      responses:
+        '200': {description: Count of pruned ASPs}
+        '403': {description: Missing or invalid X-RailDash-Token}
+
+  /v1/evidence-bundles:
+    post:
+      operationId: ingestEvidenceBundle
+      summary: Ingest one Agent Security Profile evidence bundle (DR-120/DR-121)
+      description: |
+        Token-gated. RailDash's counterpart to Rail Center's own
+        `POST /v1/evidence-bundles` -- same path and general shape, RailDash's
+        own dedup semantics (content digest, not a client-asserted id). The
+        body is the exact evidence-bundle bytes, unmodified, bounded by
+        `RAILDASH_MAX_EVIDENCE_BUNDLE_BYTES` (default 1,048,576).
+      parameters:
+        - name: agent_key
+          in: query
+          schema: {type: string, maxLength: 128}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: string, format: binary}
+      responses:
+        '202': {description: 'Accepted: {accepted, asp_id, duplicate}'}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '409': {description: This id/identity already names different stored bytes}
+        '422': {description: Malformed or unresolvable evidence bundle}
+
   /api/profile:
     get:
       operationId: downloadObservedProfile
@@ -222,6 +390,15 @@ components:
       name: offset
       in: query
       schema: {type: integer, minimum: 0, default: 0}
+    RailDashToken:
+      name: X-RailDash-Token
+      in: header
+      required: true
+      description: |
+        The per-start local write token `raildash serve` prints and writes to
+        `<db path>.token`. Required on every write route and on the two reads
+        that carry exact evidence.
+      schema: {type: string}
 
   schemas:
     Page:

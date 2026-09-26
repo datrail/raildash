@@ -119,6 +119,7 @@ def cmd_asp_list(args: argparse.Namespace) -> int:
     result = {
         "asps": store.asp_summaries(),
         "alignment_versions": store.alignment_summaries(),
+        "retention": store.get_asp_retention(),
     }
     store.close()
     print(json.dumps(result, indent=2, ensure_ascii=False))
@@ -198,6 +199,25 @@ def cmd_asp_drift_export(args: argparse.Namespace) -> int:
         print(f"raildash: drift export failed: {exc}", file=sys.stderr)
         return 1
     print(f"exported full drift evidence for {args.asp_id} to {output}")
+    return 0
+
+
+def cmd_asp_retention_set(args: argparse.Namespace) -> int:
+    """Persist a retention change (DR-120's UI settings panel wraps the same call).
+
+    Unlike the `RAILDASH_ASP_RETENTION_COUNT`/`_DAYS` env vars, this is stored in
+    the database so it survives a restart without re-exporting anything.
+    """
+    try:
+        store = _open_store(args)
+        result = store.set_asp_retention(
+            keep_count=args.keep_count, max_age_days=args.max_age_days
+        )
+        store.close()
+    except ValueError as exc:
+        print(f"raildash: ASP retention-set failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
 
@@ -286,6 +306,14 @@ def build_parser() -> argparse.ArgumentParser:
     prune.add_argument("--keep-count", type=int, default=100)
     prune.add_argument("--max-age-days", type=int, default=30)
     prune.set_defaults(func=cmd_asp_prune)
+
+    retention_set = asp_sub.add_parser(
+        "retention-set",
+        help="persist a retention change (equivalent to the UI's retention settings panel)",
+    )
+    retention_set.add_argument("--keep-count", type=int, required=True)
+    retention_set.add_argument("--max-age-days", type=int, required=True)
+    retention_set.set_defaults(func=cmd_asp_retention_set)
 
     return parser
 

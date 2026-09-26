@@ -205,6 +205,55 @@ def test_automatic_retention_rejects_zero_before_opening_database(tmp_path, monk
         Store(tmp_path / "raildash.db")
 
 
+def test_retention_setting_persists_across_reopen(tmp_path):
+    """DR-120: a UI/CLI retention change is a DB row, not just an env var --
+    it must survive a restart without re-exporting anything."""
+    path = tmp_path / "raildash.db"
+    store = Store(path)
+    assert store.set_asp_retention(keep_count=3, max_age_days=9) == {
+        "keep_count": 3,
+        "max_age_days": 9,
+    }
+    store.close()
+
+    reopened = Store(path)
+    assert reopened.get_asp_retention() == {"keep_count": 3, "max_age_days": 9}
+    reopened.close()
+
+
+def test_retention_setting_rejects_non_positive_values(tmp_path):
+    store = Store(tmp_path / "raildash.db")
+    with pytest.raises(ValueError, match="positive integer"):
+        store.set_asp_retention(keep_count=0, max_age_days=10)
+    with pytest.raises(ValueError, match="positive integer"):
+        store.set_asp_retention(keep_count=5, max_age_days=-1)
+    store.close()
+
+
+def test_asp_bundle_and_drift_explained_carry_evidence_values(tmp_path):
+    """DR-120: the UI's inspect/drift-explained views need real values -- unlike
+    the redacted `/api/asps/{id}/drift`, which stays field-names-only."""
+    store = Store(tmp_path / "raildash.db")
+    baseline = store.load_asp(FIXTURE.read_bytes())
+    version = store.lock_alignment(baseline["asp_id"], "v1.0")
+    store.switch_alignment(version["alignment_version_id"])
+    current = store.load_asp(
+        changed_bundle(bundle_id="bnd-explained", destination="private.example")
+    )
+
+    bundle = store.asp_bundle(current["asp_id"])
+    assert bundle["attributes"]["declared_destinations"]["value"] == ["private.example"]
+    assert store.asp_bundle("asp-does-not-exist") is None
+
+    explained = store.drift_explained(current["asp_id"])
+    assert explained["has_drift"] is True
+    change = next(c for c in explained["changes"] if c["name"] == "declared_destinations")
+    assert change["current"]["value"] == ["private.example"]
+    assert change["baseline"]["value"] is None
+    assert store.drift_explained("asp-does-not-exist") is None
+    store.close()
+
+
 def test_database_and_export_are_owner_only(tmp_path):
     path = tmp_path / "raildash.db"
     store = Store(path)
