@@ -4,3 +4,4 @@
 # a library. Update these deliberately and run the OSV audit recorded in the PR.
 fastapi==0.141.1
 uvicorn==0.52.3
+jsonschema==4.25.1
