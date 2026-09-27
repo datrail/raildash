@@ -132,9 +132,23 @@ def parse_bundle(raw: bytes) -> dict[str, Any]:
 
 
 def bundle_problems(bundle: Any) -> list[str]:
-    """Validate the published v1 schema plus the two rules it cannot express."""
+    """Validate the published v1 schema plus the two rules it cannot express.
+
+    `bundle_version` is checked before the schema runs, not by it: this
+    RailDash is a v1-only sink (DR-109's evidence bundle v2 has no consumer
+    here yet), and a v2 body run through the v1 validator fails every
+    top-level field at once — `sandbox`/`agents` as unknown properties,
+    `inputs_attempted`/`attributes` as missing ones — which buries the one
+    fact that matters (the version this sink does not support) under noise
+    that looks like a malformed v1 bundle rather than an unsupported one.
+    """
     if not isinstance(bundle, dict):
         return ["bundle must be an object"]
+    version = bundle.get("bundle_version")
+    if version != BUNDLE_VERSION:
+        return [
+            f"bundle_version: this RailDash only accepts evidence bundle v{BUNDLE_VERSION}, got {version!r}"
+        ]
     problems = [
         f"{'.'.join(str(part) for part in error.path) or 'bundle'}: {error.message}"
         for error in sorted(_VALIDATOR.iter_errors(bundle), key=str)

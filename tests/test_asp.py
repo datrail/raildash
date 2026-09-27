@@ -75,7 +75,7 @@ def test_real_railmon_fixture_passes_the_vendored_schema_and_runtime_validator()
     }
 
 
-def _sibling_railmon_schema() -> Path | None:
+def _sibling_railmon_schema(name: str) -> Path | None:
     """A sibling RailMon checkout, if one is present next to this repo: the
     workspace's `repo/datrail/{railmon,raildash}` layout, or dev-toolkits'
     flat sibling clone under `$RAIL_WORKSPACE_HOME`. Both put RailMon two
@@ -84,26 +84,27 @@ def _sibling_railmon_schema() -> Path | None:
     below skips there rather than failing for a reason outside the test's
     control (see its skip message)."""
     repo_root = Path(__file__).resolve().parents[1]
-    candidates = [repo_root.parent / "railmon" / "schemas" / "evidence-bundle-v1.schema.json"]
+    candidates = [repo_root.parent / "railmon" / "schemas" / name]
     workspace_home = os.environ.get("RAIL_WORKSPACE_HOME")
     if workspace_home:
-        candidates.append(Path(workspace_home) / "railmon" / "schemas" / "evidence-bundle-v1.schema.json")
+        candidates.append(Path(workspace_home) / "railmon" / "schemas" / name)
     return next((path for path in candidates if path.is_file()), None)
 
 
-def test_vendored_schema_is_byte_for_byte_identical_to_railmon():
-    railmon_schema = _sibling_railmon_schema()
+@pytest.mark.parametrize("name", ["evidence-bundle-v1.schema.json", "evidence-bundle-v2.schema.json"])
+def test_vendored_schema_is_byte_for_byte_identical_to_railmon(name: str):
+    railmon_schema = _sibling_railmon_schema(name)
     if railmon_schema is None:
         pytest.skip(
-            "no sibling RailMon checkout found next to this repo (checked "
-            "../railmon and $RAIL_WORKSPACE_HOME/railmon) — can't check for "
-            "drift from here; this repo's own standalone CI has the same gap"
+            f"no sibling RailMon checkout found next to this repo (checked "
+            f"../railmon and $RAIL_WORKSPACE_HOME/railmon) — can't check "
+            f"{name} for drift from here; this repo's own standalone CI has "
+            f"the same gap"
         )
-    vendored = SCHEMAS / "evidence-bundle-v1.schema.json"
+    vendored = SCHEMAS / name
     assert vendored.read_bytes() == railmon_schema.read_bytes(), (
-        "raildash/schemas/evidence-bundle-v1.schema.json has drifted from "
-        "RailMon's copy — re-vendor it byte-for-byte from the pinned "
-        "RailMon version"
+        f"raildash/schemas/{name} has drifted from RailMon's copy — "
+        f"re-vendor it byte-for-byte from the pinned RailMon version"
     )
 
 
@@ -525,3 +526,37 @@ def test_result_has_serialized_byte_bound_and_shared_pagination_limits():
     assert len(wire) <= MAX_DRIFT_RESULT_BYTES
     assert (DEFAULT_DRIFT_PAGE_SIZE, MAX_DRIFT_PAGE_SIZE) == (100, 500)
     validate("drift-result-v1.schema.json", result)
+
+
+def _v2_bundle() -> dict:
+    """A minimal, schema-valid evidence bundle v2 (DR-109), shaped like
+    `compose_evidence_bundle_v2.py`'s own output: one shared sandbox scope
+    plus two keyed agent scopes."""
+    changed = bundle()
+    changed["bundle_version"] = 2
+    changed.pop("inputs_attempted")
+    inputs = json.loads(BASELINE_RAW)["inputs_attempted"]
+    changed["sandbox"] = {"inputs_attempted": inputs, "attributes": {"image_digest": changed["attributes"].pop("image_digest")}}
+    changed["agents"] = [
+        {"agent_key": "executor", "discovery_status": "available", "inputs_attempted": inputs, "attributes": changed.pop("attributes")},
+    ]
+    return changed
+
+
+def test_a_v2_bundle_passes_the_vendored_v2_schema_structurally():
+    # RailDash does not consume v2 yet (see the capability-check test below);
+    # this only proves the vendored schema itself is well-formed and accepts
+    # the shape DR-109's design describes, matching RailMon's own schema test.
+    validate("evidence-bundle-v2.schema.json", _v2_bundle())
+
+
+def test_a_v2_bundle_is_refused_by_name_not_by_schema_noise():
+    # DR-109 M1's capability check: this RailDash is a v1-only sink today, so
+    # a v2 body is refused with one clear reason naming the version, not the
+    # dozen "unknown property"/"required field missing" errors the v1
+    # validator would otherwise raise across every v2-only field at once.
+    problems = bundle_problems(_v2_bundle())
+    assert problems == ["bundle_version: this RailDash only accepts evidence bundle v1, got 2"]
+
+    with pytest.raises(BundleValidationError, match=r"^invalid evidence bundle: bundle_version.*only accepts.*v1"):
+        parse_bundle(raw(_v2_bundle()))
