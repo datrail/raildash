@@ -172,7 +172,10 @@ def test_schema_and_runtime_both_restrict_windows_to_the_runtime_source():
 @pytest.mark.parametrize(
     ("mutation", "problem"),
     [
-        (lambda item: item.update(bundle_version=2), "bundle_version"),
+        # 2 is now a supported version (DR-109 M1), so a v1-shaped bundle
+        # claiming it fails v2's schema instead -- an unsupported version
+        # number is the case that stays a clean "bundle_version" refusal.
+        (lambda item: item.update(bundle_version=3), "bundle_version"),
         (lambda item: item["inputs_attempted"].pop("repo"), "repo"),
         (
             lambda item: item["attributes"]["deployment"]["value"].update(
@@ -528,35 +531,105 @@ def test_result_has_serialized_byte_bound_and_shared_pagination_limits():
     validate("drift-result-v1.schema.json", result)
 
 
-def _v2_bundle() -> dict:
-    """A minimal, schema-valid evidence bundle v2 (DR-109), shaped like
-    `compose_evidence_bundle_v2.py`'s own output: one shared sandbox scope
-    plus two keyed agent scopes."""
+SANDBOX_ATTRIBUTE_NAMES = ("container_identity", "image_digest", "mounts", "deployment")
+
+
+def _v2_bundle(*, agent_key: str = "executor") -> dict:
+    """A minimal, schema-valid evidence bundle v2 (DR-109), split into one
+    shared sandbox scope plus one keyed agent scope exactly the way
+    `compose_evidence_bundle_v2.py`'s real composer splits its
+    `SANDBOX_ATTRIBUTES` set — so `deployment` lands in `sandbox.attributes`,
+    same as a real RailMon-composed bundle, not in the agent's."""
     changed = bundle()
     changed["bundle_version"] = 2
-    changed.pop("inputs_attempted")
-    inputs = json.loads(BASELINE_RAW)["inputs_attempted"]
-    changed["sandbox"] = {"inputs_attempted": inputs, "attributes": {"image_digest": changed["attributes"].pop("image_digest")}}
+    inputs = changed.pop("inputs_attempted")
+    attributes = changed.pop("attributes")
+    sandbox_attributes = {
+        name: attributes.pop(name) for name in SANDBOX_ATTRIBUTE_NAMES if name in attributes
+    }
+    changed["sandbox"] = {"inputs_attempted": inputs, "attributes": sandbox_attributes}
     changed["agents"] = [
-        {"agent_key": "executor", "discovery_status": "available", "inputs_attempted": inputs, "attributes": changed.pop("attributes")},
+        {
+            "agent_key": agent_key,
+            "discovery_status": "available",
+            "inputs_attempted": inputs,
+            "attributes": attributes,
+        },
     ]
     return changed
 
 
 def test_a_v2_bundle_passes_the_vendored_v2_schema_structurally():
-    # RailDash does not consume v2 yet (see the capability-check test below);
-    # this only proves the vendored schema itself is well-formed and accepts
-    # the shape DR-109's design describes, matching RailMon's own schema test.
     validate("evidence-bundle-v2.schema.json", _v2_bundle())
 
 
-def test_a_v2_bundle_is_refused_by_name_not_by_schema_noise():
-    # DR-109 M1's capability check: this RailDash is a v1-only sink today, so
-    # a v2 body is refused with one clear reason naming the version, not the
-    # dozen "unknown property"/"required field missing" errors the v1
-    # validator would otherwise raise across every v2-only field at once.
-    problems = bundle_problems(_v2_bundle())
-    assert problems == ["bundle_version: this RailDash only accepts evidence bundle v1, got 2"]
+def test_a_v2_bundle_is_accepted_and_deployment_identity_resolves_from_sandbox():
+    # DR-109 M1: RailDash now consumes v2, not just refuses it by name.
+    value = _v2_bundle()
+    assert bundle_problems(value) == []
+    parsed = parse_bundle(raw(value))
+    assert resolve_identity(parsed) == {
+        "kind": "deployment_environment",
+        "value": {"deployment": "payments-agent", "namespace": "production"},
+    }
 
-    with pytest.raises(BundleValidationError, match=r"^invalid evidence bundle: bundle_version.*only accepts.*v1"):
-        parse_bundle(raw(_v2_bundle()))
+
+def test_a_v2_bundle_with_no_deployment_identity_resolves_to_its_agent_keys():
+    value = _v2_bundle()
+    value["sandbox"]["attributes"]["deployment"]["status"] = "ABSENT"
+    value["sandbox"]["attributes"]["deployment"]["value"] = None
+    del value["sandbox"]["attributes"]["deployment"]["authored_by"]
+    assert bundle_problems(value) == []
+    assert resolve_identity(parse_bundle(raw(value))) == {
+        "kind": "local_agent_keys",
+        "value": ["executor"],
+    }
+
+
+def test_an_unsupported_bundle_version_is_refused_by_name_not_by_schema_noise():
+    # A version this RailDash does not understand at all is refused with one
+    # clear reason naming both versions it does accept, not the dozen
+    # "unknown property"/"required field missing" errors either validator
+    # would otherwise raise across every field the wrong version doesn't have.
+    value = _v2_bundle()
+    value["bundle_version"] = 3
+    problems = bundle_problems(value)
+    assert problems == [
+        "bundle_version: this RailDash only accepts evidence bundle v1 or v2, got 3"
+    ]
+
+    with pytest.raises(BundleValidationError, match=r"^invalid evidence bundle: bundle_version.*only accepts.*v1.*v2"):
+        parse_bundle(raw(value))
+
+
+@pytest.mark.parametrize(
+    "mutate,expected",
+    [
+        (lambda v: v["agents"].append({**v["agents"][0], "agent_key": "aardvark"}), "sorted ascending"),
+        (lambda v: v["agents"].append({**v["agents"][0]}), "must be unique"),
+        (lambda v: v["agents"][0].__setitem__("agent_key", "default"), "must not be 'default'"),
+    ],
+)
+def test_v2_agent_key_rules_the_schema_cannot_express(mutate, expected):
+    value = _v2_bundle()
+    mutate(value)
+    problems = bundle_problems(value)
+    assert any(expected in problem for problem in problems), problems
+
+
+def test_v2_attestation_ref_must_resolve_in_either_scope():
+    value = _v2_bundle()
+    value["sandbox"]["attributes"]["image_digest"]["attestation_ref"] = "missing"
+    problems = bundle_problems(value)
+    assert any(
+        problem == "sandbox.attributes.image_digest.attestation_ref: does not resolve"
+        for problem in problems
+    ), problems
+
+    value = _v2_bundle()
+    value["agents"][0]["attributes"]["framework_identity"]["attestation_ref"] = "missing"
+    problems = bundle_problems(value)
+    assert any(
+        problem == "agents[0].attributes.framework_identity.attestation_ref: does not resolve"
+        for problem in problems
+    ), problems

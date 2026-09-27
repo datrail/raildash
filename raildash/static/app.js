@@ -223,6 +223,9 @@ function identityLabel(identity) {
   if (identity.kind === "deployment_compose") {
     return `${value.project} / ${value.service} @ ${value.host_id}`;
   }
+  if (identity.kind === "local_agent_keys") {
+    return Array.isArray(value) ? value.join(", ") : String(value);
+  }
   return String(value);
 }
 

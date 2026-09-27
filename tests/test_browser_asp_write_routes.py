@@ -60,6 +60,33 @@ def _drifted_bundle_bytes(*, bundle_id: str, destination: str) -> bytes:
     return json.dumps(value, sort_keys=True).encode()
 
 
+SANDBOX_ATTRIBUTE_NAMES = ("container_identity", "image_digest", "mounts", "deployment")
+
+
+def _v2_bundle_bytes_no_deployment_identity(*, bundle_id: str) -> bytes:
+    """A v2 bundle (DR-109) with two agent scopes and no deployment identity,
+    so it resolves to the `local_agent_keys` identity kind -- the case
+    `identityLabel` in app.js needs a real branch for, since its value is a
+    list rather than the string/object every other kind carries."""
+    value = copy.deepcopy(parse_bundle(FIXTURE.read_bytes()))
+    value["bundle_id"] = bundle_id
+    value["bundle_version"] = 2
+    inputs = value.pop("inputs_attempted")
+    attributes = value.pop("attributes")
+    sandbox_attributes = {
+        name: attributes.pop(name) for name in SANDBOX_ATTRIBUTE_NAMES if name in attributes
+    }
+    sandbox_attributes["deployment"]["status"] = "ABSENT"
+    sandbox_attributes["deployment"]["value"] = None
+    del sandbox_attributes["deployment"]["authored_by"]
+    value["sandbox"] = {"inputs_attempted": inputs, "attributes": sandbox_attributes}
+    value["agents"] = [
+        {"agent_key": "aardvark", "discovery_status": "available", "inputs_attempted": inputs, "attributes": attributes},
+        {"agent_key": "executor", "discovery_status": "available", "inputs_attempted": inputs, "attributes": copy.deepcopy(attributes)},
+    ]
+    return json.dumps(value, sort_keys=True).encode()
+
+
 def test_asp_write_actions_drive_the_full_custody_flow_from_the_ui(tmp_path):
     database = tmp_path / "raildash.db"
     drifted_path = tmp_path / "drifted-bundle.json"
@@ -229,6 +256,56 @@ def test_write_routes_reject_a_forged_token_from_outside_the_page(tmp_path):
                 {"aspId": loaded["asp_id"]},
             )
             assert status == 403
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_a_v2_asps_multi_agent_identity_renders_as_a_readable_list(tmp_path):
+    """DR-109 M1: RailDash now stores and displays a v2 ASP. Its identity
+    value is a list (`local_agent_keys`), unlike every other identity kind's
+    string/object -- catches the card falling back to `String([...])`,
+    which collapses to an unlabeled, comma-less run of the raw keys."""
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    store.load_asp(_v2_bundle_bytes_no_deployment_identity(bundle_id="bnd-browser-v2"))
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [
+            sys.executable, "-m", "raildash.cli",
+            "--db", str(database),
+            "serve", "--host", "127.0.0.1", "--port", str(port),
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on(
+                "console",
+                lambda message: errors.append(message.text) if message.type == "error" else None,
+            )
+            page.on("pageerror", lambda error: errors.append(str(error)))
+
+            page.goto(url, wait_until="networkidle")
+            title = page.locator(".asp-state-card h3").first.inner_text()
+            assert title == "aardvark, executor"
+
+            assert errors == []
             browser.close()
     finally:
         process.terminate()

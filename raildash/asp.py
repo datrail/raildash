@@ -19,15 +19,22 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from .json_safety import check_json_structure
 
-# The published v1 schema, vendored byte-for-byte from the pinned RailMon
-# version (tests/test_asp.py asserts the copy hasn't drifted). It is the
-# single source of truth for the evidence bundle's structure; only the rules
-# it cannot express live in code below (`_semantic_problems`).
+# The published v1 and v2 schemas, vendored byte-for-byte from the pinned
+# RailMon version (tests/test_asp.py asserts neither copy has drifted). They
+# are the single source of truth for the evidence bundle's structure; only
+# the rules they cannot express live in code below (`_semantic_problems`,
+# `_semantic_problems_v2`).
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "evidence-bundle-v1.schema.json"
 SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text())
 _VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
 
+SCHEMA_V2_PATH = Path(__file__).resolve().parent / "schemas" / "evidence-bundle-v2.schema.json"
+SCHEMA_V2: dict[str, Any] = json.loads(SCHEMA_V2_PATH.read_text())
+_VALIDATOR_V2 = Draft202012Validator(SCHEMA_V2, format_checker=FormatChecker())
+
 BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
+BUNDLE_VERSION_V2 = SCHEMA_V2["properties"]["bundle_version"]["const"]
+DEFAULT_AGENT_KEY = "default"
 ALIGNMENT_CONTRACT_VERSION = 1
 DRIFT_CONTRACT_VERSION = 1
 # The shipped redacted RailMon sample is about 5 KiB.  The contract suite's
@@ -96,7 +103,7 @@ _DIGEST = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class BundleValidationError(ValueError):
-    """The received bytes are not one Evidence Bundle Schema v1 document."""
+    """The received bytes are not one Evidence Bundle Schema v1 or v2 document."""
 
     def __init__(self, problems: list[str]):
         self.problems = problems
@@ -132,29 +139,37 @@ def parse_bundle(raw: bytes) -> dict[str, Any]:
 
 
 def bundle_problems(bundle: Any) -> list[str]:
-    """Validate the published v1 schema plus the two rules it cannot express.
+    """Validate the published v1 or v2 schema plus the rules it cannot express.
 
-    `bundle_version` is checked before the schema runs, not by it: this
-    RailDash is a v1-only sink (DR-109's evidence bundle v2 has no consumer
-    here yet), and a v2 body run through the v1 validator fails every
-    top-level field at once — `sandbox`/`agents` as unknown properties,
-    `inputs_attempted`/`attributes` as missing ones — which buries the one
-    fact that matters (the version this sink does not support) under noise
-    that looks like a malformed v1 bundle rather than an unsupported one.
+    `bundle_version` is checked before either schema runs, not by them: a v2
+    body run through the v1 validator (or vice versa) fails every top-level
+    field at once — `sandbox`/`agents` as unknown properties on one side,
+    `inputs_attempted`/`attributes` as missing ones on the other — which
+    buries the one fact that matters (the version this sink does not
+    support) under noise that looks like a malformed bundle of the wrong
+    version rather than an unsupported one.
     """
     if not isinstance(bundle, dict):
         return ["bundle must be an object"]
     version = bundle.get("bundle_version")
-    if version != BUNDLE_VERSION:
-        return [
-            f"bundle_version: this RailDash only accepts evidence bundle v{BUNDLE_VERSION}, got {version!r}"
+    if version == BUNDLE_VERSION:
+        problems = [
+            f"{'.'.join(str(part) for part in error.path) or 'bundle'}: {error.message}"
+            for error in sorted(_VALIDATOR.iter_errors(bundle), key=str)
         ]
-    problems = [
-        f"{'.'.join(str(part) for part in error.path) or 'bundle'}: {error.message}"
-        for error in sorted(_VALIDATOR.iter_errors(bundle), key=str)
+        problems.extend(_semantic_problems(bundle))
+        return problems
+    if version == BUNDLE_VERSION_V2:
+        problems = [
+            f"{'.'.join(str(part) for part in error.path) or 'bundle'}: {error.message}"
+            for error in sorted(_VALIDATOR_V2.iter_errors(bundle), key=str)
+        ]
+        problems.extend(_semantic_problems_v2(bundle))
+        return problems
+    return [
+        f"bundle_version: this RailDash only accepts evidence bundle v{BUNDLE_VERSION} "
+        f"or v{BUNDLE_VERSION_V2}, got {version!r}"
     ]
-    problems.extend(_semantic_problems(bundle))
-    return problems
 
 
 def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
@@ -190,12 +205,7 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
             attestation_ids.add(identifier)
     attributes = bundle.get("attributes")
     attributes = attributes if isinstance(attributes, dict) else {}
-    for name, attribute in attributes.items():
-        if not isinstance(attribute, dict):
-            continue
-        reference = attribute.get("attestation_ref")
-        if reference is not None and reference not in attestation_ids:
-            problems.append(f"attributes.{name}.attestation_ref: does not resolve")
+    problems.extend(_attestation_ref_problems("attributes", attributes, attestation_ids))
     deployment = attributes.get("deployment")
     if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
         value = deployment.get("value")
@@ -206,11 +216,99 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
     return problems
 
 
+def _attestation_ref_problems(
+    where: str, attributes: Any, attestation_ids: set[str]
+) -> list[str]:
+    """Every `attestation_ref` in one attribute map must name a real attestation."""
+    problems: list[str] = []
+    attributes = attributes if isinstance(attributes, dict) else {}
+    for name, attribute in attributes.items():
+        if not isinstance(attribute, dict):
+            continue
+        reference = attribute.get("attestation_ref")
+        if reference is not None and reference not in attestation_ids:
+            problems.append(f"{where}.{name}.attestation_ref: does not resolve")
+    return problems
+
+
+def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
+    """The rules the published v2 schema cannot express (per its own
+    `$comment`): every `attestation_ref`, in `sandbox.attributes` or any
+    agent's `attributes`, names a real attestation; two attestations never
+    share an id; `agents[].agent_key` is sorted ascending, unique, and never
+    the reserved `"default"` (kept for the unkeyed v1-compatible path); and
+    `collected_at` must be UTC, for the same reason v1 requires it (see
+    `_semantic_problems`)."""
+    problems: list[str] = []
+    collected_at = bundle.get("collected_at")
+    if isinstance(collected_at, str):
+        try:
+            parsed = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+        if parsed is not None and (parsed.tzinfo is None or parsed.utcoffset() != timedelta(0)):
+            problems.append("collected_at: date-time must be UTC")
+    attestations = bundle.get("attestations")
+    attestation_ids: set[str] = set()
+    for index, entry in enumerate(attestations if isinstance(attestations, list) else []):
+        if not isinstance(entry, dict):
+            continue
+        identifier = entry.get("id")
+        if not isinstance(identifier, str):
+            continue
+        if identifier in attestation_ids:
+            problems.append(f"attestations[{index}].id: duplicate attestation id")
+        else:
+            attestation_ids.add(identifier)
+
+    sandbox = bundle.get("sandbox")
+    sandbox_attributes = sandbox.get("attributes") if isinstance(sandbox, dict) else None
+    problems.extend(_attestation_ref_problems("sandbox.attributes", sandbox_attributes, attestation_ids))
+
+    agents = bundle.get("agents")
+    agent_keys: list[str] = []
+    for index, agent in enumerate(agents if isinstance(agents, list) else []):
+        if not isinstance(agent, dict):
+            continue
+        agent_key = agent.get("agent_key")
+        if isinstance(agent_key, str):
+            agent_keys.append(agent_key)
+        problems.extend(
+            _attestation_ref_problems(
+                f"agents[{index}].attributes", agent.get("attributes"), attestation_ids
+            )
+        )
+    if agent_keys != sorted(agent_keys):
+        problems.append("agents: agent_key values must be sorted ascending")
+    if len(set(agent_keys)) != len(agent_keys):
+        problems.append("agents: agent_key values must be unique")
+    if DEFAULT_AGENT_KEY in agent_keys:
+        problems.append(
+            f"agents: agent_key must not be {DEFAULT_AGENT_KEY!r} "
+            "(reserved for the unkeyed v1-compatible path)"
+        )
+    return problems
+
+
 def resolve_identity(
     bundle: dict[str, Any], agent_key: str | None = None
 ) -> dict[str, Any]:
-    """Resolve identity by contract precedence, never by resemblance."""
-    deployment = bundle["attributes"].get("deployment") or {}
+    """Resolve identity by contract precedence, never by resemblance.
+
+    v2's shared `deployment` fact (when present) lives in `sandbox.attributes`
+    rather than the bundle's own top-level `attributes` (see the v2 schema's
+    `$comment`), so the deployment-identity precedence below reads from
+    whichever the bundle's version actually carries. Below deployment
+    identity, a v2 bundle never needs the caller's `agent_key` fallback:
+    every one of its agents already carries its own `agent_key` (validated
+    sorted, unique, and non-default by `_semantic_problems_v2`), so the whole
+    bundle's identity is that keyed set — distinct from v1's single unkeyed
+    `local_agent_key`, which is why it is a separate identity kind rather than
+    a single-item case of it.
+    """
+    is_v2 = bundle.get("bundle_version") == BUNDLE_VERSION_V2
+    attributes = bundle["sandbox"]["attributes"] if is_v2 else bundle["attributes"]
+    deployment = attributes.get("deployment") or {}
     value = deployment.get("value") if deployment.get("status") == "ANSWERED" else {}
     value = value if isinstance(value, dict) else {}
     if all(key in value for key in DEPLOYMENT_ENV_KEYS):
@@ -229,6 +327,11 @@ def resolve_identity(
                 "project": value["com.docker.compose.project"],
                 "service": value["com.docker.compose.service"],
             },
+        }
+    if is_v2:
+        return {
+            "kind": "local_agent_keys",
+            "value": [agent["agent_key"] for agent in bundle["agents"]],
         }
     if not isinstance(agent_key, str) or not agent_key:
         raise IdentityRequiredError("unkeyed bundle requires a local agent_key")

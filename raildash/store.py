@@ -30,6 +30,7 @@ from .json_safety import (
     check_json_structure,
 )
 from .asp import (
+    BUNDLE_VERSION,
     DEFAULT_DRIFT_PAGE_SIZE,
     MAX_DRIFT_PAGE_SIZE,
     bundle_digest,
@@ -587,6 +588,17 @@ class Store:
             asp = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
             if asp is None:
                 raise KeyError("no such ASP")
+            if asp["bundle_version"] != BUNDLE_VERSION:
+                # Locking is alignment/drift comparison's entry point, and that
+                # machinery (alignment_problems, compare_alignment) is v1-only
+                # today (DR-109 M3 is where multi-agent attribution and
+                # comparison land) -- refuse by name here rather than letting
+                # a later drift compare crash on an alignment contract it
+                # can't validate.
+                raise ValueError(
+                    f"locking an evidence bundle v{asp['bundle_version']} as a baseline "
+                    f"is not supported yet (only v{BUNDLE_VERSION})"
+                )
             alignment_id = f"aspver-{uuid.uuid4()}"
             locked_at = self._now()
             try:
