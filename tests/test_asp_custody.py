@@ -28,6 +28,34 @@ def changed_bundle(*, bundle_id: str, destination: str | None = None) -> bytes:
     return json.dumps(value, sort_keys=True).encode()
 
 
+SANDBOX_ATTRIBUTE_NAMES = ("container_identity", "image_digest", "mounts", "deployment")
+
+
+def v2_bundle(*, bundle_id: str) -> bytes:
+    """A v2 bundle split into sandbox/agent scope the way the real
+    `compose_evidence_bundle_v2.py` composer splits its `SANDBOX_ATTRIBUTES`
+    set (mirrors `tests/test_asp.py`'s own `_v2_bundle` -- duplicated rather
+    than imported since neither test module imports the other)."""
+    value = copy.deepcopy(parse_bundle(FIXTURE.read_bytes()))
+    value["bundle_id"] = bundle_id
+    value["bundle_version"] = 2
+    inputs = value.pop("inputs_attempted")
+    attributes = value.pop("attributes")
+    sandbox_attributes = {
+        name: attributes.pop(name) for name in SANDBOX_ATTRIBUTE_NAMES if name in attributes
+    }
+    value["sandbox"] = {"inputs_attempted": inputs, "attributes": sandbox_attributes}
+    value["agents"] = [
+        {
+            "agent_key": "executor",
+            "discovery_status": "available",
+            "inputs_attempted": inputs,
+            "attributes": attributes,
+        },
+    ]
+    return json.dumps(value, sort_keys=True).encode()
+
+
 def test_default_database_launch_still_uses_private_working_directory_path(tmp_path):
     environment = os.environ.copy()
     environment.pop("RAILDASH_DB", None)
@@ -108,6 +136,33 @@ def test_lock_switch_compare_and_redacted_page(tmp_path):
     assert page["limit"] == 1
     assert len(page["changes"]) == 1
     assert "private.example" not in json.dumps(page)
+    store.close()
+
+
+def test_v2_bundle_is_stored_and_read_back_exactly(tmp_path):
+    store = Store(tmp_path / "raildash.db")
+    raw = v2_bundle(bundle_id="bnd-custody-v2")
+    loaded = store.load_asp(raw)
+
+    assert loaded["replayed"] is False
+    assert store.asp_exact_bytes(loaded["asp_id"]) == raw
+    assert store.asp_bundle(loaded["asp_id"])["bundle_version"] == 2
+
+    summary = store.asp_summaries()[0]
+    assert summary["asp_id"] == loaded["asp_id"]
+    assert summary["contract"]["bundle_version"] == 2
+
+    state = store.asp_state(loaded["asp_id"])
+    assert state is not None
+    assert state["state"] == "NO_ACTIVE_ALIGNMENT"
+    store.close()
+
+
+def test_locking_a_v2_bundle_as_a_baseline_is_refused_by_name(tmp_path):
+    store = Store(tmp_path / "raildash.db")
+    loaded = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-lock"))
+    with pytest.raises(ValueError, match=r"v2.*not supported yet"):
+        store.lock_alignment(loaded["asp_id"], "v1.0")
     store.close()
 
 
