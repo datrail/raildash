@@ -416,12 +416,13 @@ components:
       properties:
         kind:
           type: string
-          enum: [deployment_environment, deployment_compose, local_agent_key]
+          enum: [deployment_environment, deployment_compose, local_agent_key, local_agent_keys]
         value:
           description: Closed identity value for the named kind; never evidence content.
           oneOf:
             - {type: string, maxLength: 128}
             - {type: object}
+            - {type: array, items: {type: string, maxLength: 128}}
 
     AspSummary:
       type: object
@@ -441,7 +442,7 @@ components:
           type: object
           required: [bundle_version, rule_pack_version]
           properties:
-            bundle_version: {type: integer, const: 1}
+            bundle_version: {type: integer, enum: [1, 2]}
             rule_pack_version: {type: integer, minimum: 1}
         agent_identity: {$ref: '#/components/schemas/AgentIdentity'}
         replayed: {type: boolean}
