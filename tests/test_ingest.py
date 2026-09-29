@@ -164,3 +164,75 @@ def test_a_webhook_envelope_in_the_file_is_unwrapped(tmp_path):
     items, skipped = read_jsonl(str(path))
     assert len(items) == 2
     assert skipped == 0
+
+
+def test_an_unattributed_row_keeps_its_reason_and_capturing_target():
+    # Shaped like RailMon's keyed `conflict` output (railmon#36): the ticket
+    # named a sibling, so no agent_ref, and the capturing tap is only a lead.
+    row = normalise({
+        "runtime_identity_version": 1,
+        "agent_ref": None,
+        "attribution": {
+            "state": "conflict",
+            "method": None,
+            "reason": "TICKET_CLAIM_CONFLICT",
+            "target_id": "executor",
+            "process": {"pid": 42, "start_time_ticks": 7},
+        },
+        "request": {"method": "POST", "path": "/"},
+    })
+    assert row["attribution_state"] == "conflict"
+    assert row["attribution_reason"] == "TICKET_CLAIM_CONFLICT"
+    assert row["attribution_target"] == "executor"
+    assert row["agent_key"] is None
+    assert row["attribution_method"] is None
+
+
+def test_an_unattributed_row_never_claims_a_method_or_an_agent():
+    row = normalise({
+        "runtime_identity_version": 1,
+        "agent_ref": {"host_id": "h", "sandbox_name": "s", "agent_key": "planner"},
+        "attribution": {"state": "ambiguous", "method": "process_target", "reason": "x" * 500},
+    })
+    assert row["agent_key"] is None
+    assert row["attribution_method"] is None
+    assert row["attribution_reason"] == "x" * 128
+
+
+def test_an_attributed_row_with_no_reference_is_unknown_not_attributed():
+    row = normalise({
+        "runtime_identity_version": 1,
+        "attribution": {"state": "attributed", "method": "process_target"},
+    })
+    assert row["attribution_state"] == "unknown"
+    assert row["attribution_reason"] == "INCOMPLETE_AGENT_REF"
+    assert row["agent_key"] is None
+
+
+def test_a_runtime_interaction_is_read_from_the_exchange_it_nests():
+    # RailMon's RuntimeInteraction envelope for a response-only row (an
+    # HTTP/2 stream already open at attach): request is null in `raw`, and
+    # the envelope only summarises. Everything but identity comes from `raw`.
+    row = normalise({
+        "interaction_id": "rt-1",
+        "capture_source": "railmon",
+        "timestamp": "2026-09-28T00:00:00+00:00",
+        "request": {"method": "UNKNOWN", "path": "", "destination": "unknown"},
+        "response": {"status": 200},
+        "raw": {
+            "timestamp_ns": 5,
+            "pid": 42,
+            "tid": 43,
+            "request": None,
+            "response": {
+                "status_code": 200,
+                "body": {"model": "claude-x", "content": [{"type": "tool_use", "name": "Bash"}]},
+            },
+            "response_size": 99,
+        },
+    })
+    assert row["interaction_id"] == "rt-1"
+    assert (row["status_code"], row["pid"], row["tid"], row["timestamp_ns"]) == (200, 42, 43, 5)
+    assert row["response_size"] == 99
+    assert row["model"] == "claude-x"
+    assert row["tool_calls"] == 1

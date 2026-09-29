@@ -264,11 +264,17 @@ paths:
       description: |
         Summarises facts observed in one RailMon capture. The versioned JSON
         has source=raildash-observed, contains no credential values, and is not
-        an authoritative Rail Center score.
+        an authoritative Rail Center score. With agent_key, only interactions
+        attributed to that agent count; ambiguous, unknown and conflict rows
+        never count toward any agent.
       parameters:
         - name: session_id
           in: query
           required: true
+          schema:
+            type: string
+        - name: agent_key
+          in: query
           schema:
             type: string
       responses:
@@ -283,6 +289,38 @@ paths:
                 $ref: '#/components/schemas/ObservedProfile'
         '404':
           description: Session not found
+
+  /api/interactions:
+    get:
+      operationId: listInteractions
+      summary: List captured interactions, newest first
+      description: |
+        Filters combine with AND. agent_key selects rows attributed to one
+        agent; unattributed=true selects the unattributed queue (ambiguous,
+        unknown and conflict rows, each with attribution_reason and the
+        capturing attribution_target), which the default list still includes.
+      parameters:
+        - {name: session_id, in: query, schema: {type: string}}
+        - {name: host, in: query, schema: {type: string}}
+        - {name: method, in: query, schema: {type: string}}
+        - {name: status_class, in: query, schema: {type: string, pattern: '^[1-5]$'}}
+        - {name: q, in: query, schema: {type: string}}
+        - {name: errors_only, in: query, schema: {type: boolean}}
+        - {name: agent_key, in: query, schema: {type: string}}
+        - name: attribution_state
+          in: query
+          schema: {type: string, enum: [attributed, ambiguous, unknown, conflict]}
+        - {name: unattributed, in: query, schema: {type: boolean}}
+        - {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 500}}
+        - {name: offset, in: query, schema: {type: integer, minimum: 0}}
+      responses:
+        '200':
+          description: |
+            {total, items[]}. Each item carries the redacted summary columns
+            (method, host, path, status_code, latency_ms, sizes, model,
+            tool_calls, has_ticket) plus agent_host_id, sandbox_name,
+            agent_key, attribution_state, attribution_method,
+            attribution_reason and attribution_target; never the raw body.
 
   /api/interactions/{row_id}:
     get:
@@ -539,6 +577,7 @@ components:
             id: {type: string}
             agent: {type: string}
             capture_start: {type: string}
+            agent_key: {type: string}
         observed:
           type: object
           required: [interaction_count, error_count, error_rate, x_rail, hosts, methods, models, tool_names, tool_names_truncated, truncated_dimensions]

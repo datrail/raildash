@@ -329,8 +329,8 @@ def api_overview(session_id: str | None = None) -> dict[str, Any]:
 
 
 @app.get("/api/profile")
-def api_observed_profile(session_id: str) -> JSONResponse:
-    profile = get_store().observed_profile(session_id)
+def api_observed_profile(session_id: str, agent_key: str | None = None) -> JSONResponse:
+    profile = get_store().observed_profile(session_id, agent_key=agent_key)
     if profile is None:
         raise HTTPException(404, "no such session")
     return JSONResponse(
@@ -349,6 +349,7 @@ def api_filters(session_id: str | None = None) -> dict[str, Any]:
     return {
         "hosts": db.distinct("host", session_id),
         "methods": db.distinct("method", session_id),
+        "agent_keys": db.distinct("agent_key", session_id),
     }
 
 
@@ -364,6 +365,7 @@ def api_interactions(
     attribution_state: str | None = Query(
         None, pattern=r"^(attributed|ambiguous|unknown|conflict)$"
     ),
+    unattributed: bool = False,
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> dict[str, Any]:
@@ -376,6 +378,7 @@ def api_interactions(
         errors_only=errors_only,
         agent_key=agent_key,
         attribution_state=attribution_state,
+        unattributed=unattributed,
         limit=limit,
         offset=offset,
     )

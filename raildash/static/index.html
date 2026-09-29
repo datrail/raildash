@@ -190,6 +190,10 @@
             <span class="sr-only">Search host or path</span>
             <input type="search" id="f-q" placeholder="host or path" autocomplete="off">
           </label>
+          <label class="field" id="f-agent-field" hidden>
+            <span class="sr-only">Agent</span>
+            <select id="f-agent"><option value="">any agent</option></select>
+          </label>
           <label class="field">
             <span class="sr-only">Method</span>
             <select id="f-method"><option value="">any method</option></select>
@@ -242,6 +246,35 @@
         <button type="button" class="btn btn-quiet" id="prev" disabled>Previous</button>
         <span class="pager-text" id="pager-text">—</span>
         <button type="button" class="btn btn-quiet" id="next" disabled>Next</button>
+      </div>
+    </section>
+
+    <section class="panel" id="unattributed-panel" aria-labelledby="unattributed-h" hidden>
+      <div class="panel-head">
+        <div>
+          <h2 id="unattributed-h">Unattributed interactions</h2>
+          <span class="hint">Not tied to exactly one declared agent (ambiguous, unknown, or a
+            process/x-rail conflict); counts toward no agent's profile. "Captured by" is a
+            lead, not an identity.</span>
+        </div>
+        <span class="muted" id="unattributed-count"></span>
+      </div>
+
+      <div class="scroll-x">
+        <table class="log">
+          <thead>
+            <tr>
+              <th scope="col" class="c-when">Time</th>
+              <th scope="col">State</th>
+              <th scope="col">Reason</th>
+              <th scope="col">Captured by</th>
+              <th scope="col" class="c-method">Method</th>
+              <th scope="col">Host</th>
+              <th scope="col">Path</th>
+            </tr>
+          </thead>
+          <tbody id="unattributed"></tbody>
+        </table>
       </div>
     </section>
 

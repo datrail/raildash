@@ -174,6 +174,9 @@ function filterStaticInteractions(items, params) {
     if (params.method && row.method !== params.method) return false;
     if (params.status_class && String(row.status_code || "")[0] !== params.status_class) return false;
     if (params.errors_only && !(row.status_code >= 400)) return false;
+    if (params.agent_key && row.agent_key !== params.agent_key) return false;
+    if (params.unattributed &&
+        !["ambiguous", "unknown", "conflict"].includes(row.attribution_state)) return false;
     if (params.q) {
       const needle = String(params.q).toLowerCase();
       if (!String(row.host || "").toLowerCase().includes(needle) &&
@@ -746,6 +749,7 @@ function filterParams() {
     status_class: $("f-status").value,
     q: $("f-q").value.trim(),
     errors_only: $("f-errors").checked,
+    agent_key: $("f-agent").value,
   };
 }
 
@@ -876,8 +880,12 @@ async function loadProfile() {
     return;
   }
 
-  const path = `/api/profile?session_id=${encodeURIComponent(state.sessionId)}`;
-  const profile = await getJSON("/api/profile", { session_id: state.sessionId });
+  // With an agent selected the profile is that agent's attributed traffic
+  // only; unattributed rows never count toward it.
+  const agentKey = $("f-agent").value;
+  const path = `/api/profile?session_id=${encodeURIComponent(state.sessionId)}` +
+    (agentKey ? `&agent_key=${encodeURIComponent(agentKey)}` : "");
+  const profile = await getJSON("/api/profile", { session_id: state.sessionId, agent_key: agentKey });
   const observed = profile.observed || {};
   download.href = staticDemo ? "./profile.json" : path;
   download.removeAttribute("aria-disabled");
@@ -1115,9 +1123,41 @@ async function loadLog() {
   $("next").disabled = to >= state.total;
 }
 
+/* ------------------------------------------------------------ unattributed */
+
+// Separate from the log above on purpose: the default lane keeps showing every
+// row exactly as before, and this queue only appears once there is something
+// in it (design doc §4.6).
+async function loadUnattributed() {
+  const data = await getJSON("/api/interactions", {
+    session_id: state.sessionId,
+    unattributed: true,
+    limit: 50,
+  });
+  $("unattributed-panel").hidden = data.total === 0;
+  $("unattributed-count").textContent = data.total
+    ? `${fmtInt(data.total)} interaction${data.total === 1 ? "" : "s"}${data.total > data.items.length ? `, newest ${data.items.length} shown` : ""}`
+    : "";
+  const body = $("unattributed");
+  body.replaceChildren();
+  data.items.forEach((row) => {
+    const tr = el("tr");
+    tr.dataset.sev = row.attribution_state === "conflict" ? "fail" : "warn";
+    tr.append(el("td", "muted", fmtTime(row.timestamp)));
+    tr.append(el("td", null, row.attribution_state));
+    tr.append(el("td", null, row.attribution_reason || "—"));
+    tr.append(el("td", null, row.attribution_target || "—"));
+    tr.append(el("td", null, row.method || "—"));
+    tr.append(el("td", "cell-host", row.host || "—"));
+    tr.append(el("td", "cell-path", row.path || "—"));
+    tr.addEventListener("click", () => openDetail(row.id));
+    body.append(tr);
+  });
+}
+
 function anyFilterActive() {
   const p = filterParams();
-  return Boolean(p.host || p.method || p.status_class || p.q || p.errors_only);
+  return Boolean(p.host || p.method || p.status_class || p.q || p.errors_only || p.agent_key);
 }
 
 function renderActiveFilter() {
@@ -1157,7 +1197,14 @@ function bodyBlock(body) {
 
 async function openDetail(rowId) {
   const data = await getJSON(`/api/interactions/${rowId}`);
-  const raw = data.raw || {};
+  const envelope = data.raw || {};
+  // A RuntimeInteraction row (keyed RailMon capture) nests the captured
+  // exchange in `raw`; show that, not the envelope's summary fields.
+  const nested = envelope.raw;
+  const raw = "capture_source" in envelope && nested && typeof nested === "object" &&
+    !Array.isArray(nested)
+    ? nested
+    : envelope;
   const req = raw.request || {};
   const res = raw.response || {};
 
@@ -1278,7 +1325,9 @@ async function refresh() {
   try {
     await loadSessions();
     renderActiveFilter();
-    await Promise.all([loadOverview(), loadProfile(), loadLog(), loadAspAlignments()]);
+    await Promise.all([
+      loadOverview(), loadProfile(), loadLog(), loadUnattributed(), loadAspAlignments(),
+    ]);
     await loadDrift();
     await loadFilterOptions();
     setConn("live", staticDemo ? "fixture" : "live");
@@ -1295,19 +1344,47 @@ async function refresh() {
 let filtersLoadedFor = null;
 
 async function loadFilterOptions() {
-  if (filtersLoadedFor === state.sessionId) return;
+  // A live session may gain keyed rows after first load, so keep asking while
+  // the agent filter has nothing to offer yet.
+  if (filtersLoadedFor === state.sessionId && !$("f-agent-field").hidden) return;
   const data = await getJSON("/api/filters", { session_id: state.sessionId });
   const select = $("f-method");
   const current = select.value;
-  select.replaceChildren(el("option", null, "any method"));
-  select.firstChild.value = "";
-  data.methods.forEach((m) => {
-    const opt = el("option", null, m);
-    opt.value = m;
-    select.append(opt);
+  // Rebuilt only when the list changed: this can now run on every poll, and
+  // replacing the options closes a dropdown the user has open.
+  const shown = Array.from(select.options).slice(1).map((opt) => opt.value);
+  if (shown.join("\n") !== data.methods.join("\n")) {
+    select.replaceChildren(el("option", null, "any method"));
+    select.firstChild.value = "";
+    data.methods.forEach((m) => {
+      const opt = el("option", null, m);
+      opt.value = m;
+      select.append(opt);
+    });
+    select.value = data.methods.includes(current) ? current : "";
+  }
+
+  // Only keyed (multi-agent) captures have agent keys; a single-agent capture
+  // keeps exactly the filter bar it always had.
+  const agentKeys = data.agent_keys || [];
+  const agentSelect = $("f-agent");
+  const currentAgent = agentSelect.value;
+  agentSelect.replaceChildren(el("option", null, "any agent"));
+  agentSelect.firstChild.value = "";
+  agentKeys.forEach((key) => {
+    const opt = el("option", null, key);
+    opt.value = key;
+    agentSelect.append(opt);
   });
-  select.value = data.methods.includes(current) ? current : "";
+  agentSelect.value = agentKeys.includes(currentAgent) ? currentAgent : "";
+  $("f-agent-field").hidden = agentKeys.length === 0;
   filtersLoadedFor = state.sessionId;
+  // A session switch can drop the selected agent; the log and profile were
+  // just loaded with it, so load them again without it.
+  if (agentSelect.value !== currentAgent) {
+    state.offset = 0;
+    await Promise.all([loadLog(), loadProfile()]);
+  }
 }
 
 function debounce(fn, ms) {
@@ -1367,12 +1444,17 @@ function init() {
   $("f-method").addEventListener("change", rerun);
   $("f-status").addEventListener("change", rerun);
   $("f-errors").addEventListener("change", rerun);
+  $("f-agent").addEventListener("change", () => {
+    rerun();
+    loadProfile().catch((e) => console.error(e));
+  });
 
   $("f-clear").addEventListener("click", () => {
     $("f-q").value = "";
     $("f-method").value = "";
     $("f-status").value = "";
     $("f-errors").checked = false;
+    $("f-agent").value = "";
     state.host = null;
     state.offset = 0;
     refresh();
