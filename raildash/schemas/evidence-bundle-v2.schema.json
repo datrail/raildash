@@ -135,7 +135,8 @@
         "PROVIDER_HOSTED",
         "TEMPLATE_UNRESOLVED",
         "PARSE_FAILED",
-        "SIZE_CAP_EXCEEDED"
+        "SIZE_CAP_EXCEEDED",
+        "MULTI_AGENT_SCOPE_UNRESOLVED"
       ]
     },
     "source": {

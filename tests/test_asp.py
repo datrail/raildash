@@ -563,6 +563,26 @@ def test_a_v2_bundle_passes_the_vendored_v2_schema_structurally():
     validate("evidence-bundle-v2.schema.json", _v2_bundle())
 
 
+def test_a_v2_agent_railmon_cannot_scope_is_accepted_not_refused():
+    # RailMon marks every agent-scoped attribute of an available agent with no
+    # scan.config_roots BLIND/MULTI_AGENT_SCOPE_UNRESOLVED (railmon#31). A
+    # vendored schema one reason behind refused that whole real collection.
+    value = _v2_bundle()
+    agent = value["agents"][0]
+    agent["attributes"] = {
+        name: {
+            "value": None,
+            "status": "BLIND",
+            "reason": "MULTI_AGENT_SCOPE_UNRESOLVED",
+            "tier": attribute.get("tier", "observed"),
+        }
+        for name, attribute in agent["attributes"].items()
+    }
+    assert agent["attributes"], "fixture must carry agent-scoped attributes"
+    validate("evidence-bundle-v2.schema.json", value)
+    assert bundle_problems(value) == []
+
+
 def test_a_v2_bundle_is_accepted_and_deployment_identity_resolves_from_sandbox():
     # DR-109 M1: RailDash now consumes v2, not just refuses it by name.
     value = _v2_bundle()
