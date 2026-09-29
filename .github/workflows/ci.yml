@@ -93,7 +93,9 @@ jobs:
         run: |
           docker run -d --name raildash -p 127.0.0.1:8000:8000 raildash:ci
           for _ in $(seq 60); do
-            token=$(docker exec raildash cat /data/raildash.db.token 2>/dev/null) && break
+            # Non-empty, not just readable: the file is created, then written.
+            token=$(docker exec raildash cat /data/raildash.db.token 2>/dev/null || true)
+            [ -n "$token" ] && break
             sleep 0.5
           done
           python3 tests/image_smoke.py http://127.0.0.1:8000 "$token" \

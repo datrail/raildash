@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Black-box smoke test against a running RailDash, e.g. the built image (DR-109 M4).
+"""Black-box smoke test against a fresh RailDash, e.g. the built image (DR-109 M4).
 
     python3 tests/image_smoke.py <base-url> <local-token>
 
@@ -9,7 +9,8 @@ keyed RuntimeInteraction rows the built RailMon binary emitted
 (`tests/fixtures/keyed-capture.jsonl`: attributed `critic` and `planner`, and a
 `conflict` row for `executor`) and an evidence bundle over the token-guarded
 ingest route. A unit test cannot show that the image ships what these paths
-read at runtime; this does.
+read at runtime; this does. It expects an empty database: a second run against
+the same instance fails, because re-delivered rows are deduplicated.
 """
 
 import json
@@ -61,7 +62,7 @@ def main() -> None:
     require(status == 200 and body.get("total") == len(rows), f"interaction list: {status} {body}")
     status, body = call(base, "/api/filters")
     # The conflict row names no agent, so only the two attributed keys index.
-    require(body.get("agent_keys") == ["critic", "planner"], f"agent index: {body}")
+    require(status == 200 and body.get("agent_keys") == ["critic", "planner"], f"agent index: {status} {body}")
 
     bundle = (FIXTURES / "evidence-bundle-v1.json").read_bytes()
     status, _ = call(base, "/v1/evidence-bundles?agent_key=smoke", bundle)
