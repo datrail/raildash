@@ -118,3 +118,71 @@ def test_asp_alignment_survives_refresh_focus_and_theme_switch(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+KEYED_FIXTURE = ROOT / "tests" / "fixtures" / "keyed-capture.jsonl"
+
+
+def test_keyed_capture_gets_an_agent_filter_and_a_separate_unattributed_queue(tmp_path):
+    # Rows the built RailMon binary emitted in railmon's
+    # tests/ticket_claim_acceptance.py: planner's ticket agreed, executor's
+    # named planner (conflict), critic sent none.
+    database = tmp_path / "raildash.db"
+    subprocess.run(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database), "load", str(KEYED_FIXTURE)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+    )
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database), "serve",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on(
+                "console",
+                lambda message: errors.append(message.text) if message.type == "error" else None,
+            )
+            page.goto(url, wait_until="networkidle")
+
+            # The default lane still lists every row.
+            assert page.locator("#log tr").count() == 3
+            assert "example.test" in page.locator("#log").inner_text()
+
+            queue = page.locator("#unattributed-panel")
+            assert queue.is_visible()
+            rows = page.locator("#unattributed tr")
+            assert rows.count() == 1
+            text = rows.first.inner_text()
+            assert "conflict" in text
+            assert "TICKET_CLAIM_CONFLICT" in text
+            assert "executor" in text
+
+            agent = page.locator("#f-agent")
+            assert page.locator("#f-agent-field").is_visible()
+            options = agent.locator("option").all_inner_texts()
+            assert options == ["any agent", "critic", "planner"]
+            with page.expect_response(lambda r: "agent_key=planner" in r.url and "/api/profile" in r.url):
+                agent.select_option("planner")
+            page.wait_for_function("document.querySelectorAll('#log tr').length === 1")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

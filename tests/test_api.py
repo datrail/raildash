@@ -983,3 +983,108 @@ def test_capture_drift_ui_uses_existing_profile_and_overview_apis(client):
     assert "generation !== driftGeneration" in js
     assert "Comparison incomplete" in js
     assert "risk score" not in html.lower()
+
+
+def _keyed(state: str, *, agent_key: str | None, path: str, reason: str | None = None) -> dict:
+    ref = {"host_id": "h", "sandbox_name": "s", "agent_key": agent_key} if agent_key else None
+    return {
+        "interaction_id": f"{state}-{path}",
+        "timestamp": "2026-09-28T00:00:00+00:00",
+        "timestamp_ns": 1,
+        "runtime_identity_version": 1,
+        "agent_ref": ref,
+        "attribution": {
+            "state": state,
+            "method": "process_target" if state == "attributed" else None,
+            "reason": reason,
+            "target_id": agent_key or "executor",
+            "process": {"pid": 42, "start_time_ticks": 7},
+        },
+        "request": {"method": "POST", "path": path, "headers": {"host": f"{path.strip('/')}.test"}},
+        "response": {"status_code": 200},
+    }
+
+
+def test_the_unattributed_queue_is_separate_and_counts_toward_no_agent(client):
+    client.post(
+        "/webhook/http-interactions",
+        json={
+            "session_id": "keyed",
+            "interactions": [
+                _keyed("attributed", agent_key="planner", path="/plan"),
+                _keyed("attributed", agent_key="executor", path="/exec"),
+                _keyed("conflict", agent_key=None, path="/forged", reason="TICKET_CLAIM_CONFLICT"),
+                _keyed("unknown", agent_key=None, path="/unpinned", reason="PROCESS_INCARNATION_UNPINNED"),
+            ],
+        },
+    ).raise_for_status()
+
+    # The default lane is unchanged: every row, attributed or not.
+    assert client.get("/api/interactions", params={"session_id": "keyed"}).json()["total"] == 4
+
+    queue = client.get(
+        "/api/interactions", params={"session_id": "keyed", "unattributed": True}
+    ).json()
+    assert queue["total"] == 2
+    by_path = {item["path"]: item for item in queue["items"]}
+    assert by_path["/forged"]["attribution_state"] == "conflict"
+    assert by_path["/forged"]["attribution_reason"] == "TICKET_CLAIM_CONFLICT"
+    assert by_path["/forged"]["attribution_target"] == "executor"
+    assert by_path["/unpinned"]["attribution_reason"] == "PROCESS_INCARNATION_UNPINNED"
+
+    assert client.get("/api/overview", params={"session_id": "keyed"}).json()["totals"][
+        "unattributed"
+    ] == 2
+    assert client.get("/api/filters", params={"session_id": "keyed"}).json()["agent_keys"] == [
+        "executor",
+        "planner",
+    ]
+
+    only_executor = client.get(
+        "/api/interactions", params={"session_id": "keyed", "agent_key": "executor"}
+    ).json()
+    assert [item["path"] for item in only_executor["items"]] == ["/exec"]
+
+    profile = client.get(
+        "/api/profile", params={"session_id": "keyed", "agent_key": "executor"}
+    ).json()
+    assert profile["session"]["agent_key"] == "executor"
+    assert profile["observed"]["interaction_count"] == 1
+    assert [host["value"] for host in profile["observed"]["hosts"]] == ["exec.test"]
+
+    # An empty agent_key is no scope at all, not "the agent with no key".
+    whole = client.get("/api/profile", params={"session_id": "keyed", "agent_key": ""}).json()
+    assert whole["observed"]["interaction_count"] == 4
+    assert "agent_key" not in whole["session"]
+
+
+def test_an_agent_profile_lists_tools_from_railmons_nested_exchange(client):
+    row = _keyed("attributed", agent_key="planner", path="/plan")
+    # RailMon's RuntimeInteraction keeps bodies only in the nested exchange.
+    row["capture_source"] = "railmon"
+    row["raw"] = {
+        "timestamp_ns": 1,
+        "request": {"method": "POST", "path": "/plan", "headers": {"host": "plan.test"}},
+        "response": {"status_code": 200, "body": {"content": [{"type": "tool_use", "name": "Bash"}]}},
+    }
+    client.post(
+        "/webhook/http-interactions", json={"session_id": "tools", "interactions": [row]}
+    ).raise_for_status()
+    profile = client.get(
+        "/api/profile", params={"session_id": "tools", "agent_key": "planner"}
+    ).json()
+    assert profile["observed"]["tool_names"] == [{"value": "Bash", "count": 1}]
+    listed = client.get("/api/interactions", params={"session_id": "tools"}).json()["items"][0]
+    detail = client.get(f"/api/interactions/{listed['id']}").json()
+    assert detail["tool_names"] == ["Bash"]
+
+
+def test_a_single_agent_capture_has_no_agent_filter_and_an_empty_queue(client):
+    params = {"session_id": "file:capture.jsonl"}
+    assert client.get("/api/filters", params=params).json()["agent_keys"] == []
+    assert client.get("/api/interactions", params={**params, "unattributed": True}).json()[
+        "total"
+    ] == 0
+    assert client.get("/api/overview", params=params).json()["totals"]["unattributed"] == 0
+    whole = client.get("/api/profile", params=params).json()
+    assert "agent_key" not in whole["session"]

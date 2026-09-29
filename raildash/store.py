@@ -23,7 +23,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .ingest import interaction_has_ticket, redact_credential_headers, redact_raw_event
+from .ingest import (
+    interaction_has_ticket,
+    legacy_exchange,
+    redact_credential_headers,
+    redact_raw_event,
+)
 from .json_safety import (
     MAX_SAFE_JSON_BYTES,
     JSONStructureTooComplex,
@@ -46,6 +51,9 @@ UNSAFE_LEGACY_CAPTURE = {
     "redacted": True,
     "reason": "legacy capture exceeded safe migration limits",
 }
+# Attribution states that name no agent (design doc §4.6): they go to the
+# unattributed queue and never count toward any one agent.
+UNATTRIBUTED_SQL = "('ambiguous', 'unknown', 'conflict')"
 MAX_PROFILE_TOOL_ROWS = 10_000
 MAX_PROFILE_TOOL_NAMES = 1_000
 MAX_PROFILE_DIMENSION_VALUES = 100
@@ -86,6 +94,8 @@ CREATE TABLE IF NOT EXISTS interactions (
     agent_key      TEXT,
     attribution_state TEXT,
     attribution_method TEXT,
+    attribution_reason TEXT,
+    attribution_target TEXT,
     raw            TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
@@ -243,6 +253,8 @@ class Store:
             "agent_key",
             "attribution_state",
             "attribution_method",
+            "attribution_reason",
+            "attribution_target",
         ):
             if name not in existing:
                 self._db.execute(f"ALTER TABLE interactions ADD COLUMN {name} TEXT")
@@ -999,16 +1011,18 @@ class Store:
                         pid, tid, method, host, path, status_code, latency_ms,
                         request_size, response_size, model, tool_calls,
                         has_ticket, agent_host_id, sandbox_name, agent_key,
-                        attribution_state, attribution_method, raw
+                        attribution_state, attribution_method,
+                        attribution_reason, attribution_target, raw
                     ) VALUES (
                         :session_id, :interaction_id, :timestamp, :timestamp_ns,
                         :pid, :tid, :method, :host, :path, :status_code, :latency_ms,
                         :request_size, :response_size, :model, :tool_calls,
                         :has_ticket, :agent_host_id, :sandbox_name, :agent_key,
-                        :attribution_state, :attribution_method, :raw
+                        :attribution_state, :attribution_method,
+                        :attribution_reason, :attribution_target, :raw
                     )
                     """,
-                    {**row, "session_id": session_id},
+                    {"attribution_reason": None, "attribution_target": None, **row, "session_id": session_id},
                 )
                 inserted += cur.rowcount
             if inserted:
@@ -1081,7 +1095,9 @@ class Store:
                    AVG(latency_ms)                     AS avg_latency_ms,
                    MAX(latency_ms)                     AS max_latency_ms,
                    COALESCE(SUM(request_size), 0)      AS request_bytes,
-                   COALESCE(SUM(response_size), 0)     AS response_bytes
+                   COALESCE(SUM(response_size), 0)     AS response_bytes,
+                   COALESCE(SUM(attribution_state IN {UNATTRIBUTED_SQL}), 0)
+                                                       AS unattributed
             FROM interactions {where}
             """,
             params,
@@ -1124,13 +1140,24 @@ class Store:
             "statuses": [dict(r) for r in statuses],
         }
 
-    def observed_profile(self, session_id: str) -> dict[str, Any] | None:
+    def observed_profile(
+        self, session_id: str, agent_key: str | None = None
+    ) -> dict[str, Any] | None:
         """Build a portable summary of facts observed in one capture.
 
         This deliberately contains no score or inferred posture. Values come
         only from the already-redacted interaction columns and captured
         ``tool_use`` names.
+
+        With ``agent_key`` the summary covers only interactions attributed to
+        that agent. Ambiguous, unknown and conflict rows never carry an
+        ``agent_key`` (see ``ingest``), so they stay in the unattributed queue
+        and cannot shape any one agent's observed profile (design doc §4.6).
         """
+        scope, scope_params = "session_id = ?", [session_id]
+        if agent_key:
+            scope += " AND agent_key = ?"
+            scope_params.append(agent_key)
         session = self._db.execute(
             "SELECT session_id, agent, capture_start FROM sessions WHERE session_id = ?",
             (session_id,),
@@ -1139,13 +1166,13 @@ class Store:
             return None
 
         totals = self._db.execute(
-            """
+            f"""
             SELECT COUNT(*) AS interactions,
                    COALESCE(SUM(status_code >= 400), 0) AS errors,
                    COALESCE(SUM(has_ticket), 0) AS ticket_interactions
-            FROM interactions WHERE session_id = ?
+            FROM interactions WHERE {scope}
             """,
-            (session_id,),
+            scope_params,
         ).fetchone()
 
         truncated_dimensions: list[str] = []
@@ -1160,14 +1187,14 @@ class Store:
                            COUNT(*) AS count,
                            MAX(length({column}) > ?) AS value_truncated
                     FROM interactions
-                    WHERE session_id = ? AND {column} IS NOT NULL AND {column} != ''
+                    WHERE {scope} AND {column} IS NOT NULL AND {column} != ''
                     GROUP BY substr({column}, 1, ?)
                     ORDER BY count DESC, value
                     LIMIT ?""",
                 (
                     MAX_PROFILE_VALUE_CHARS,
                     MAX_PROFILE_VALUE_CHARS,
-                    session_id,
+                    *scope_params,
                     MAX_PROFILE_VALUE_CHARS,
                     MAX_PROFILE_DIMENSION_VALUES + 1,
                 ),
@@ -1182,10 +1209,10 @@ class Store:
         tool_counts: dict[str, int] = {}
         tool_names_truncated = False
         raw_rows = self._db.execute(
-            """SELECT raw FROM interactions
-               WHERE session_id = ? AND tool_calls > 0
+            f"""SELECT raw FROM interactions
+               WHERE {scope} AND tool_calls > 0
                ORDER BY id LIMIT ?""",
-            (session_id, MAX_PROFILE_TOOL_ROWS + 1),
+            (*scope_params, MAX_PROFILE_TOOL_ROWS + 1),
         )
         for index, row in enumerate(raw_rows):
             if index == MAX_PROFILE_TOOL_ROWS:
@@ -1221,6 +1248,7 @@ class Store:
                 "id": session["session_id"],
                 "agent": session["agent"],
                 "capture_start": session["capture_start"],
+                **({"agent_key": agent_key} if agent_key else {}),
             },
             "observed": {
                 "interaction_count": interaction_count,
@@ -1262,6 +1290,7 @@ class Store:
         errors_only: bool = False,
         agent_key: str | None = None,
         attribution_state: str | None = None,
+        unattributed: bool = False,
         limit: int = 100,
         offset: int = 0,
     ) -> dict[str, Any]:
@@ -1284,6 +1313,8 @@ class Store:
         if attribution_state:
             clauses.append("attribution_state = ?")
             params.append(attribution_state)
+        if unattributed:
+            clauses.append(f"attribution_state IN {UNATTRIBUTED_SQL}")
         if status_class and status_class.isdigit():
             lo = int(status_class) * 100
             clauses.append("status_code >= ? AND status_code < ?")
@@ -1307,7 +1338,8 @@ class Store:
                    host, path, status_code, latency_ms, request_size,
                    response_size, model, tool_calls, has_ticket,
                    agent_host_id, sandbox_name, agent_key,
-                   attribution_state, attribution_method
+                   attribution_state, attribution_method, attribution_reason,
+                   attribution_target
             FROM interactions {where}
             ORDER BY timestamp_ns DESC, id DESC
             LIMIT ? OFFSET ?
@@ -1335,6 +1367,7 @@ class Store:
         Capture bodies are untrusted, so only the known Anthropic message
         locations are inspected and every unexpected shape is ignored.
         """
+        raw = legacy_exchange(raw)
         if not isinstance(raw, dict):
             return []
 
@@ -1462,7 +1495,7 @@ class Store:
         return current
 
     def distinct(self, column: str, session_id: str | None = None) -> list[str]:
-        if column not in {"host", "method"}:
+        if column not in {"host", "method", "agent_key"}:
             raise ValueError(f"not a filterable column: {column}")
         where, params = ("WHERE session_id = ?", (session_id,)) if session_id else ("", ())
         rows = self._db.execute(

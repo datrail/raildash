@@ -59,6 +59,7 @@ CREDENTIAL_HEADERS = frozenset(
     }
 )
 REDACTED = "[REDACTED-BY-RAILDASH]"
+MAX_ATTRIBUTION_REASON_CHARS = 128
 
 
 def _redact_header_lines(text: str) -> str:
@@ -347,11 +348,28 @@ def _synthetic_id(interaction: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
 
 
+def legacy_exchange(interaction: Any) -> Any:
+    """The captured exchange inside a RailMon RuntimeInteraction, else itself.
+
+    That shape (what RailMon emits with `--output-format runtime-interaction`,
+    and always for keyed multi-agent capture) summarises request/response as
+    `destination`/`status` and nests the full legacy interaction — bodies,
+    headers, pid/tid, sizes — in `raw`. Identity and attribution stay on the
+    envelope; everything about the exchange itself is read from here.
+    """
+    if isinstance(interaction, dict) and "capture_source" in interaction:
+        nested = interaction.get("raw")
+        if isinstance(nested, dict):
+            return nested
+    return interaction
+
+
 def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
     """One RailMon interaction to one `interactions` row."""
-    request = interaction.get("request")
+    legacy = legacy_exchange(interaction)
+    request = legacy.get("request")
     request = request if isinstance(request, dict) else {}
-    response = interaction.get("response")
+    response = legacy.get("response")
     response = response if isinstance(response, dict) else {}
 
     host, path = _split_host_path(request)
@@ -363,7 +381,7 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             status = None
 
-    latency = interaction.get("latency_ms")
+    latency = legacy.get("latency_ms")
     if not isinstance(latency, (int, float)):
         latency = None
 
@@ -376,6 +394,8 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
 
     state = None
     method_name = None
+    reason = None
+    target = None
     agent_host_id = sandbox_name = agent_key = None
     attribution = interaction.get("attribution")
     if interaction.get("runtime_identity_version") == 1 and isinstance(attribution, dict):
@@ -391,20 +411,40 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
                     agent_host_id, sandbox_name, agent_key = values
                 else:
                     state, method_name = "unknown", None
+                    reason = "INCOMPLETE_AGENT_REF"
+            elif state == "attributed":
+                state, method_name = "unknown", None
+                reason = "INCOMPLETE_AGENT_REF"
+            else:
+                # The producer's reason (e.g. TICKET_CLAIM_CONFLICT) is what the
+                # unattributed queue shows; bounded, since it is only a label.
+                # A row that names no agent claims no attribution method.
+                method_name = None
+                candidate_reason = attribution.get("reason")
+                if isinstance(candidate_reason, str) and candidate_reason:
+                    reason = candidate_reason[:MAX_ATTRIBUTION_REASON_CHARS]
+                else:
+                    reason = "UNSPECIFIED"
+                # Which declared target's tap captured the row, as a lead for
+                # the operator — never an identity: a conflict row's capturing
+                # target is exactly the claim that could not be trusted alone.
+                candidate_target = attribution.get("target_id")
+                if isinstance(candidate_target, str) and candidate_target:
+                    target = candidate_target[:MAX_ATTRIBUTION_REASON_CHARS]
 
     return {
         "interaction_id": interaction_id,
-        "timestamp": interaction.get("timestamp"),
-        "timestamp_ns": interaction.get("timestamp_ns") or 0,
-        "pid": interaction.get("pid"),
-        "tid": interaction.get("tid"),
+        "timestamp": interaction.get("timestamp") or legacy.get("timestamp"),
+        "timestamp_ns": legacy.get("timestamp_ns") or 0,
+        "pid": legacy.get("pid"),
+        "tid": legacy.get("tid"),
         "method": (request.get("method") or "").upper() or None,
         "host": host,
         "path": path,
         "status_code": status,
         "latency_ms": float(latency) if latency is not None else None,
-        "request_size": interaction.get("request_size"),
-        "response_size": interaction.get("response_size"),
+        "request_size": legacy.get("request_size"),
+        "response_size": legacy.get("response_size"),
         "model": _model(request_body) or _model(response_body),
         "tool_calls": _count_tool_calls(request_body) + _count_tool_calls(response_body),
         "has_ticket": int(interaction_has_ticket(interaction)),
@@ -413,6 +453,8 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
         "agent_key": agent_key,
         "attribution_state": state,
         "attribution_method": method_name,
+        "attribution_reason": reason,
+        "attribution_target": target,
         "raw": json.dumps(redact_credential_headers(interaction), default=str),
     }
 
