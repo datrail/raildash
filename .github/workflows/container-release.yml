@@ -61,7 +61,9 @@ jobs:
   # needs the resolved tag to know *what* to test, and a malformed tag should
   # fail in seconds rather than after a full test-and-build.
   version:
-    runs-on: ubuntu-latest
+    # Named, not ubuntu-latest: that label moves to 26.04 from 2026-10-19 to
+    # 11-19, run by run (actions/runner-images#14748). Move on purpose (DR-133).
+    runs-on: ubuntu-26.04
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       latest: ${{ steps.version.outputs.latest }}
@@ -126,7 +128,7 @@ jobs:
 
   publish:
     needs: [version, ci]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       # Submodules are off by default. GITHUB_TOKEN cannot read another
       # repository, so a recursive checkout fails on any repo that declares a
