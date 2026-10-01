@@ -186,3 +186,75 @@ def test_keyed_capture_gets_an_agent_filter_and_a_separate_unattributed_queue(tm
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_capture_drift_shows_an_image_upload_burst(tmp_path):
+    """DR-132: same host, method and model, but one capture uploads images."""
+    from raildash.ingest import normalise
+    from raildash.store import Store
+
+    def call(interaction_id: str, content) -> dict:
+        return {
+            "interaction_id": interaction_id,
+            "request": {
+                "method": "POST",
+                "path": "/v1/messages",
+                "headers": {"host": "api.anthropic.com", "content-type": "application/json"},
+                "body": {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": content}]},
+            },
+            "response": {"status_code": 200},
+        }
+
+    image = [{"type": "image", "source": {"type": "base64", "data": "iVBORw0KGgo"}}]
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    for session_id, rows in (
+        ("text-only", [call(f"t{i}", "hello") for i in range(3)]),
+        ("with-uploads", [call(f"u{i}", image) for i in range(2)] + [call("u-text", "hi")]),
+    ):
+        store.upsert_session(session_id, agent="agent", source="test")
+        store.add_interactions(session_id, [normalise(row) for row in rows])
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database), "serve",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on(
+                "console",
+                lambda message: errors.append(message.text) if message.type == "error" else None,
+            )
+            page.goto(url, wait_until="networkidle")
+
+            page.locator("#drift-left").select_option("text-only")
+            page.locator("#drift-right").select_option("with-uploads")
+            group = page.locator(".drift-group", has_text="Uploaded content")
+            group.wait_for()
+            added = group.locator(".drift-change", has_text="Added")
+            assert added.locator(".drift-label").all_inner_texts() == ["image"]
+            # Nothing else drifted: the host is the same on both sides.
+            hosts = page.locator(".drift-group", has_text="Hosts")
+            assert hosts.locator(".drift-label").count() == 0
+            assert "iVBORw0KGgo" not in page.content()
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

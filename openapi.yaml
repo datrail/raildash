@@ -580,7 +580,7 @@ components:
             agent_key: {type: string}
         observed:
           type: object
-          required: [interaction_count, error_count, error_rate, x_rail, hosts, methods, models, tool_names, tool_names_truncated, truncated_dimensions]
+          required: [interaction_count, error_count, error_rate, x_rail, hosts, methods, models, tool_names, tool_names_truncated, request_media_types, content_kinds, truncated_dimensions]
           properties:
             interaction_count: {type: integer}
             error_count: {type: integer}
@@ -606,9 +606,21 @@ components:
             tool_names_truncated:
               type: boolean
               description: True when safety limits prevented a complete tool-name summary.
+            request_media_types:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedValueCount'}
+              description: Request Content-Type media types, parameters dropped; count is interactions.
+            content_kinds:
+              type: array
+              items:
+                allOf:
+                  - {$ref: '#/components/schemas/ObservedValueCount'}
+                  - properties:
+                      value: {type: string, enum: [image, document, audio]}
+              description: Media kinds carried in request bodies (e.g. image upload blocks); count is interactions carrying that kind. Never the media itself.
             truncated_dimensions:
               type: array
-              items: {type: string, enum: [hosts, methods, models, tool_names]}
+              items: {type: string, enum: [hosts, methods, models, tool_names, request_media_types]}
               description: Dimensions whose cardinality or value-length safety limit was reached.
 
     InteractionSummary:
