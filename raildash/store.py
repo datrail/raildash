@@ -28,6 +28,8 @@ from .ingest import (
     legacy_exchange,
     redact_credential_headers,
     redact_raw_event,
+    request_content_kinds,
+    request_media_type,
 )
 from .json_safety import (
     MAX_SAFE_JSON_BYTES,
@@ -89,6 +91,8 @@ CREATE TABLE IF NOT EXISTS interactions (
     model          TEXT,
     tool_calls     INTEGER NOT NULL DEFAULT 0,
     has_ticket     INTEGER NOT NULL DEFAULT 0,
+    request_media_type TEXT,
+    content_kinds  TEXT,
     agent_host_id  TEXT,
     sandbox_name   TEXT,
     agent_key      TEXT,
@@ -232,6 +236,7 @@ class Store:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
         self._ensure_multi_agent_columns()
+        self._ensure_content_columns()
         self._migrate()
         # A UI-driven retention change (`set_asp_retention`) persists here so it
         # survives a restart without re-exporting an env var. It only overrides
@@ -266,6 +271,61 @@ class Store:
             "CREATE INDEX IF NOT EXISTS interactions_attribution "
             "ON interactions(attribution_state)"
         )
+
+    def _ensure_content_columns(self) -> None:
+        """Add DR-132's request media columns and fill them for older rows.
+
+        The values are derived from `raw`, which every row already holds, so a
+        database captured before DR-132 shows its uploads too. New rows are
+        always written with a non-NULL `content_kinds`, so NULL means "not yet
+        derived": an interrupted fill resumes on the next open. Rows go in
+        bounded pages like `_migrate`; one too large or malformed to parse
+        gets an empty value rather than a guess.
+        """
+        existing = {
+            row["name"] for row in self._db.execute("PRAGMA table_info(interactions)")
+        }
+        for name in ("request_media_type", "content_kinds"):
+            if name not in existing:
+                self._db.execute(f"ALTER TABLE interactions ADD COLUMN {name} TEXT")
+        # Holds only rows still to derive, so once filled it is empty and the
+        # check on every later open costs nothing.
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS interactions_content_pending "
+            "ON interactions(id) WHERE content_kinds IS NULL"
+        )
+        last_id = 0
+        while True:
+            rows = self._db.execute(
+                "SELECT id, length(CAST(raw AS BLOB)) AS size FROM interactions "
+                "WHERE content_kinds IS NULL AND id > ? ORDER BY id LIMIT ?",
+                (last_id, MIGRATION_BATCH_ROWS),
+            ).fetchall()
+            if not rows:
+                break
+            for candidate in rows:
+                media_type, kinds = None, ""
+                if int(candidate["size"] or 0) <= MAX_SAFE_JSON_BYTES:
+                    raw = self._db.execute(
+                        "SELECT raw FROM interactions WHERE id = ?", (candidate["id"],)
+                    ).fetchone()["raw"]
+                    try:
+                        exchange = legacy_exchange(self._safe_raw(raw))
+                        request = (
+                            exchange.get("request") if isinstance(exchange, dict) else None
+                        )
+                        if isinstance(request, dict):
+                            media_type = request_media_type(request)
+                            kinds = ",".join(request_content_kinds(request))
+                    except Exception:  # noqa: BLE001 - one row must not stop startup
+                        media_type, kinds = None, ""
+                self._db.execute(
+                    "UPDATE interactions SET request_media_type = ?, content_kinds = ? "
+                    "WHERE id = ?",
+                    (media_type, kinds, candidate["id"]),
+                )
+            last_id = rows[-1]["id"]
+            self._db.commit()
 
     @staticmethod
     def _prepare_private_database_path(path: Path) -> None:
@@ -1010,19 +1070,28 @@ class Store:
                         session_id, interaction_id, timestamp, timestamp_ns,
                         pid, tid, method, host, path, status_code, latency_ms,
                         request_size, response_size, model, tool_calls,
-                        has_ticket, agent_host_id, sandbox_name, agent_key,
+                        has_ticket, request_media_type, content_kinds,
+                        agent_host_id, sandbox_name, agent_key,
                         attribution_state, attribution_method,
                         attribution_reason, attribution_target, raw
                     ) VALUES (
                         :session_id, :interaction_id, :timestamp, :timestamp_ns,
                         :pid, :tid, :method, :host, :path, :status_code, :latency_ms,
                         :request_size, :response_size, :model, :tool_calls,
-                        :has_ticket, :agent_host_id, :sandbox_name, :agent_key,
+                        :has_ticket, :request_media_type, :content_kinds,
+                        :agent_host_id, :sandbox_name, :agent_key,
                         :attribution_state, :attribution_method,
                         :attribution_reason, :attribution_target, :raw
                     )
                     """,
-                    {"attribution_reason": None, "attribution_target": None, **row, "session_id": session_id},
+                    {
+                        "attribution_reason": None,
+                        "attribution_target": None,
+                        "request_media_type": None,
+                        "content_kinds": "",
+                        **row,
+                        "session_id": session_id,
+                    },
                 )
                 inserted += cur.rowcount
             if inserted:
@@ -1236,6 +1305,18 @@ class Store:
                     continue
                 tool_counts[name] = tool_counts.get(name, 0) + 1
 
+        # Only BLOCK_TYPE_KINDS/MEDIA_TYPE_KINDS values are ever stored, so
+        # this dimension is a closed vocabulary and needs no truncation.
+        content_kind_counts: dict[str, int] = {}
+        for row in self._db.execute(
+            f"""SELECT content_kinds, COUNT(*) AS count FROM interactions
+               WHERE {scope} AND content_kinds IS NOT NULL AND content_kinds != ''
+               GROUP BY content_kinds""",
+            scope_params,
+        ):
+            for kind in row["content_kinds"].split(","):
+                content_kind_counts[kind] = content_kind_counts.get(kind, 0) + row["count"]
+
         interaction_count = int(totals["interactions"])
         error_count = int(totals["errors"])
         ticket_count = int(totals["ticket_interactions"])
@@ -1272,9 +1353,24 @@ class Store:
                     )
                 ],
                 "tool_names_truncated": tool_names_truncated,
+                "request_media_types": counted(
+                    "request_media_type", "request_media_types"
+                ),
+                "content_kinds": [
+                    {"value": kind, "count": count}
+                    for kind, count in sorted(
+                        content_kind_counts.items(), key=lambda item: (-item[1], item[0])
+                    )
+                ],
                 "truncated_dimensions": [
                     label
-                    for label in ("hosts", "methods", "models", "tool_names")
+                    for label in (
+                        "hosts",
+                        "methods",
+                        "models",
+                        "tool_names",
+                        "request_media_types",
+                    )
                     if label in truncated_dimensions
                 ],
             },

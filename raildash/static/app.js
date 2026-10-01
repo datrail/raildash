@@ -908,6 +908,8 @@ async function loadProfile() {
   grid.append(profileValues("Methods", observed.methods || []));
   grid.append(profileValues("Tools", observed.tool_names || []));
   grid.append(profileValues("Models", observed.models || []));
+  grid.append(profileValues("Uploaded content", observed.content_kinds || []));
+  grid.append(profileValues("Request content types", observed.request_media_types || []));
 }
 
 function changedValues(before, after) {
@@ -935,6 +937,25 @@ function driftLabels(title, change, incomplete) {
       section.append(row);
     }
   );
+  return section;
+}
+
+// A kind both sessions carry can still drift: a burst of image uploads to a
+// host the agent already used changes only how many calls carry images.
+function driftCounts(title, before, after, incomplete) {
+  const section = driftLabels(title, changedValues(before, after), incomplete);
+  if (incomplete) return section;
+  const previous = new Map((before || []).map((item) => [item.value, item.count]));
+  const changed = (after || [])
+    .filter((item) => previous.has(item.value) && previous.get(item.value) !== item.count)
+    .sort((a, b) => a.value.localeCompare(b.value));
+  const row = el("div", "drift-change");
+  row.append(el("span", "drift-kind", "Calls"));
+  if (!changed.length) row.append(el("span", "muted", "Unchanged"));
+  changed.forEach((item) => row.append(el(
+    "span", "drift-label", `${item.value} ${fmtInt(previous.get(item.value))} → ${fmtInt(item.count)}`
+  )));
+  section.append(row);
   return section;
 }
 
@@ -986,6 +1007,8 @@ async function loadDrift() {
     labels.append(driftLabels("Hosts", changedValues(before.hosts, after.hosts), incomplete("hosts")));
     labels.append(driftLabels("Tools", changedValues(before.tool_names, after.tool_names), incomplete("tool_names")));
     labels.append(driftLabels("Models", changedValues(before.models, after.models), incomplete("models")));
+    labels.append(driftCounts("Uploaded content", before.content_kinds, after.content_kinds, false));
+    labels.append(driftLabels("Request content types", changedValues(before.request_media_types, after.request_media_types), incomplete("request_media_types")));
     body.append(labels);
 
     const leftTotals = leftOverview.totals || {};

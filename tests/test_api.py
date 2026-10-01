@@ -966,6 +966,225 @@ def test_observed_profile_ui_is_present_and_text_only(client):
     assert 'el("span", "profile-value", item.value)' in js
 
 
+IMAGE_DATA = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+
+
+def _upload(interaction_id: str, body, content_type: str = "application/json") -> dict:
+    return {
+        "interaction_id": interaction_id,
+        "request": {
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": {"host": "api.anthropic.com", "Content-Type": content_type},
+            "body": body,
+        },
+        "response": {"status_code": 200},
+    }
+
+
+def _post_session(client, session_id: str, interactions: list[dict]) -> dict:
+    client.post(
+        "/webhook/http-interactions",
+        json={"session_id": session_id, "interactions": interactions},
+    ).raise_for_status()
+    response = client.get("/api/profile", params={"session_id": session_id})
+    assert response.status_code == 200
+    return response
+
+
+def test_observed_profile_counts_uploaded_content_kinds_without_the_data(client):
+    image = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": IMAGE_DATA}}
+    response = _post_session(client, "uploads", [
+        # Anthropic: a user turn with a screenshot, and a tool's screenshot
+        # coming back inside a tool_result.
+        _upload("a-top", {"model": "claude-sonnet-5", "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "look"}, image]},
+        ]}),
+        _upload("a-tool", {"model": "claude-sonnet-5", "messages": [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": [image]},
+            ]},
+        ]}),
+        _upload("a-pdf", {"messages": [{"role": "user", "content": [
+            {"type": "document", "source": {"type": "base64", "data": IMAGE_DATA}},
+        ]}]}),
+        # OpenAI chat and Responses API.
+        _upload("o-chat", {"model": "gpt-5", "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{IMAGE_DATA}"}},
+        ]}]}),
+        _upload("o-responses", {"model": "gpt-5", "input": [
+            {"role": "user", "content": [{"type": "input_image", "image_url": "https://x/y.png"}]},
+        ]}),
+        # A direct upload: the body is the file, only the header says so.
+        _upload("raw-upload", "\x89PNG...", "multipart/form-data; boundary=----abc123"),
+        _upload("png-body", "\x89PNG...", "image/png"),
+        _upload("text-only", {"messages": [{"role": "user", "content": "hello"}]},
+                "application/json; charset=utf-8"),
+    ])
+
+    observed = response.json()["observed"]
+    assert observed["content_kinds"] == [
+        {"value": "image", "count": 5},
+        {"value": "document", "count": 1},
+    ]
+    assert observed["request_media_types"] == [
+        {"value": "application/json", "count": 6},
+        {"value": "image/png", "count": 1},
+        {"value": "multipart/form-data", "count": 1},
+    ]
+    assert observed["truncated_dimensions"] == []
+    assert IMAGE_DATA not in response.text
+    assert "boundary" not in response.text
+
+
+def test_an_image_burst_is_visible_between_two_captures(client):
+    text = _post_session(client, "before", [
+        _upload(f"t{index}", {"messages": [{"role": "user", "content": "hi"}]})
+        for index in range(3)
+    ]).json()["observed"]
+    image = {"type": "image", "source": {"type": "base64", "data": IMAGE_DATA}}
+    burst = _post_session(client, "after", [
+        _upload(f"i{index}", {"messages": [{"role": "user", "content": [image]}]})
+        for index in range(12)
+    ]).json()["observed"]
+
+    # Same host, method and model on both sides: only the uploads differ.
+    assert text["hosts"] == [{"value": "api.anthropic.com", "count": 3}]
+    assert burst["hosts"] == [{"value": "api.anthropic.com", "count": 12}]
+    assert text["content_kinds"] == []
+    assert burst["content_kinds"] == [{"value": "image", "count": 12}]
+    js = client.get("/app.js").text
+    assert 'driftCounts("Uploaded content", before.content_kinds, after.content_kinds' in js
+    assert 'profileValues("Uploaded content", observed.content_kinds' in js
+
+
+def test_malformed_bodies_carry_no_content_kind(client):
+    observed = _post_session(client, "malformed", [
+        _upload("m1", {"messages": "not a list", "content": {"type": "image"}}),
+        _upload("m2", {"messages": [None, 3, {"content": [None, {"type": 7}]}]}),
+        _upload("m3", {"input": "just text"}),
+        _upload("m4", None, ""),
+    ]).json()["observed"]
+
+    assert observed["content_kinds"] == []
+    assert observed["request_media_types"] == [{"value": "application/json", "count": 3}]
+
+
+def test_a_non_string_block_type_neither_crashes_ingest_nor_counts(client):
+    observed = _post_session(client, "odd-types", [
+        _upload("u1", {"input": [{"type": ["x"]}, {"type": {"a": 1}}]}),
+        _upload("u2", {"messages": [{"role": "user", "content": [
+            {"type": ["tool_result"]},
+            {"type": "tool_result", "content": [{"type": {"image": 1}}]},
+        ]}]}),
+    ]).json()["observed"]
+
+    assert observed["interaction_count"] == 2
+    assert observed["content_kinds"] == []
+
+    # The same unhashable-type crash, in the attribution envelope.
+    bad_state = {**_keyed("attributed", agent_key="a", path="/s"), "interaction_id": "bad-state"}
+    bad_state["attribution"]["state"] = ["attributed"]
+    client.post(
+        "/webhook/http-interactions",
+        json={"session_id": "odd-types", "interactions": [bad_state]},
+    ).raise_for_status()
+
+
+def test_padding_ahead_of_an_image_does_not_hide_it(client):
+    padded = {"messages": [
+        *({"role": "user", "content": "x"} for _ in range(10_001)),
+        {"role": "user", "content": [{}] * 10_001 + [{"type": "image"}]},
+    ]}
+    observed = _post_session(client, "padded", [_upload("p", padded)]).json()["observed"]
+
+    assert observed["content_kinds"] == [{"value": "image", "count": 1}]
+
+
+def test_an_interrupted_content_backfill_resumes_on_the_next_open(tmp_path, monkeypatch):
+    from raildash import store as store_module
+
+    path = tmp_path / "old.db"
+    old_schema = SCHEMA.replace("    request_media_type TEXT,\n", "").replace(
+        "    content_kinds  TEXT,\n", ""
+    )
+    db = sqlite3.connect(path)
+    db.executescript(old_schema)
+    db.execute("INSERT INTO sessions (session_id) VALUES ('old')")
+    image = _upload("x", {"messages": [{"role": "user", "content": [{"type": "image"}]}]})
+    for index in range(5):
+        db.execute(
+            "INSERT INTO interactions (session_id, interaction_id, raw) VALUES (?, ?, ?)",
+            ("old", f"i{index}", json.dumps(image)),
+        )
+    db.commit()
+    db.close()
+
+    monkeypatch.setattr(store_module, "MIGRATION_BATCH_ROWS", 2)
+    calls = 0
+    real = store_module.request_content_kinds
+
+    def dies_on_the_fourth_row(request):
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            raise KeyboardInterrupt
+        return real(request)
+
+    monkeypatch.setattr(store_module, "request_content_kinds", dies_on_the_fourth_row)
+    import gc
+
+    interrupted = False
+    try:
+        Store(path)
+    except KeyboardInterrupt:
+        interrupted = True
+    assert interrupted
+    # A reference cycle keeps the half-built Store's exclusive connection
+    # open; a real interruption ends the process and closes it.
+    gc.collect()
+
+    monkeypatch.setattr(store_module, "request_content_kinds", real)
+    store = Store(path)
+    observed = store.observed_profile("old")["observed"]
+    store.close()
+
+    assert observed["content_kinds"] == [{"value": "image", "count": 5}]
+
+
+def test_opening_a_pre_dr132_database_fills_in_content_kinds(tmp_path):
+    path = tmp_path / "old.db"
+    old_schema = SCHEMA.replace("    request_media_type TEXT,\n", "").replace(
+        "    content_kinds  TEXT,\n", ""
+    )
+    assert "content_kinds" not in old_schema
+    db = sqlite3.connect(path)
+    db.executescript(old_schema)
+    db.execute("INSERT INTO sessions (session_id) VALUES ('old')")
+    for interaction_id, interaction in (
+        ("with-image", _upload("x", {"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "data": IMAGE_DATA}},
+        ]}]})),
+        ("text", _upload("y", {"messages": []}, "text/plain")),
+    ):
+        db.execute(
+            "INSERT INTO interactions (session_id, interaction_id, raw) VALUES (?, ?, ?)",
+            ("old", interaction_id, json.dumps(interaction)),
+        )
+    db.commit()
+    db.close()
+
+    store = Store(path)
+    observed = store.observed_profile("old")["observed"]
+    store.close()
+
+    assert observed["content_kinds"] == [{"value": "image", "count": 1}]
+    assert observed["request_media_types"] == [
+        {"value": "application/json", "count": 1},
+        {"value": "text/plain", "count": 1},
+    ]
+
+
 def test_capture_drift_ui_uses_existing_profile_and_overview_apis(client):
     html = client.get("/").text
     js = client.get("/app.js").text

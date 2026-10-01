@@ -60,6 +60,24 @@ CREDENTIAL_HEADERS = frozenset(
 )
 REDACTED = "[REDACTED-BY-RAILDASH]"
 MAX_ATTRIBUTION_REASON_CHARS = 128
+MAX_MEDIA_TYPE_CHARS = 128
+BLOCK_TYPE_KINDS = {
+    # Anthropic
+    "image": "image",
+    "document": "document",
+    # OpenAI chat completions
+    "image_url": "image",
+    "input_audio": "audio",
+    "file": "document",
+    # OpenAI Responses API
+    "input_image": "image",
+    "input_file": "document",
+}
+MEDIA_TYPE_KINDS = (
+    ("image/", "image"),
+    ("audio/", "audio"),
+    ("application/pdf", "document"),
+)
 
 
 def _redact_header_lines(text: str) -> str:
@@ -276,6 +294,7 @@ def _count_tool_calls(body: Any) -> int:
             1
             for block in content
             if isinstance(block, dict)
+            and isinstance(block.get("type"), str)
             and block.get("type") in {"tool_use", "tool_call"}
         )
 
@@ -307,6 +326,78 @@ def _model(body: Any) -> str | None:
         if isinstance(model, str) and model:
             return model
     return None
+
+
+def request_media_type(request: dict[str, Any]) -> str | None:
+    """The request's Content-Type media type, parameters dropped.
+
+    `multipart/form-data; boundary=…` becomes `multipart/form-data`: the
+    boundary is random per request and would make every upload a new value.
+    """
+    value = _header(request.get("headers"), "content-type")
+    if not value:
+        return None
+    media_type = value.split(";", 1)[0].strip().lower()
+    return media_type[:MAX_MEDIA_TYPE_CHARS] or None
+
+
+def request_content_kinds(request: dict[str, Any]) -> list[str]:
+    """Which media kinds (image, document, audio) a request body carries.
+
+    Answers "is this agent uploading images", the PixelLeak signal: a burst
+    of screenshots to a host the agent already talks to changes no host,
+    model or tool, only what the requests carry. Only the kind is kept,
+    never the data.
+
+    Reads Anthropic `image`/`document` blocks (top level, in `messages`, and
+    inside a `tool_result`'s content, where a screenshot tool's output
+    lands), OpenAI chat parts (`image_url`, `input_audio`, `file`) and
+    Responses API parts (`input_image`, `input_file`) under `messages` or
+    `input`. A body that is itself an image, PDF or audio file counts by its
+    media type. Like `_count_tool_calls`, unknown shapes count nothing and
+    nothing here can raise.
+    """
+    kinds: set[str] = set()
+    media_type = request_media_type(request) or ""
+    for prefix, kind in MEDIA_TYPE_KINDS:
+        if media_type.startswith(prefix):
+            kinds.add(kind)
+
+    body = request.get("body")
+    if not isinstance(body, dict):
+        return sorted(kinds)
+
+    # No block cap: padding ahead of an image would hide it, which is the
+    # evasion this exists to catch. The walk is linear and one level deep,
+    # and a webhook body is already bounded by `check_json_structure`.
+    def add_blocks(content: Any, depth: int = 0) -> None:
+        if not isinstance(content, list):
+            return
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if not isinstance(block_type, str):
+                continue
+            kind = BLOCK_TYPE_KINDS.get(block_type)
+            if kind:
+                kinds.add(kind)
+            elif depth == 0 and block_type in {"tool_result", "message"}:
+                add_blocks(block.get("content"), depth + 1)
+
+    add_blocks(body.get("content"))
+    for field in ("messages", "input"):
+        items = body.get(field)
+        if not isinstance(items, list):
+            continue
+        # A Responses API `input` list may hold content parts directly, or
+        # messages that hold them; `add_blocks` reads the former and descends
+        # one level into the latter's `type: "message"` items.
+        add_blocks(items)
+        for item in items:
+            if isinstance(item, dict) and "type" not in item:
+                add_blocks(item.get("content"))
+    return sorted(kinds)
 
 
 def _has_ticket(request: dict[str, Any]) -> bool:
@@ -400,7 +491,9 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
     attribution = interaction.get("attribution")
     if interaction.get("runtime_identity_version") == 1 and isinstance(attribution, dict):
         candidate_state = attribution.get("state")
-        if candidate_state in {"attributed", "ambiguous", "unknown", "conflict"}:
+        if isinstance(candidate_state, str) and candidate_state in {
+            "attributed", "ambiguous", "unknown", "conflict"
+        }:
             state = candidate_state
             candidate_method = attribution.get("method")
             method_name = candidate_method if isinstance(candidate_method, str) else None
@@ -448,6 +541,8 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
         "model": _model(request_body) or _model(response_body),
         "tool_calls": _count_tool_calls(request_body) + _count_tool_calls(response_body),
         "has_ticket": int(interaction_has_ticket(interaction)),
+        "request_media_type": request_media_type(request),
+        "content_kinds": ",".join(request_content_kinds(request)),
         "agent_host_id": agent_host_id,
         "sandbox_name": sandbox_name,
         "agent_key": agent_key,
