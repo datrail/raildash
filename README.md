@@ -164,6 +164,25 @@ opt-in to reach RailDash from another host, and the token requirement still
 applies unchanged — exposing the port does not by itself expose the write
 routes.
 
+### Multi-agent collections (evidence bundle v2)
+
+RailMon run with `--target-manifest` delivers one evidence-bundle v2
+collection per scan: a shared sandbox scope plus one scope per declared
+agent. It locks, switches and drifts exactly like a v1 bundle. Its drift
+results use `drift_contract_version: 2`, where every change carries an
+`agent_key`: `null` for the sandbox scope and attestations, otherwise the
+agent the change happened in. Three change types are new:
+
+| Change | Meaning |
+| --- | --- |
+| `AGENT_CHANGED` `["discovery_status"]` | A declared agent's discovery moved, e.g. `available` → `not_found` when its process is gone. Its attribute and source changes follow, scoped to it. |
+| `AGENT_ADDED` / `AGENT_REMOVED` | The collection gained or lost an agent scope. This is possible only under a deployment identity. With no deployment identity, the sorted agent keys *are* the identity, so a manifest that declares a different set of agents is `IDENTITY_MISMATCH`, not drift. |
+
+A v1 bundle compared with a v2 baseline (or the reverse) is
+`CONTRACT_MISMATCH`. v1 comparisons still emit contract v1 unchanged.
+Schemas: `raildash/schemas/drift-result-v1.schema.json` and
+`drift-result-v2.schema.json`.
+
 The existing capture and `/api/profile` paths are unchanged. The pure
 validator/comparator and versioned JSON Schemas live under `raildash.asp`
 and `raildash/schemas/`.

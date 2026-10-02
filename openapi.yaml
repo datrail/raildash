@@ -504,11 +504,17 @@ components:
 
     DriftChange:
       type: object
+      description: >-
+        Contract v1 (evidence bundle v1) changes carry no `agent_key`. Contract
+        v2 (evidence bundle v2, DR-109) changes always carry it: null for the
+        shared sandbox scope and for attestations, otherwise the agent the
+        change is in. AGENT_* changes are v2 only; their `name` is the agent_key.
       required: [type, name, fields]
       properties:
+        agent_key: {type: [string, 'null']}
         type:
           type: string
-          enum: [ATTRIBUTE_ADDED, ATTRIBUTE_REMOVED, ATTRIBUTE_CHANGED, SOURCE_ADDED, SOURCE_REMOVED, SOURCE_CHANGED, ATTESTATION_ADDED, ATTESTATION_REMOVED, ATTESTATION_CHANGED]
+          enum: [ATTRIBUTE_ADDED, ATTRIBUTE_REMOVED, ATTRIBUTE_CHANGED, SOURCE_ADDED, SOURCE_REMOVED, SOURCE_CHANGED, ATTESTATION_ADDED, ATTESTATION_REMOVED, ATTESTATION_CHANGED, AGENT_ADDED, AGENT_REMOVED, AGENT_CHANGED]
         name: {type: string}
         fields:
           type: array
@@ -518,7 +524,7 @@ components:
       type: object
       required: [drift_contract_version, comparable, has_drift, reason, change_count, changes, truncated]
       properties:
-        drift_contract_version: {type: integer, const: 1}
+        drift_contract_version: {type: integer, enum: [1, 2]}
         comparable: {type: boolean}
         has_drift: {type: [boolean, 'null']}
         reason:

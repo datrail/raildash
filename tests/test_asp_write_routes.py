@@ -256,6 +256,64 @@ def test_bundle_and_drift_explained_are_token_gated_and_carry_values(client):
     )
 
 
+def _v2_collection(bundle_id: str, *, executor_status: str = "available") -> bytes:
+    """A RailMon-shaped v2 collection (DR-109): one sandbox scope, two
+    agents, deployment identity from the shared sandbox scope."""
+    value = json.loads(ASP_FIXTURE.read_bytes())
+    value["bundle_id"] = bundle_id
+    value["bundle_version"] = 2
+    inputs = value.pop("inputs_attempted")
+    attributes = value.pop("attributes")
+    sandbox = {
+        name: attributes.pop(name)
+        for name in ("container_identity", "image_digest", "mounts", "deployment")
+    }
+    value["sandbox"] = {"inputs_attempted": inputs, "attributes": sandbox}
+    value["agents"] = [
+        {"agent_key": key, "discovery_status": "available", "inputs_attempted": inputs,
+         "attributes": json.loads(json.dumps(attributes))}
+        for key in ("executor", "planner")
+    ]
+    if executor_status != "available":
+        value["collected_at"] = "2026-09-24T06:00:00Z"
+        value["agents"][0]["discovery_status"] = executor_status
+        value["agents"][0]["attributes"] = {}
+    return json.dumps(value, sort_keys=True).encode()
+
+
+def test_a_v2_collection_locks_over_http_and_drift_is_scoped_to_one_agent(client):
+    loaded = client.post(
+        "/v1/evidence-bundles", content=_v2_collection("bnd-http-v2"), headers=auth()
+    ).json()
+    locked = client.post(
+        f"/api/asps/{loaded['asp_id']}/lock", json={"version": "v1.0"}, headers=auth()
+    )
+    assert locked.status_code == 201
+    client.post(
+        f"/api/alignments/{locked.json()['alignment_version_id']}/switch", headers=auth()
+    )
+    assert client.get(f"/api/asps/{loaded['asp_id']}/state").json()["state"] == "ALIGNED"
+
+    gone = client.post(
+        "/v1/evidence-bundles",
+        content=_v2_collection("bnd-http-v2-gone", executor_status="not_found"),
+        headers=auth(),
+    ).json()
+    assert client.get(f"/api/asps/{gone['asp_id']}/state").json()["state"] == "DRIFT_DETECTED"
+    redacted = client.get(f"/api/asps/{gone['asp_id']}/drift").json()
+    assert redacted["drift_contract_version"] == 2
+    assert {c["agent_key"] for c in redacted["changes"]} == {"executor"}
+    explained = client.get(
+        f"/api/asps/{gone['asp_id']}/drift/explained", headers=auth()
+    ).json()
+    first = explained["changes"][0]
+    assert (first["type"], first["baseline"], first["current"]) == (
+        "AGENT_CHANGED",
+        {"discovery_status": "available"},
+        {"discovery_status": "not_found"},
+    )
+
+
 # --------------------------------------------------------- retention / prune
 
 
