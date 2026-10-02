@@ -375,7 +375,7 @@ def test_a_v2_baseline_locks_from_the_ui_and_drift_names_the_agent(tmp_path):
             diff_text = drifted_card.locator(".asp-diff-table").inner_text()
             assert "AGENT_CHANGED · agent executor" in diff_text
             assert '"not_found"' in diff_text
-            assert "ATTRIBUTE_REMOVED · executor · tool_names" in diff_text
+            assert "ATTRIBUTE_REMOVED · executor · approval_policy" in diff_text
             assert "aardvark" not in diff_text
 
             assert errors == []
