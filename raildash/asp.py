@@ -31,6 +31,11 @@ _VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
 SCHEMA_V2_PATH = Path(__file__).resolve().parent / "schemas" / "evidence-bundle-v2.schema.json"
 SCHEMA_V2: dict[str, Any] = json.loads(SCHEMA_V2_PATH.read_text())
 _VALIDATOR_V2 = Draft202012Validator(SCHEMA_V2, format_checker=FormatChecker())
+# v2's generic attribute definition leaves an ANSWERED `deployment` value
+# unconstrained; it is held to v1's shape, because it is the same identity.
+_DEPLOYMENT_VALUE_VALIDATOR = Draft202012Validator(
+    {**SCHEMA["$defs"]["deployment_value"], "$schema": SCHEMA["$schema"]}
+)
 
 BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 BUNDLE_VERSION_V2 = SCHEMA_V2["properties"]["bundle_version"]["const"]
@@ -245,7 +250,8 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
     share an id; `agents[].agent_key` is sorted ascending, unique, and never
     the reserved `"default"` (kept for the unkeyed v1-compatible path); and
     `collected_at` must be UTC, for the same reason v1 requires it (see
-    `_semantic_problems`)."""
+    `_semantic_problems`); and an ANSWERED sandbox `deployment` value has
+    v1's shape and byte bound, since it resolves to the same identity."""
     problems: list[str] = []
     collected_at = bundle.get("collected_at")
     if isinstance(collected_at, str):
@@ -271,6 +277,15 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
     sandbox = bundle.get("sandbox")
     sandbox_attributes = sandbox.get("attributes") if isinstance(sandbox, dict) else None
     problems.extend(_attestation_ref_problems("sandbox.attributes", sandbox_attributes, attestation_ids))
+    deployment = (sandbox_attributes or {}).get("deployment") if isinstance(sandbox_attributes, dict) else None
+    if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
+        value = deployment.get("value")
+        for error in _DEPLOYMENT_VALUE_VALIDATOR.iter_errors(value):
+            problems.append(f"sandbox.attributes.deployment.value: {error.message}")
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
+                    problems.append(f"sandbox.attributes.deployment.value.{key}: exceeds byte bound")
 
     agents = bundle.get("agents")
     agent_keys: list[str] = []
@@ -280,6 +295,10 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
         agent_key = agent.get("agent_key")
         if isinstance(agent_key, str):
             agent_keys.append(agent_key)
+            # The schema's `pattern` is a search, where `$` also matches
+            # before a trailing newline; the key becomes an identity.
+            if not _V2_AGENT_KEY.fullmatch(agent_key):
+                problems.append(f"agents[{index}].agent_key: invalid agent_key")
         problems.extend(
             _attestation_ref_problems(
                 f"agents[{index}].attributes", agent.get("attributes"), attestation_ids
@@ -352,7 +371,11 @@ def resolve_identity(
 
 
 def alignment_problems(alignment: Any) -> list[str]:
-    """Validate the closed alignment-version v1 object used by comparison."""
+    """Validate the closed alignment-version v1 object used by comparison.
+
+    Contract v1 of the alignment object covers both evidence-bundle
+    versions: only `contract.bundle_version` and the identity kind differ.
+    """
     if not isinstance(alignment, dict):
         return ["alignment version must be an object"]
     required = {
@@ -372,7 +395,7 @@ def alignment_problems(alignment: Any) -> list[str]:
     for key in ("alignment_version_id", "version"):
         _bounded_string(alignment.get(key), key, 1, None, problems)
     _date_time(alignment.get("locked_at"), "locked_at", problems)
-    problems.extend(_identity_problems(alignment.get("agent_identity")))
+    problems.extend(identity_problems(alignment.get("agent_identity")))
     contract = alignment.get("contract")
     if not isinstance(contract, dict) or set(contract) != {
         "bundle_version",
@@ -636,7 +659,7 @@ def _map_changes(
     return changes
 
 
-def _identity_problems(identity: Any) -> list[str]:
+def identity_problems(identity: Any) -> list[str]:
     if not isinstance(identity, dict) or set(identity) != {"kind", "value"}:
         return ["agent_identity: must contain only kind and value"]
     kind = identity.get("kind")

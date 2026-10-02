@@ -251,6 +251,23 @@ def test_a_v2_drift_names_the_scope_it_happened_in(tmp_path):
     store.close()
 
 
+def test_a_lock_refuses_an_identity_every_later_compare_would_reject(tmp_path, monkeypatch):
+    # Defence in depth: ingest validates identity, but a stored identity that
+    # alignment_problems rejects would fail every later ingest for it.
+    import raildash.store as store_module
+
+    monkeypatch.setattr(
+        store_module,
+        "resolve_identity",
+        lambda bundle, agent_key=None: {"kind": "local_agent_keys", "value": ["executor\n"]},
+    )
+    store = Store(tmp_path / "raildash.db")
+    loaded = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-bad-identity"))
+    with pytest.raises(ValueError, match="cannot be locked as a baseline"):
+        store.lock_alignment(loaded["asp_id"], "v1.0")
+    store.close()
+
+
 def test_a_v1_bundle_against_a_v2_baseline_is_not_comparable(tmp_path):
     # Same deployment identity, different evidence shape: comparing would
     # report every attribute as moved between scopes, so it is refused.

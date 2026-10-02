@@ -717,3 +717,39 @@ def test_a_local_agent_keys_identity_must_be_a_sorted_unique_key_list(value):
     active = alignment(raw(_keys_only_v2("executor")))
     active["agent_identity"]["value"] = value
     assert "agent_identity.value: invalid local agent_key list" in alignment_problems(active)
+
+
+@pytest.mark.parametrize("keys", [("executor",), ("executor", "planner")])
+def test_a_v2_alignment_and_its_binding_pass_the_published_schemas(keys):
+    active = alignment(raw(_keys_only_v2(*keys)))
+    validate("alignment-version-v1.schema.json", active)
+    validate(
+        "active-binding-v1.schema.json",
+        {
+            "binding_contract_version": 1,
+            "agent_identity": active["agent_identity"],
+            "alignment_version_id": active["alignment_version_id"],
+            "switched_at": "2026-09-24T00:02:00Z",
+        },
+    )
+    Draft202012Validator.check_schema(
+        json.loads((SCHEMAS / "drift-result-v2.schema.json").read_text(encoding="utf-8"))
+    )
+
+
+def test_a_v2_agent_key_with_a_trailing_newline_is_refused():
+    # The schema pattern is a search, where `$` matches before a final "\n";
+    # the key would otherwise become an identity no alignment accepts.
+    value = _keys_only_v2("executor")
+    value["agents"][0]["agent_key"] = "executor\n"
+    assert "agents[0].agent_key: invalid agent_key" in bundle_problems(value)
+
+
+@pytest.mark.parametrize("namespace", ["", " ", 7])
+def test_a_v2_deployment_value_is_held_to_the_v1_shape(namespace):
+    value = _v2_bundle()
+    value["sandbox"]["attributes"]["deployment"]["value"]["RAIL_NAMESPACE"] = namespace
+    assert any(
+        problem.startswith("sandbox.attributes.deployment.value")
+        for problem in bundle_problems(value)
+    )

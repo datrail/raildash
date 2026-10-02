@@ -176,7 +176,7 @@ agent the change happened in. Three change types are new:
 | Change | Meaning |
 | --- | --- |
 | `AGENT_CHANGED` `["discovery_status"]` | A declared agent's discovery moved, e.g. `available` → `not_found` when its process is gone. Its attribute and source changes follow, scoped to it. |
-| `AGENT_ADDED` / `AGENT_REMOVED` | The collection gained or lost an agent scope. This is possible only under a deployment identity. With no deployment identity, the sorted agent keys *are* the identity, so a manifest that declares a different set of agents is `IDENTITY_MISMATCH`, not drift. |
+| `AGENT_ADDED` / `AGENT_REMOVED` | The collection gained or lost an agent scope. This happens only under a deployment identity (`RAIL_DEPLOYMENT`/`RAIL_NAMESPACE` or the compose labels). With no deployment identity, the sorted agent keys *are* the identity. A manifest that declares a different set of agents is then a new subject with no alignment of its own, offered for locking, and the old subject's card receives no new ASPs. Set a deployment identity to see a manifest change as drift. |
 
 A v1 bundle compared with a v2 baseline (or the reverse) is
 `CONTRACT_MISMATCH`. v1 comparisons still emit contract v1 unchanged.

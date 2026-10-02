@@ -41,6 +41,7 @@ from .asp import (
     MAX_DRIFT_PAGE_SIZE,
     bundle_digest,
     compare_alignment,
+    identity_problems,
     parse_bundle,
     resolve_identity,
 )
@@ -659,6 +660,15 @@ class Store:
             asp = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
             if asp is None:
                 raise KeyError("no such ASP")
+            # Every later compare validates this identity; one stored that it
+            # rejects would fail every ingest for that identity from then on.
+            problems = identity_problems(
+                self._identity_object(asp["identity_kind"], asp["identity_value"])
+            )
+            if problems:
+                raise ValueError(
+                    "this ASP's identity cannot be locked as a baseline: " + "; ".join(problems)
+                )
             alignment_id = f"aspver-{uuid.uuid4()}"
             locked_at = self._now()
             try:
