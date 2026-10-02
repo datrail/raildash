@@ -314,3 +314,76 @@ def test_a_v2_asps_multi_agent_identity_renders_as_a_readable_list(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_a_v2_baseline_locks_from_the_ui_and_drift_names_the_agent(tmp_path):
+    """DR-109: a multi-agent collection used to fail on "Lock this as your
+    alignment baseline"; it now locks, and a sibling that vanished shows up
+    as drift on that agent, not as an unlabeled attribute list."""
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    store.load_asp(_v2_bundle_bytes_no_deployment_identity(bundle_id="bnd-browser-v2-lock"))
+    store.close()
+
+    vanished = json.loads(
+        _v2_bundle_bytes_no_deployment_identity(bundle_id="bnd-browser-v2-vanished")
+    )
+    vanished["collected_at"] = "2026-09-24T05:00:00Z"
+    vanished["agents"][1]["discovery_status"] = "not_found"
+    vanished["agents"][1]["attributes"] = {}
+    vanished_path = tmp_path / "vanished-bundle.json"
+    vanished_path.write_text(json.dumps(vanished, sort_keys=True))
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [
+            sys.executable, "-m", "raildash.cli",
+            "--db", str(database),
+            "serve", "--host", "127.0.0.1", "--port", str(port),
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on(
+                "console",
+                lambda message: errors.append(message.text) if message.type == "error" else None,
+            )
+            page.on("pageerror", lambda error: errors.append(str(error)))
+
+            page.goto(url, wait_until="networkidle")
+            card = page.locator(".asp-state-card").first
+            with page.expect_response(
+                lambda response: response.url.endswith("/lock") and response.status == 201
+            ):
+                card.get_by_role("button", name="Lock this as your alignment baseline").click()
+            page.wait_for_selector(".asp-state-card:has-text('Aligned')")
+
+            page.locator("#asp-upload-input").set_input_files(str(vanished_path))
+            page.wait_for_selector("#asp-upload-status:has-text('Loaded as asp-')")
+            page.wait_for_selector(".asp-state-card:has-text('Drift detected')")
+
+            drifted_card = page.locator(".asp-state-card", has_text="Drift detected").first
+            diff_text = drifted_card.locator(".asp-diff-table").inner_text()
+            assert "AGENT_CHANGED · agent executor" in diff_text
+            assert '"not_found"' in diff_text
+            assert "ATTRIBUTE_REMOVED · executor · approval_policy" in diff_text
+            assert "aardvark" not in diff_text
+
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

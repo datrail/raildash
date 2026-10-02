@@ -249,6 +249,15 @@ function statePresentation(name) {
   return states[name] || ["Comparison unavailable", "warn"];
 }
 
+// DR-109: a v2 (multi-agent) comparison scopes every change -- null is the
+// shared sandbox, otherwise one agent_key. A v1 change carries no scope.
+function changeLabel(change) {
+  if (!("agent_key" in change)) return change.name;
+  if (change.type.startsWith("AGENT_")) return `agent ${change.name}`;
+  if (change.agent_key === null) return `sandbox · ${change.name}`;
+  return `${change.agent_key} · ${change.name}`;
+}
+
 function renderDriftGroups(result) {
   const wrapper = el("div", "asp-drift-groups");
   const groups = new Map();
@@ -263,7 +272,7 @@ function renderDriftGroups(result) {
     const list = el("ul");
     changes.forEach((change) => {
       const item = el("li");
-      item.append(el("span", "asp-change-name", change.name));
+      item.append(el("span", "asp-change-name", changeLabel(change)));
       item.append(el("span", "asp-change-type", change.type));
       if ((change.fields || []).length) {
         item.append(el("span", "asp-change-fields", change.fields.join(", ")));
@@ -383,7 +392,7 @@ function describeEvidenceRecord(record) {
 
 function renderDiffRow(change) {
   const row = el("div", "asp-diff-row");
-  row.append(el("span", "asp-change-name", `${change.type} · ${change.name}`));
+  row.append(el("span", "asp-change-name", `${change.type} · ${changeLabel(change)}`));
   const dl = el("dl");
   dl.append(el("dt", null, "Before"));
   dl.append(el("dd", "asp-diff-old", describeEvidenceRecord(change.baseline)));

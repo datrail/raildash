@@ -158,11 +158,128 @@ def test_v2_bundle_is_stored_and_read_back_exactly(tmp_path):
     store.close()
 
 
-def test_locking_a_v2_bundle_as_a_baseline_is_refused_by_name(tmp_path):
+def _v2_variant(*, bundle_id: str, mutate) -> bytes:
+    value = json.loads(v2_bundle(bundle_id=bundle_id))
+    value["collected_at"] = "2026-09-24T04:00:00Z"
+    mutate(value)
+    return json.dumps(value, sort_keys=True).encode()
+
+
+def _validate_drift(result: dict, version: int) -> None:
+    from jsonschema import Draft202012Validator
+
+    schema = json.loads(
+        (REPO_ROOT / "raildash" / "schemas" / f"drift-result-v{version}.schema.json").read_text()
+    )
+    # drift_page adds its own paging fields around the stored result.
+    stored = {key: value for key, value in result.items() if key in schema["properties"]}
+    Draft202012Validator(schema).validate(stored)
+
+
+def test_a_v2_baseline_locks_and_a_vanished_agent_is_drift(tmp_path):
+    # DR-109: a multi-agent collection could be loaded but not locked, so a
+    # RailMon target-manifest deployment got no drift detection at all.
     store = Store(tmp_path / "raildash.db")
-    loaded = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-lock"))
-    with pytest.raises(ValueError, match=r"v2.*not supported yet"):
+    baseline = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-lock"))
+    version = store.lock_alignment(baseline["asp_id"], "v1.0")
+    assert version["contract"] == {"bundle_version": 2, "rule_pack_version": 1}
+    store.switch_alignment(version["alignment_version_id"])
+    assert store.asp_state(baseline["asp_id"])["state"] == "ALIGNED"
+
+    replay = store.load_asp(_v2_variant(bundle_id="bnd-custody-v2-replay", mutate=lambda v: None))
+    replay_drift = store.drift_page(replay["asp_id"])
+    _validate_drift(replay_drift, 2)
+    assert store.asp_state(replay["asp_id"])["state"] == "ALIGNED"
+    assert replay_drift["drift_contract_version"] == 2
+
+    def vanish(value: dict) -> None:
+        agent = value["agents"][0]
+        agent["discovery_status"] = "not_found"
+        agent["attributes"] = {}
+
+    gone = store.load_asp(_v2_variant(bundle_id="bnd-custody-v2-gone", mutate=vanish))
+    assert store.asp_state(gone["asp_id"])["state"] == "DRIFT_DETECTED"
+    drift = store.drift_page(gone["asp_id"])
+    _validate_drift(drift, 2)
+    assert drift["changes"][0] == {
+        "agent_key": "executor",
+        "type": "AGENT_CHANGED",
+        "name": "executor",
+        "fields": ["discovery_status"],
+    }
+    assert {c["type"] for c in drift["changes"][1:]} == {"ATTRIBUTE_REMOVED"}
+    assert {c["agent_key"] for c in drift["changes"]} == {"executor"}
+
+    explained = store.drift_explained(gone["asp_id"])
+    assert explained["changes"][0]["baseline"] == {"discovery_status": "available"}
+    assert explained["changes"][0]["current"] == {"discovery_status": "not_found"}
+    removed = explained["changes"][1]
+    assert removed["baseline"] is not None and removed["current"] is None
+    store.close()
+
+
+def test_a_v2_drift_names_the_scope_it_happened_in(tmp_path):
+    store = Store(tmp_path / "raildash.db")
+    baseline = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-scope"))
+    version = store.lock_alignment(baseline["asp_id"], "v1.0")
+    store.switch_alignment(version["alignment_version_id"])
+
+    def add_sibling_and_change_mounts(value: dict) -> None:
+        sibling = copy.deepcopy(value["agents"][0])
+        sibling["agent_key"] = "planner"
+        value["agents"].append(sibling)
+        value["agents"].sort(key=lambda agent: agent["agent_key"])
+        value["sandbox"]["attributes"]["mounts"]["note"] = "mounts moved"
+        value["agents"][0]["attributes"]["declared_destinations"]["value"] = ["new.example"]
+
+    current = store.load_asp(
+        _v2_variant(bundle_id="bnd-custody-v2-scope-2", mutate=add_sibling_and_change_mounts)
+    )
+    drift = store.drift_page(current["asp_id"])
+    _validate_drift(drift, 2)
+    assert [(c["agent_key"], c["type"], c["name"]) for c in drift["changes"]] == [
+        (None, "ATTRIBUTE_CHANGED", "mounts"),
+        ("planner", "AGENT_ADDED", "planner"),
+        ("executor", "ATTRIBUTE_CHANGED", "declared_destinations"),
+    ]
+    explained = store.drift_explained(current["asp_id"])["changes"]
+    assert explained[0]["current"]["note"] == "mounts moved"
+    assert explained[1]["baseline"] is None
+    assert explained[1]["current"] == {"discovery_status": "available"}
+    assert explained[2]["baseline"]["value"] != ["new.example"]
+    assert explained[2]["current"]["value"] == ["new.example"]
+    store.close()
+
+
+def test_a_lock_refuses_an_identity_every_later_compare_would_reject(tmp_path, monkeypatch):
+    # Defence in depth: ingest validates identity, but a stored identity that
+    # alignment_problems rejects would fail every later ingest for it.
+    import raildash.store as store_module
+
+    monkeypatch.setattr(
+        store_module,
+        "resolve_identity",
+        lambda bundle, agent_key=None: {"kind": "local_agent_keys", "value": ["executor\n"]},
+    )
+    store = Store(tmp_path / "raildash.db")
+    loaded = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-bad-identity"))
+    with pytest.raises(ValueError, match="cannot be locked as a baseline"):
         store.lock_alignment(loaded["asp_id"], "v1.0")
+    store.close()
+
+
+def test_a_v1_bundle_against_a_v2_baseline_is_not_comparable(tmp_path):
+    # Same deployment identity, different evidence shape: comparing would
+    # report every attribute as moved between scopes, so it is refused.
+    store = Store(tmp_path / "raildash.db")
+    baseline = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-mixed"))
+    version = store.lock_alignment(baseline["asp_id"], "v1.0")
+    store.switch_alignment(version["alignment_version_id"])
+    current = store.load_asp(changed_bundle(bundle_id="bnd-custody-v1-after-v2"))
+    drift = store.drift_page(current["asp_id"])
+    _validate_drift(drift, 2)
+    assert drift["comparable"] is False
+    assert drift["reason"] == "CONTRACT_MISMATCH"
     store.close()
 
 

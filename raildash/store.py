@@ -37,11 +37,11 @@ from .json_safety import (
     check_json_structure,
 )
 from .asp import (
-    BUNDLE_VERSION,
     DEFAULT_DRIFT_PAGE_SIZE,
     MAX_DRIFT_PAGE_SIZE,
     bundle_digest,
     compare_alignment,
+    identity_problems,
     parse_bundle,
     resolve_identity,
 )
@@ -660,16 +660,14 @@ class Store:
             asp = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
             if asp is None:
                 raise KeyError("no such ASP")
-            if asp["bundle_version"] != BUNDLE_VERSION:
-                # Locking is alignment/drift comparison's entry point, and that
-                # machinery (alignment_problems, compare_alignment) is v1-only
-                # today (DR-109 M3 is where multi-agent attribution and
-                # comparison land) -- refuse by name here rather than letting
-                # a later drift compare crash on an alignment contract it
-                # can't validate.
+            # Every later compare validates this identity; one stored that it
+            # rejects would fail every ingest for that identity from then on.
+            problems = identity_problems(
+                self._identity_object(asp["identity_kind"], asp["identity_value"])
+            )
+            if problems:
                 raise ValueError(
-                    f"locking an evidence bundle v{asp['bundle_version']} as a baseline "
-                    f"is not supported yet (only v{BUNDLE_VERSION})"
+                    "this ASP's identity cannot be locked as a baseline: " + "; ".join(problems)
                 )
             alignment_id = f"aspver-{uuid.uuid4()}"
             locked_at = self._now()
@@ -928,13 +926,40 @@ class Store:
         baseline = detail["baseline"]
         current = detail["current"]
 
-        def lookup(kind: str, name: str) -> tuple[Any, Any]:
+        def scope_of(bundle: dict[str, Any], change: dict[str, Any]) -> dict[str, Any] | None:
+            # A v1 bundle is its own single scope. A v2 change names its
+            # scope: null is the shared sandbox, otherwise one agent_key.
+            if "agent_key" not in change:
+                return bundle
+            if change["agent_key"] is None:
+                return bundle["sandbox"]
+            for agent in bundle["agents"]:
+                if agent["agent_key"] == change["agent_key"]:
+                    return agent
+            return None
+
+        def lookup(kind: str, change: dict[str, Any]) -> tuple[Any, Any]:
+            name = change["name"]
+            if kind in ("ATTRIBUTE", "SOURCE", "AGENT"):
+                before_scope = scope_of(baseline, change)
+                after_scope = scope_of(current, change)
+            if kind == "AGENT":
+                # The agent's discovery outcome, not its whole scope: its
+                # attribute and source changes are listed separately.
+                return tuple(
+                    None if scope is None
+                    else {"discovery_status": scope["discovery_status"]}
+                    for scope in (before_scope, after_scope)
+                )
             if kind == "ATTRIBUTE":
-                return baseline["attributes"].get(name), current["attributes"].get(name)
+                return tuple(
+                    None if scope is None else scope["attributes"].get(name)
+                    for scope in (before_scope, after_scope)
+                )
             if kind == "SOURCE":
-                return (
-                    baseline["inputs_attempted"].get(name),
-                    current["inputs_attempted"].get(name),
+                return tuple(
+                    None if scope is None else scope["inputs_attempted"].get(name)
+                    for scope in (before_scope, after_scope)
                 )
             baseline_by_id = {a["id"]: a for a in baseline.get("attestations", [])}
             current_by_id = {a["id"]: a for a in current.get("attestations", [])}
@@ -944,7 +969,7 @@ class Store:
         explained = []
         for change in all_changes[offset : offset + limit]:
             kind = change["type"].split("_")[0]
-            before, after = lookup(kind, change["name"])
+            before, after = lookup(kind, change)
             explained.append({**change, "baseline": before, "current": after})
 
         return {

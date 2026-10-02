@@ -54,7 +54,7 @@ def alignment(
         "locked_at": "2026-09-24T00:01:00Z",
         "agent_identity": identity or resolve_identity(baseline),
         "contract": {
-            "bundle_version": 1,
+            "bundle_version": baseline["bundle_version"],
             "rule_pack_version": rule_pack_version,
         },
         "asp": {"asp_id": "asp-fixture-001", "digest": bundle_digest(baseline_raw)},
@@ -653,3 +653,103 @@ def test_v2_attestation_ref_must_resolve_in_either_scope():
         problem == "agents[0].attributes.framework_identity.attestation_ref: does not resolve"
         for problem in problems
     ), problems
+
+
+def _keys_only_v2(*keys: str) -> dict:
+    """A v2 collection with no deployment identity, so it resolves to its
+    sorted agent keys (`local_agent_keys`)."""
+    value = _v2_bundle()
+    value["sandbox"]["attributes"]["deployment"]["status"] = "ABSENT"
+    value["sandbox"]["attributes"]["deployment"]["value"] = None
+    del value["sandbox"]["attributes"]["deployment"]["authored_by"]
+    template = value["agents"][0]
+    value["agents"] = [{**copy.deepcopy(template), "agent_key": key} for key in sorted(keys)]
+    return value
+
+
+def test_a_v2_alignment_compares_scope_by_scope_under_contract_v2():
+    # DR-109: locking a multi-agent collection used to be refused outright.
+    baseline_raw = raw(_keys_only_v2("executor", "planner"))
+    active = alignment(baseline_raw)
+    assert alignment_problems(active) == []
+    assert active["agent_identity"] == {"kind": "local_agent_keys", "value": ["executor", "planner"]}
+
+    same = compare_alignment(active, baseline_raw, baseline_raw)
+    validate("drift-result-v2.schema.json", same)
+    assert same["drift_contract_version"] == 2
+    assert same["has_drift"] is False
+
+    current = _keys_only_v2("executor", "planner")
+    current["bundle_id"] = "bnd-fixture-v2-next"
+    current["agents"][1]["discovery_status"] = "not_found"
+    current["agents"][1]["attributes"].pop("tool_names")
+    result = compare_alignment(active, baseline_raw, raw(current))
+    validate("drift-result-v2.schema.json", result)
+    assert result["changes"] == [
+        {"agent_key": "planner", "type": "AGENT_CHANGED", "name": "planner", "fields": ["discovery_status"]},
+        {"agent_key": "planner", "type": "ATTRIBUTE_REMOVED", "name": "tool_names", "fields": []},
+    ]
+
+
+def test_a_changed_agent_key_set_is_a_different_identity_not_drift():
+    # With no deployment identity the declared keys *are* the identity, so a
+    # manifest that declares another agent is a different subject. Agents
+    # that disappear at runtime stay declared and show up as not_found.
+    baseline_raw = raw(_keys_only_v2("executor", "planner"))
+    result = compare_alignment(
+        alignment(baseline_raw), baseline_raw, raw(_keys_only_v2("executor"))
+    )
+    validate("drift-result-v2.schema.json", result)
+    assert result["reason"] == "IDENTITY_MISMATCH"
+
+
+def test_a_v1_comparison_still_emits_contract_v1_exactly():
+    result = compare_alignment(alignment(), BASELINE_RAW, BASELINE_RAW)
+    validate("drift-result-v1.schema.json", result)
+    assert result["drift_contract_version"] == 1
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[], ["planner", "executor"], ["executor", "executor"], ["Executor"], "executor"],
+)
+def test_a_local_agent_keys_identity_must_be_a_sorted_unique_key_list(value):
+    active = alignment(raw(_keys_only_v2("executor")))
+    active["agent_identity"]["value"] = value
+    assert "agent_identity.value: invalid local agent_key list" in alignment_problems(active)
+
+
+@pytest.mark.parametrize("keys", [("executor",), ("executor", "planner")])
+def test_a_v2_alignment_and_its_binding_pass_the_published_schemas(keys):
+    active = alignment(raw(_keys_only_v2(*keys)))
+    validate("alignment-version-v1.schema.json", active)
+    validate(
+        "active-binding-v1.schema.json",
+        {
+            "binding_contract_version": 1,
+            "agent_identity": active["agent_identity"],
+            "alignment_version_id": active["alignment_version_id"],
+            "switched_at": "2026-09-24T00:02:00Z",
+        },
+    )
+    Draft202012Validator.check_schema(
+        json.loads((SCHEMAS / "drift-result-v2.schema.json").read_text(encoding="utf-8"))
+    )
+
+
+def test_a_v2_agent_key_with_a_trailing_newline_is_refused():
+    # The schema pattern is a search, where `$` matches before a final "\n";
+    # the key would otherwise become an identity no alignment accepts.
+    value = _keys_only_v2("executor")
+    value["agents"][0]["agent_key"] = "executor\n"
+    assert "agents[0].agent_key: invalid agent_key" in bundle_problems(value)
+
+
+@pytest.mark.parametrize("namespace", ["", " ", 7])
+def test_a_v2_deployment_value_is_held_to_the_v1_shape(namespace):
+    value = _v2_bundle()
+    value["sandbox"]["attributes"]["deployment"]["value"]["RAIL_NAMESPACE"] = namespace
+    assert any(
+        problem.startswith("sandbox.attributes.deployment.value")
+        for problem in bundle_problems(value)
+    )

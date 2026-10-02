@@ -31,12 +31,21 @@ _VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
 SCHEMA_V2_PATH = Path(__file__).resolve().parent / "schemas" / "evidence-bundle-v2.schema.json"
 SCHEMA_V2: dict[str, Any] = json.loads(SCHEMA_V2_PATH.read_text())
 _VALIDATOR_V2 = Draft202012Validator(SCHEMA_V2, format_checker=FormatChecker())
+# v2's generic attribute definition leaves an ANSWERED `deployment` value
+# unconstrained; it is held to v1's shape, because it is the same identity.
+_DEPLOYMENT_VALUE_VALIDATOR = Draft202012Validator(
+    {**SCHEMA["$defs"]["deployment_value"], "$schema": SCHEMA["$schema"]}
+)
 
 BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 BUNDLE_VERSION_V2 = SCHEMA_V2["properties"]["bundle_version"]["const"]
 DEFAULT_AGENT_KEY = "default"
 ALIGNMENT_CONTRACT_VERSION = 1
 DRIFT_CONTRACT_VERSION = 1
+# DR-109: comparing two evidence-bundle v2 collections. Contract v1 stays
+# exactly what a v1 comparison emits; v2 adds the `agent_key` scope every
+# change carries (null for the shared sandbox scope) and the AGENT_* changes.
+DRIFT_CONTRACT_VERSION_V2 = 2
 # The shipped redacted RailMon sample is about 5 KiB.  The contract suite's
 # valid 1,000-attribute high-cardinality bundle is about 432 KiB, so 1 MiB gives
 # it more than 2x headroom while avoiding the webhook's much larger interaction
@@ -57,8 +66,9 @@ DEPLOYMENT_COMPOSE_KEYS = (
 DEPLOYMENT_KEYS = frozenset((*DEPLOYMENT_ENV_KEYS, *DEPLOYMENT_COMPOSE_KEYS))
 DEPLOYMENT_VALUE_MAX_BYTES = 253
 IDENTITY_KINDS = frozenset(
-    {"deployment_environment", "deployment_compose", "local_agent_key"}
+    {"deployment_environment", "deployment_compose", "local_agent_key", "local_agent_keys"}
 )
+_V2_AGENT_KEY = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 NON_COMPARABLE_REASONS = frozenset(
     {
         "IDENTITY_MISMATCH",
@@ -81,6 +91,8 @@ CHANGE_TYPES = frozenset(
         "ATTESTATION_CHANGED",
     }
 )
+CHANGE_TYPES_V2 = CHANGE_TYPES | {"AGENT_ADDED", "AGENT_REMOVED", "AGENT_CHANGED"}
+AGENT_FIELD_ORDER = ("discovery_status",)
 ATTRIBUTE_FIELD_ORDER = (
     "value",
     "status",
@@ -238,7 +250,8 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
     share an id; `agents[].agent_key` is sorted ascending, unique, and never
     the reserved `"default"` (kept for the unkeyed v1-compatible path); and
     `collected_at` must be UTC, for the same reason v1 requires it (see
-    `_semantic_problems`)."""
+    `_semantic_problems`); and an ANSWERED sandbox `deployment` value has
+    v1's shape and byte bound, since it resolves to the same identity."""
     problems: list[str] = []
     collected_at = bundle.get("collected_at")
     if isinstance(collected_at, str):
@@ -264,6 +277,15 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
     sandbox = bundle.get("sandbox")
     sandbox_attributes = sandbox.get("attributes") if isinstance(sandbox, dict) else None
     problems.extend(_attestation_ref_problems("sandbox.attributes", sandbox_attributes, attestation_ids))
+    deployment = (sandbox_attributes or {}).get("deployment") if isinstance(sandbox_attributes, dict) else None
+    if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
+        value = deployment.get("value")
+        for error in _DEPLOYMENT_VALUE_VALIDATOR.iter_errors(value):
+            problems.append(f"sandbox.attributes.deployment.value: {error.message}")
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
+                    problems.append(f"sandbox.attributes.deployment.value.{key}: exceeds byte bound")
 
     agents = bundle.get("agents")
     agent_keys: list[str] = []
@@ -273,6 +295,10 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
         agent_key = agent.get("agent_key")
         if isinstance(agent_key, str):
             agent_keys.append(agent_key)
+            # The schema's `pattern` is a search, where `$` also matches
+            # before a trailing newline; the key becomes an identity.
+            if not _V2_AGENT_KEY.fullmatch(agent_key):
+                problems.append(f"agents[{index}].agent_key: invalid agent_key")
         problems.extend(
             _attestation_ref_problems(
                 f"agents[{index}].attributes", agent.get("attributes"), attestation_ids
@@ -345,7 +371,11 @@ def resolve_identity(
 
 
 def alignment_problems(alignment: Any) -> list[str]:
-    """Validate the closed alignment-version v1 object used by comparison."""
+    """Validate the closed alignment-version v1 object used by comparison.
+
+    Contract v1 of the alignment object covers both evidence-bundle
+    versions: only `contract.bundle_version` and the identity kind differ.
+    """
     if not isinstance(alignment, dict):
         return ["alignment version must be an object"]
     required = {
@@ -365,14 +395,17 @@ def alignment_problems(alignment: Any) -> list[str]:
     for key in ("alignment_version_id", "version"):
         _bounded_string(alignment.get(key), key, 1, None, problems)
     _date_time(alignment.get("locked_at"), "locked_at", problems)
-    problems.extend(_identity_problems(alignment.get("agent_identity")))
+    problems.extend(identity_problems(alignment.get("agent_identity")))
     contract = alignment.get("contract")
     if not isinstance(contract, dict) or set(contract) != {
         "bundle_version",
         "rule_pack_version",
     }:
         problems.append("contract: must contain only bundle_version and rule_pack_version")
-    elif contract.get("bundle_version") != BUNDLE_VERSION or not _positive_integer(
+    elif contract.get("bundle_version") not in (
+        BUNDLE_VERSION,
+        BUNDLE_VERSION_V2,
+    ) or not _positive_integer(
         contract.get("rule_pack_version")
     ):
         problems.append("contract: unsupported bundle or rule-pack version")
@@ -399,13 +432,19 @@ def compare_alignment(
     problems = alignment_problems(alignment)
     if problems:
         raise ValueError("invalid alignment version: " + "; ".join(problems[:5]))
+    is_v2 = alignment["contract"]["bundle_version"] == BUNDLE_VERSION_V2
+    contract_version = DRIFT_CONTRACT_VERSION_V2 if is_v2 else DRIFT_CONTRACT_VERSION
+
+    def not_comparable(reason: str) -> dict[str, Any]:
+        return _not_comparable(reason, contract_version)
+
     if bundle_digest(baseline_raw) != alignment["asp"]["digest"]:
-        return _not_comparable("ALIGNMENT_INTEGRITY_FAILED")
+        return not_comparable("ALIGNMENT_INTEGRITY_FAILED")
     try:
         baseline = parse_bundle(baseline_raw)
         current = parse_bundle(current_raw)
     except BundleValidationError:
-        return _not_comparable("INVALID_BUNDLE")
+        return not_comparable("INVALID_BUNDLE")
 
     expected_contract = alignment["contract"]
     for bundle in (baseline, current):
@@ -413,7 +452,7 @@ def compare_alignment(
             bundle["bundle_version"] != expected_contract["bundle_version"]
             or bundle["rule_pack_version"] != expected_contract["rule_pack_version"]
         ):
-            return _not_comparable("CONTRACT_MISMATCH")
+            return not_comparable("CONTRACT_MISMATCH")
 
     expected_identity = alignment["agent_identity"]
     baseline_key = (
@@ -425,16 +464,16 @@ def compare_alignment(
         baseline_identity = resolve_identity(baseline, baseline_key)
         current_identity = resolve_identity(current, current_agent_key)
     except IdentityRequiredError:
-        return _not_comparable("IDENTITY_MISMATCH")
+        return not_comparable("IDENTITY_MISMATCH")
     if baseline_identity != expected_identity:
-        return _not_comparable("ALIGNMENT_INTEGRITY_FAILED")
+        return not_comparable("ALIGNMENT_INTEGRITY_FAILED")
     if current_identity != expected_identity:
-        return _not_comparable("IDENTITY_MISMATCH")
+        return not_comparable("IDENTITY_MISMATCH")
 
-    changes = _bundle_changes(baseline, current)
+    changes = _bundle_changes_v2(baseline, current) if is_v2 else _bundle_changes(baseline, current)
     total = len(changes)
     result = {
-        "drift_contract_version": DRIFT_CONTRACT_VERSION,
+        "drift_contract_version": contract_version,
         "comparable": True,
         "has_drift": bool(changes),
         "reason": None,
@@ -458,11 +497,13 @@ def _serialized_size(value: dict[str, Any]) -> int:
     )
 
 
-def _not_comparable(reason: str) -> dict[str, Any]:
+def _not_comparable(
+    reason: str, contract_version: int = DRIFT_CONTRACT_VERSION
+) -> dict[str, Any]:
     if reason not in NON_COMPARABLE_REASONS:
         raise ValueError(f"unknown non-comparable reason: {reason}")
     return {
-        "drift_contract_version": DRIFT_CONTRACT_VERSION,
+        "drift_contract_version": contract_version,
         "comparable": False,
         "has_drift": None,
         "reason": reason,
@@ -501,6 +542,71 @@ def _bundle_changes(
     current_attestations = {entry["id"]: entry for entry in current.get("attestations", [])}
     changes.extend(
         _map_changes(
+            baseline_attestations,
+            current_attestations,
+            "ATTESTATION",
+            ATTESTATION_FIELD_ORDER,
+            ignored_fields={"id"},
+        )
+    )
+    return changes
+
+
+def _scope_changes(
+    scope: dict[str, Any], baseline: dict[str, Any], current: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """One v2 scope's attribute and source changes, each tagged with the
+    scope's `agent_key` (null for the shared sandbox scope)."""
+    changes = _map_changes(
+        _comparison_attributes(baseline["attributes"]),
+        _comparison_attributes(current["attributes"]),
+        "ATTRIBUTE",
+        ATTRIBUTE_FIELD_ORDER,
+    )
+    changes.extend(
+        _map_changes(
+            baseline["inputs_attempted"],
+            current["inputs_attempted"],
+            "SOURCE",
+            SOURCE_FIELD_ORDER,
+        )
+    )
+    return [{**scope, **change} for change in changes]
+
+
+def _bundle_changes_v2(
+    baseline: dict[str, Any], current: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Compare two evidence-bundle v2 collections scope by scope (DR-109).
+
+    The shared sandbox scope comes first, then every agent in `agent_key`
+    order, then the collection's attestations -- the same per-scope order v1
+    uses for its one scope. An agent present on only one side is one
+    AGENT_ADDED/AGENT_REMOVED change, not a removal of each of its
+    attributes; an agent whose `discovery_status` moved (an `available`
+    agent RailMon can no longer find is `not_found`) is AGENT_CHANGED,
+    followed by whatever its attributes and sources did as a result.
+    """
+    changes = _scope_changes({"agent_key": None}, baseline["sandbox"], current["sandbox"])
+    baseline_agents = {agent["agent_key"]: agent for agent in baseline["agents"]}
+    current_agents = {agent["agent_key"]: agent for agent in current["agents"]}
+    for key in sorted(baseline_agents.keys() - current_agents.keys()):
+        changes.append({"agent_key": key, "type": "AGENT_REMOVED", "name": key, "fields": []})
+    for key in sorted(current_agents.keys() - baseline_agents.keys()):
+        changes.append({"agent_key": key, "type": "AGENT_ADDED", "name": key, "fields": []})
+    for key in sorted(baseline_agents.keys() & current_agents.keys()):
+        before, after = baseline_agents[key], current_agents[key]
+        fields = [field for field in AGENT_FIELD_ORDER if before[field] != after[field]]
+        if fields:
+            changes.append(
+                {"agent_key": key, "type": "AGENT_CHANGED", "name": key, "fields": fields}
+            )
+        changes.extend(_scope_changes({"agent_key": key}, before, after))
+    baseline_attestations = {entry["id"]: entry for entry in baseline.get("attestations", [])}
+    current_attestations = {entry["id"]: entry for entry in current.get("attestations", [])}
+    changes.extend(
+        {"agent_key": None, **change}
+        for change in _map_changes(
             baseline_attestations,
             current_attestations,
             "ATTESTATION",
@@ -553,13 +659,22 @@ def _map_changes(
     return changes
 
 
-def _identity_problems(identity: Any) -> list[str]:
+def identity_problems(identity: Any) -> list[str]:
     if not isinstance(identity, dict) or set(identity) != {"kind", "value"}:
         return ["agent_identity: must contain only kind and value"]
     kind = identity.get("kind")
     if kind not in IDENTITY_KINDS:
         return ["agent_identity.kind: unsupported"]
     value = identity.get("value")
+    if kind == "local_agent_keys":
+        if (
+            not isinstance(value, list)
+            or not value
+            or any(not isinstance(key, str) or not _V2_AGENT_KEY.fullmatch(key) for key in value)
+            or value != sorted(set(value))
+        ):
+            return ["agent_identity.value: invalid local agent_key list"]
+        return []
     if kind == "local_agent_key":
         if (
             not isinstance(value, str)
