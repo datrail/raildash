@@ -44,11 +44,26 @@ jobs:
         with:
           python-version: "3.13"
 
+      # RailMon produces the evidence bundles RailDash validates against its
+      # vendored copy of RailMon's schemas. The drift test compares the two
+      # byte for byte and fails (rather than skips) under CI when RailMon's
+      # copy is missing. Its default branch, not a pin: a RailMon schema change
+      # RailDash has not re-vendored is exactly the break to surface here.
+      # Sparse, so pytest never sees RailMon's own tests.
+      - uses: actions/checkout@v4
+        with:
+          repository: datrail/railmon
+          path: .ci/railmon
+          sparse-checkout: schemas
+          persist-credentials: false
+
       # `make test` builds its own virtualenv and installs requirements-dev,
       # so this needs no separate pip step and the local and CI runs are the
       # same command. RailDash does have dependencies — FastAPI and uvicorn —
       # unlike the stdlib-only scanner.
       - run: make test
+        env:
+          RAILMON_SCHEMAS_DIR: ${{ github.workspace }}/.ci/railmon/schemas
 
       # Exercise the real local server and ASP database in Chromium. Keeping
       # this in the existing test job makes a UI regression a required PR
