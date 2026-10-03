@@ -1188,8 +1188,8 @@ class Store:
                    COALESCE(SUM(tool_calls), 0)        AS tool_calls,
                    AVG(latency_ms)                     AS avg_latency_ms,
                    MAX(latency_ms)                     AS max_latency_ms,
-                   COALESCE(SUM(request_size), 0)      AS request_bytes,
-                   COALESCE(SUM(response_size), 0)     AS response_bytes,
+                   TOTAL(request_size)                 AS request_bytes,
+                   TOTAL(response_size)                AS response_bytes,
                    COALESCE(SUM(attribution_state IN {UNATTRIBUTED_SQL}), 0)
                                                        AS unattributed
             FROM interactions {where}
@@ -1227,8 +1227,14 @@ class Store:
             params,
         ).fetchall()
 
+        # TOTAL, not SUM: two captured sizes near 2**63 overflow SUM and
+        # would fail this view outright.
+        totals_out = dict(totals) if totals else {}
+        for key in ("request_bytes", "response_bytes"):
+            if key in totals_out:
+                totals_out[key] = int(totals_out[key])
         return {
-            "totals": dict(totals) if totals else {},
+            "totals": totals_out,
             "hosts": [dict(r) for r in hosts],
             "models": [dict(r) for r in models],
             "statuses": [dict(r) for r in statuses],
@@ -1342,6 +1348,39 @@ class Store:
             for kind in row["content_kinds"].split(","):
                 content_kind_counts[kind] = content_kind_counts.get(kind, 0) + row["count"]
 
+        # How much each destination host is sent, from the request size the
+        # capture records (the whole HTTP request, headers included). Without
+        # it, a host the agent already uses could start receiving files many
+        # times the usual size and change no host, method, model or tool.
+        # The size is whatever the capture said, so only a positive integer
+        # counts (SQLite orders text above every number), and TOTAL cannot
+        # overflow the way SUM can.
+        upload_rows = self._db.execute(
+            f"""SELECT substr(host, 1, ?) AS value,
+                       COUNT(*) AS count,
+                       TOTAL(request_size) AS total_bytes,
+                       MAX(request_size) AS max_bytes,
+                       MAX(length(host) > ?) AS value_truncated
+                FROM interactions
+                WHERE {scope} AND host IS NOT NULL AND host != ''
+                      AND typeof(request_size) = 'integer' AND request_size > 0
+                GROUP BY substr(host, 1, ?)
+                ORDER BY total_bytes DESC, value
+                LIMIT ?""",
+            (
+                MAX_PROFILE_VALUE_CHARS,
+                MAX_PROFILE_VALUE_CHARS,
+                *scope_params,
+                MAX_PROFILE_VALUE_CHARS,
+                MAX_PROFILE_DIMENSION_VALUES + 1,
+            ),
+        ).fetchall()
+        if len(upload_rows) > MAX_PROFILE_DIMENSION_VALUES:
+            mark_truncated("upload_bytes")
+            upload_rows = upload_rows[:MAX_PROFILE_DIMENSION_VALUES]
+        if any(row["value_truncated"] for row in upload_rows):
+            mark_truncated("upload_bytes")
+
         interaction_count = int(totals["interactions"])
         error_count = int(totals["errors"])
         ticket_count = int(totals["ticket_interactions"])
@@ -1387,6 +1426,15 @@ class Store:
                         content_kind_counts.items(), key=lambda item: (-item[1], item[0])
                     )
                 ],
+                "upload_bytes": [
+                    {
+                        "value": row["value"],
+                        "count": row["count"],
+                        "total_bytes": int(row["total_bytes"]),
+                        "max_bytes": int(row["max_bytes"]),
+                    }
+                    for row in upload_rows
+                ],
                 "truncated_dimensions": [
                     label
                     for label in (
@@ -1395,6 +1443,7 @@ class Store:
                         "models",
                         "tool_names",
                         "request_media_types",
+                        "upload_bytes",
                     )
                     if label in truncated_dimensions
                 ],

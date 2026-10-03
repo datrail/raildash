@@ -586,7 +586,7 @@ components:
             agent_key: {type: string}
         observed:
           type: object
-          required: [interaction_count, error_count, error_rate, x_rail, hosts, methods, models, tool_names, tool_names_truncated, request_media_types, content_kinds, truncated_dimensions]
+          required: [interaction_count, error_count, error_rate, x_rail, hosts, methods, models, tool_names, tool_names_truncated, request_media_types, content_kinds, upload_bytes, truncated_dimensions]
           properties:
             interaction_count: {type: integer}
             error_count: {type: integer}
@@ -624,9 +624,20 @@ components:
                   - properties:
                       value: {type: string, enum: [image, document, audio]}
               description: Media kinds carried in request bodies (e.g. image upload blocks); count is interactions carrying that kind. Never the media itself.
+            upload_bytes:
+              type: array
+              items:
+                allOf:
+                  - {$ref: '#/components/schemas/ObservedValueCount'}
+                  - type: object
+                    required: [total_bytes, max_bytes]
+                    properties:
+                      total_bytes: {type: integer, description: Sum of request sizes sent to this host.}
+                      max_bytes: {type: integer, description: Largest single request sent to this host.}
+              description: Bytes sent per destination host, largest total first; value is the host, count is interactions with a positive recorded request size. A request size is the whole captured HTTP request, headers included.
             truncated_dimensions:
               type: array
-              items: {type: string, enum: [hosts, methods, models, tool_names, request_media_types]}
+              items: {type: string, enum: [hosts, methods, models, tool_names, request_media_types, upload_bytes]}
               description: Dimensions whose cardinality or value-length safety limit was reached.
 
     InteractionSummary:
