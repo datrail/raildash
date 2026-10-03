@@ -568,6 +568,16 @@ components:
         value: {type: string}
         count: {type: integer}
 
+    ObservedFileCount:
+      allOf:
+        - {$ref: '#/components/schemas/ObservedValueCount'}
+        - type: object
+          required: [read, write]
+          properties:
+            read: {type: integer, description: Times a tool call asked to read it.}
+            write: {type: integer, description: Times a tool call asked to create, change or move it.}
+      description: count is read + write.
+
     ObservedProfile:
       type: object
       required: [schema_version, source, authoritative, disclaimer, session, observed]
@@ -586,7 +596,7 @@ components:
             agent_key: {type: string}
         observed:
           type: object
-          required: [interaction_count, error_count, error_rate, x_rail, hosts, methods, models, tool_names, tool_names_truncated, request_media_types, content_kinds, upload_bytes, truncated_dimensions]
+          required: [interaction_count, error_count, error_rate, x_rail, hosts, methods, models, tool_names, tool_names_truncated, request_media_types, content_kinds, upload_bytes, file_access, file_types, truncated_dimensions]
           properties:
             interaction_count: {type: integer}
             error_count: {type: integer}
@@ -635,10 +645,26 @@ components:
                       total_bytes: {type: integer, description: Sum of request sizes sent to this host.}
                       max_bytes: {type: integer, description: Largest single request sent to this host.}
               description: Bytes sent per destination host, largest total first; value is the host, count is interactions with a positive recorded request size. A request size is the whole captured HTTP request, headers included.
+            file_access:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedFileCount'}
+              description: >-
+                Files the model asked a known file tool (Claude Code's Read/Write/Edit family, Anthropic's text editor
+                tool, the MCP filesystem server) to read or write; value is the path as the model
+                wrote it, trimmed and cut to 256 characters. MCP tools match by tool name under any server name. Paths
+                written to come first, then most calls; reading many files never displaces a written one. Each tool_use id counts once per capture however many later
+                requests replay it; a block without an id counts every time it is seen. This is the captured
+                conversation, not a filesystem trace: it does not show that the tool ran or succeeded.
+            file_types:
+              type: array
+              items: {$ref: '#/components/schemas/ObservedFileCount'}
+              description: The same calls grouped by lower-cased file extension, types written to first, then most calls; `(none)` for a path without one, `(other)` for an extension of 16 or more characters.
             truncated_dimensions:
               type: array
-              items: {type: string, enum: [hosts, methods, models, tool_names, request_media_types, upload_bytes]}
-              description: Dimensions whose cardinality or value-length safety limit was reached.
+              items: {type: string, enum: [hosts, methods, models, tool_names, request_media_types, upload_bytes, file_access, file_writes, file_types]}
+              description: >-
+                Dimensions whose cardinality or value-length safety limit was reached. file_writes means the paths in
+                file_access with a write may be incomplete; file_access alone means only read-only paths were cut.
 
     InteractionSummary:
       type: object

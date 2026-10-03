@@ -344,3 +344,105 @@ def test_capture_drift_shows_a_much_larger_upload_to_a_known_host(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_capture_drift_shows_a_file_the_agent_never_wrote_before(tmp_path):
+    """Lebin's file and artifact-write dimensions: same host, model and tool
+    names, but one capture reads a key and writes an archive to a share."""
+    from raildash.ingest import normalise
+    from raildash.store import Store
+
+    def call(interaction_id: str, blocks: list[dict]) -> dict:
+        return {
+            "interaction_id": interaction_id,
+            "request": {
+                "method": "POST",
+                "path": "/v1/messages",
+                "headers": {"host": "api.anthropic.com", "content-type": "application/json"},
+                "body": {"model": "claude-sonnet-5", "messages": [{"role": "user", "content": "tidy up"}]},
+            },
+            "response": {"status_code": 200, "body": {"content": blocks}},
+        }
+
+    def tool(call_id: str, name: str, path: str) -> dict:
+        return {"type": "tool_use", "id": call_id, "name": name, "input": {"file_path": path}}
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    for session_id, rows in (
+        ("usual", [call("a", [
+            tool("a1", "Read", "/app/config.yaml"),
+            tool("a2", "Write", "/app/out.log"),
+        ])]),
+        ("exfil", [call("b", [
+            tool("b1", "Read", "/app/config.yaml"),
+            tool("b2", "Read", "/home/me/.ssh/id_rsa"),
+            tool("b3", "Write", "/srv/share/dump.tar"),
+        ])]),
+    ):
+        store.upsert_session(session_id, agent="agent", source="test")
+        store.add_interactions(session_id, [normalise(row) for row in rows])
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database), "serve",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on(
+                "console",
+                lambda message: errors.append(message.text) if message.type == "error" else None,
+            )
+            page.goto(url, wait_until="networkidle")
+
+            def drift(title: str):
+                return page.locator(".drift-group").filter(
+                    has=page.get_by_role("heading", name=title, exact=True)
+                )
+
+            def changes(title: str) -> dict[str, list[str]]:
+                rows = {}
+                for row in drift(title).locator(".drift-change").all():
+                    kind = row.locator(".drift-kind").inner_text()
+                    rows[kind] = row.locator(".drift-label").all_inner_texts()
+                return rows
+
+            page.locator("#drift-left").select_option("usual")
+            page.locator("#drift-right").select_option("exfil")
+            drift("Files asked to write").locator(".drift-label").first.wait_for()
+            assert changes("Files asked to write") == {
+                "Added": ["/srv/share/dump.tar"], "Removed": ["/app/out.log"],
+            }
+            assert changes("Files asked to read") == {"Added": ["/home/me/.ssh/id_rsa"], "Removed": []}
+            assert changes("File types asked to write") == {"Added": [".tar"], "Removed": [".log"]}
+            # Nothing else about the traffic moved.
+            assert changes("Hosts") == {"Added": [], "Removed": []}
+            assert changes("Tools") == {"Added": [], "Removed": []}
+
+            # The selected capture's observed profile lists the files it touched.
+            files = page.locator(".profile-group").filter(
+                has=page.get_by_role("heading", name="Files", exact=True)
+            )
+            files.locator(".profile-chip").first.wait_for()
+            assert "not a filesystem trace" in files.locator(".note").inner_text()
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

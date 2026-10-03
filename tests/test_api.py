@@ -126,6 +126,9 @@ def test_observed_profile_summarises_one_capture(client):
         {"value": "exfil.attacker.net", "count": 1, "total_bytes": 182, "max_bytes": 182},
         {"value": "registry.npmjs.org", "count": 1, "total_bytes": 182, "max_bytes": 182},
     ]
+    # delivery_track_package is not a file tool.
+    assert observed["file_access"] == []
+    assert observed["file_types"] == []
     assert observed["truncated_dimensions"] == []
 
 
@@ -1419,3 +1422,216 @@ def test_a_single_agent_capture_has_no_agent_filter_and_an_empty_queue(client):
     assert client.get("/api/overview", params=params).json()["totals"]["unattributed"] == 0
     whole = client.get("/api/profile", params=params).json()
     assert "agent_key" not in whole["session"]
+
+
+def _turn(request_blocks: list[dict], response_blocks: list[dict], agent_key: str | None = None) -> dict:
+    """One Anthropic call: the replayed history in the request, new calls in the response."""
+    interaction = {
+        "request": {
+            "method": "POST",
+            "path": "/v1/messages",
+            "headers": {"host": "api.anthropic.com"},
+            "body": {"model": "claude-sonnet-5", "messages": [
+                {"role": "user", "content": "tidy the repo"},
+                {"role": "assistant", "content": request_blocks},
+            ]},
+        },
+        "response": {"status_code": 200, "body": {"content": response_blocks}},
+    }
+    if agent_key:
+        interaction.update({
+            "runtime_identity_version": 1,
+            "attribution": {"state": "attributed", "method": "process_target"},
+            "agent_ref": {"host_id": "h", "sandbox_name": "s", "agent_key": agent_key},
+        })
+    return interaction
+
+
+def _call(call_id: str | None, name: str, **arguments) -> dict:
+    block = {"type": "tool_use", "name": name, "input": arguments}
+    if call_id:
+        block["id"] = call_id
+    return block
+
+
+def test_observed_profile_counts_files_each_tool_call_reads_or_writes(client):
+    read_config = _call("t1", "Read", file_path="/app/config.yaml")
+    write_key = _call("t2", "Write", file_path="/tmp/id_rsa", content="...")
+    observed = _post_session(client, "files", [
+        _turn([], [read_config]),
+        # The next request replays both earlier calls; they count once.
+        _turn([read_config], [write_key]),
+        _turn([read_config, write_key], [
+            _call("t3", "Edit", file_path="/app/config.yaml", old_string="a", new_string="b"),
+            _call("t4", "mcp__filesystem__read_multiple_files", paths=["/etc/passwd", "/app/README"]),
+            _call("t5", "str_replace_based_edit_tool", command="view", path="/app/main.py"),
+            _call("t6", "str_replace_based_edit_tool", command="create", path="/app/out.PY", file_text=""),
+            _call("t7", "move_file", source="/app/a.txt", destination="/srv/public/a.txt"),
+            # Not a file tool, an unknown editor command, and a path that is
+            # not a string: none of them is file access.
+            _call("t8", "fetch", path="/v1/messages"),
+            _call("t9", "str_replace_editor", command="explode", path="/app/x"),
+            _call("t10", "Read", file_path=["/app/list"]),
+        ]),
+    ]).json()["observed"]
+
+    assert observed["file_access"] == [
+        # Anything written first, then most calls.
+        {"value": "/app/config.yaml", "count": 2, "read": 1, "write": 1},
+        {"value": "/app/a.txt", "count": 1, "read": 0, "write": 1},
+        {"value": "/app/out.PY", "count": 1, "read": 0, "write": 1},
+        {"value": "/srv/public/a.txt", "count": 1, "read": 0, "write": 1},
+        {"value": "/tmp/id_rsa", "count": 1, "read": 0, "write": 1},
+        {"value": "/app/README", "count": 1, "read": 1, "write": 0},
+        {"value": "/app/main.py", "count": 1, "read": 1, "write": 0},
+        {"value": "/etc/passwd", "count": 1, "read": 1, "write": 0},
+    ]
+    assert observed["file_types"] == [
+        {"value": "(none)", "count": 3, "read": 2, "write": 1},
+        {"value": ".py", "count": 2, "read": 1, "write": 1},
+        {"value": ".txt", "count": 2, "read": 0, "write": 2},
+        {"value": ".yaml", "count": 2, "read": 1, "write": 1},
+    ]
+    assert observed["truncated_dimensions"] == []
+
+
+def test_a_file_call_without_an_id_counts_each_time_it_is_seen(client):
+    read = _call(None, "Read", file_path="/app/a.md")
+    observed = _post_session(client, "no-ids", [
+        _turn([], [read]),
+        _turn([read], []),
+    ]).json()["observed"]
+
+    assert observed["file_access"] == [{"value": "/app/a.md", "count": 2, "read": 2, "write": 0}]
+
+
+def test_an_agent_profile_counts_only_that_agents_files(client):
+    client.post(
+        "/webhook/http-interactions",
+        json={"session_id": "agent-files", "interactions": [
+            _turn([], [_call("a1", "Read", file_path="/alpha.txt")], agent_key="alpha"),
+            _turn([], [_call("b1", "Write", file_path="/beta.txt")], agent_key="beta"),
+            _turn([], [_call("u1", "Write", file_path="/nobody.txt")]),
+        ]},
+    ).raise_for_status()
+
+    observed = client.get(
+        "/api/profile", params={"session_id": "agent-files", "agent_key": "alpha"}
+    ).json()["observed"]
+    assert observed["file_access"] == [{"value": "/alpha.txt", "count": 1, "read": 1, "write": 0}]
+    assert observed["file_types"] == [{"value": ".txt", "count": 1, "read": 1, "write": 0}]
+
+
+def test_file_access_is_bounded(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_DIMENSION_VALUES", 2)
+    monkeypatch.setattr(store_module, "MAX_PROFILE_VALUE_CHARS", 12)
+    observed = _post_session(client, "many-files", [
+        _turn([], [
+            _call(f"c{index}", "Read", file_path=f"/f{index}.txt") for index in range(3)
+        ] + [_call("long", "Write", file_path="/a/very/long/path.bin")]),
+    ]).json()["observed"]
+
+    # The type comes from the whole path, before it is cut to length.
+    assert observed["file_access"] == [
+        {"value": "/a/very/long", "count": 1, "read": 0, "write": 1},
+        {"value": "/f0.txt", "count": 1, "read": 1, "write": 0},
+    ]
+    assert observed["file_types"] == [
+        {"value": ".bin", "count": 1, "read": 0, "write": 1},
+        {"value": ".txt", "count": 3, "read": 3, "write": 0},
+    ]
+    # The cut-short path was a write, so writes are incomplete too. (The
+    # 12-character limit also cuts the host and model.)
+    assert observed["truncated_dimensions"] == ["hosts", "models", "file_access", "file_writes"]
+
+
+def test_reading_many_files_cannot_push_a_write_out_of_the_profile(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_DIMENSION_VALUES", 2)
+    reads = [_call(f"r{index}-{n}", "Read", file_path=f"/r{index}") for index in range(3) for n in range(5)]
+    observed = _post_session(client, "read-flood", [
+        _turn([], reads + [_call("w", "Write", file_path="/srv/share/dump.tar")]),
+    ]).json()["observed"]
+
+    assert observed["file_access"][0] == {
+        "value": "/srv/share/dump.tar", "count": 1, "read": 0, "write": 1,
+    }
+    # Only read-only paths were cut, so the written set is complete.
+    assert observed["truncated_dimensions"] == ["file_access"]
+
+    observed = _post_session(client, "write-flood", [
+        _turn([], [_call(f"w{index}", "Write", file_path=f"/w{index}") for index in range(3)]),
+    ]).json()["observed"]
+    assert observed["truncated_dimensions"] == ["file_access", "file_writes"]
+
+
+def test_a_long_tool_use_id_still_counts_its_call_once(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_FILE_CALLS", 2)
+    long_id = "x" * 10_000
+    read = _call(long_id, "Read", file_path="/a")
+    # The digest, not the id, is what is kept.
+    assert len(long_id) > store_module.MAX_PROFILE_CALL_ID_CHARS
+    observed = _post_session(client, "long-id", [
+        _turn([], [read]),
+        _turn([read], [_call(long_id + "y", "Read", file_path="/a")]),
+    ]).json()["observed"]
+
+    assert observed["file_access"] == [{"value": "/a", "count": 2, "read": 2, "write": 0}]
+    assert observed["truncated_dimensions"] == []
+
+
+def test_one_call_naming_too_many_files_marks_the_profile_incomplete(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_TOOL_NAMES", 2)
+    observed = _post_session(client, "many-paths", [
+        _turn([], [_call("m", "read_multiple_files", paths=["/a", "/b", "/c"])]),
+    ]).json()["observed"]
+
+    assert [item["value"] for item in observed["file_access"]] == ["/a", "/b"]
+    # It only read, so no write can be missing.
+    assert observed["truncated_dimensions"] == ["file_access", "file_types"]
+
+
+def test_a_write_displaces_a_read_only_path_at_the_counting_cap(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_TOOL_NAMES", 3)
+    observed = _post_session(client, "cap-write", [
+        _turn([], [_call(f"r{index}", "Read", file_path=f"/r{index}") for index in range(3)]
+              + [_call("w", "Write", file_path="/srv/dump.tar")]),
+    ]).json()["observed"]
+
+    assert observed["file_access"][0]["value"] == "/srv/dump.tar"
+    assert len(observed["file_access"]) == 3
+    assert observed["truncated_dimensions"] == ["file_access"]
+
+
+def test_file_access_is_incomplete_past_the_call_limit(client, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_FILE_CALLS", 1)
+    observed = _post_session(client, "call-limit", [
+        _turn([], [_call("x1", "Read", file_path="/a"), _call("x2", "Read", file_path="/b")]),
+    ]).json()["observed"]
+
+    assert observed["file_access"] == [{"value": "/a", "count": 1, "read": 1, "write": 0}]
+    assert observed["truncated_dimensions"] == ["file_access", "file_writes", "file_types"]
+
+
+@pytest.mark.parametrize(("path", "file_type"), [
+    ("/app/Main.PY", ".py"),
+    ("C:\\Users\\me\\notes.txt", ".txt"),
+    ("/home/me/.bashrc", "(none)"),
+    ("/app/Makefile", "(none)"),
+    ("/app/dir.d/", "(none)"),
+    ("archive.tar.gz", ".gz"),
+    ("x." + "a" * 16, "(other)"),
+])
+def test_file_type_is_the_lower_cased_extension(path, file_type):
+    assert Store._file_type(path) == file_type
