@@ -50,10 +50,12 @@ see RailMon's README.
 
 ## Running the full stack
 
-To run RailMon and RailDash together, or to install from published images, see
-**[INSTALL.md](https://github.com/datrail/datrail-project/blob/master/INSTALL.md)** — the full install guide, covering the source-built
-stack (`make stack-local`), the registry stack (`make stack`), platform support,
-verification, and troubleshooting.
+To run RailMon and RailDash together, use
+[datrail-project](https://github.com/datrail/datrail-project#quick-start):
+clone it and run `docker compose up -d`, which builds both images from source.
+[INSTALL.md](https://github.com/datrail/datrail-project/blob/master/INSTALL.md)
+covers prerequisites, platform support, settings (including the RailDash
+token), published images, verification, and troubleshooting.
 
 ## Architecture
 

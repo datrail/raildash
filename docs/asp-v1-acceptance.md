@@ -62,8 +62,10 @@ It needs no preparation beyond Docker.
 `make` optional. No cloud account, no Rail Center.
 
 **1. Clean-build both images from source**, from sibling checkouts of this
-repo and `railmon` (matches `datrail-project`'s `make stack-local` — see its
-`INSTALL.md`):
+repo and `railmon`. To run the whole stack instead, `docker compose up -d` in
+[datrail-project](https://github.com/datrail/datrail-project#quick-start) builds
+the same images; see its
+[INSTALL.md](https://github.com/datrail/datrail-project/blob/master/INSTALL.md).
 
 ```bash
 docker build -t raildash:handoff .        # from this repo's root
