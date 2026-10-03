@@ -61,6 +61,9 @@ CREDENTIAL_HEADERS = frozenset(
 REDACTED = "[REDACTED-BY-RAILDASH]"
 MAX_ATTRIBUTION_REASON_CHARS = 128
 MAX_MEDIA_TYPE_CHARS = 128
+# SQLite's INTEGER is signed 64-bit; a larger size makes the insert raise and
+# would fail the whole webhook batch it arrived in.
+MAX_SIZE_BYTES = 2**63 - 1
 BLOCK_TYPE_KINDS = {
     # Anthropic
     "image": "image",
@@ -428,6 +431,13 @@ def interaction_has_ticket(interaction: dict[str, Any]) -> bool:
     return False
 
 
+def _size(value: Any) -> int | None:
+    """A byte count from the capture, or None when it isn't one."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 0 <= value <= MAX_SIZE_BYTES else None
+
+
 def _synthetic_id(interaction: dict[str, Any]) -> str:
     """A stable id for an interaction RailMon did not hash.
 
@@ -536,8 +546,8 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
         "path": path,
         "status_code": status,
         "latency_ms": float(latency) if latency is not None else None,
-        "request_size": legacy.get("request_size"),
-        "response_size": legacy.get("response_size"),
+        "request_size": _size(legacy.get("request_size")),
+        "response_size": _size(legacy.get("response_size")),
         "model": _model(request_body) or _model(response_body),
         "tool_calls": _count_tool_calls(request_body) + _count_tool_calls(response_body),
         "has_ticket": int(interaction_has_ticket(interaction)),

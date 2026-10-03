@@ -119,6 +119,13 @@ def test_observed_profile_summarises_one_capture(client):
         {"value": "delivery_track_package", "count": 2}
     ]
     assert observed["tool_names_truncated"] is False
+    # One fixture row has no host, so its 182 bytes belong to no destination.
+    assert observed["upload_bytes"] == [
+        {"value": "api.anthropic.com", "count": 3, "total_bytes": 1087, "max_bytes": 531},
+        {"value": "host.openshell.internal:8091", "count": 2, "total_bytes": 540, "max_bytes": 318},
+        {"value": "exfil.attacker.net", "count": 1, "total_bytes": 182, "max_bytes": 182},
+        {"value": "registry.npmjs.org", "count": 1, "total_bytes": 182, "max_bytes": 182},
+    ]
     assert observed["truncated_dimensions"] == []
 
 
@@ -181,7 +188,8 @@ def test_observed_profile_bounds_distinct_dimension_values(client, monkeypatch):
     assert len(observed["hosts"]) == 1
     assert len(observed["methods"]) == 1
     assert len(observed["models"]) == 1
-    assert observed["truncated_dimensions"] == ["hosts", "methods"]
+    assert len(observed["upload_bytes"]) == 1
+    assert observed["truncated_dimensions"] == ["hosts", "methods", "upload_bytes"]
 
 
 def test_observed_profile_bounds_individual_value_lengths(client, monkeypatch):
@@ -208,6 +216,7 @@ def test_observed_profile_bounds_individual_value_lengths(client, monkeypatch):
                             ]
                         },
                     },
+                    "request_size": 64,
                 }
             ],
         },
@@ -221,12 +230,16 @@ def test_observed_profile_bounds_individual_value_lengths(client, monkeypatch):
     assert observed["methods"] == [{"value": "CAPTURED", "count": 1}]
     assert observed["models"] == [{"value": "captured", "count": 1}]
     assert observed["tool_names"] == [{"value": "captured", "count": 1}]
+    assert observed["upload_bytes"] == [
+        {"value": "captured", "count": 1, "total_bytes": 64, "max_bytes": 64}
+    ]
     assert observed["tool_names_truncated"] is True
     assert observed["truncated_dimensions"] == [
         "hosts",
         "methods",
         "models",
         "tool_names",
+        "upload_bytes",
     ]
 
 
@@ -1150,6 +1163,105 @@ def test_an_interrupted_content_backfill_resumes_on_the_next_open(tmp_path, monk
     store.close()
 
     assert observed["content_kinds"] == [{"value": "image", "count": 5}]
+
+
+def _sized(host: str, request_size, agent_key: str | None = None) -> dict:
+    interaction = {
+        "request": {"method": "POST", "path": "/upload", "headers": {"host": host}},
+        "response": {"status_code": 200},
+        "request_size": request_size,
+    }
+    if agent_key:
+        interaction.update({
+            "runtime_identity_version": 1,
+            "attribution": {"state": "attributed", "method": "process_target"},
+            "agent_ref": {"host_id": "h", "sandbox_name": "s", "agent_key": agent_key},
+        })
+    return interaction
+
+
+def test_observed_profile_sums_bytes_sent_per_host(client):
+    observed = _post_session(client, "sizes", [
+        _sized("files.example", 1_000),
+        _sized("files.example", 5_000_000),
+        _sized("api.example", 300),
+        _sized("api.example", 0),  # no request body recorded: not counted
+    ]).json()["observed"]
+
+    assert observed["upload_bytes"] == [
+        {"value": "files.example", "count": 2, "total_bytes": 5_001_000, "max_bytes": 5_000_000},
+        {"value": "api.example", "count": 1, "total_bytes": 300, "max_bytes": 300},
+    ]
+
+
+def test_a_request_size_that_is_not_a_byte_count_is_dropped_not_fatal(client):
+    """A capture's size is untrusted: text sorts above every number in SQLite,
+    and an integer past 64 bits used to fail the insert of the whole batch."""
+    observed = _post_session(client, "odd-sizes", [
+        _sized("h.example", 2**70),
+        _sized("h.example", "999999"),
+        _sized("h.example", -5),
+        _sized("h.example", 1.5),
+        _sized("h.example", True),
+        _sized("h.example", 10),
+    ]).json()["observed"]
+
+    assert observed["interaction_count"] == 6
+    assert observed["upload_bytes"] == [
+        {"value": "h.example", "count": 1, "total_bytes": 10, "max_bytes": 10}
+    ]
+    totals = client.get("/api/overview", params={"session_id": "odd-sizes"}).json()["totals"]
+    assert totals["request_bytes"] == 10
+
+
+def test_overview_byte_totals_survive_sizes_that_overflow_a_sum(client):
+    _post_session(client, "near-max", [
+        _sized("a.example", 2**63 - 1),
+        _sized("b.example", 2**63 - 1),
+    ])
+
+    for params in ({"session_id": "near-max"}, {}):
+        response = client.get("/api/overview", params=params)
+        assert response.status_code == 200
+        assert isinstance(response.json()["totals"]["request_bytes"], int)
+        assert response.json()["totals"]["request_bytes"] >= 2**64 - 2
+
+
+def test_a_pre_existing_non_integer_size_never_shapes_upload_bytes(tmp_path):
+    """Rows stored before sizes were checked at ingest may hold anything."""
+    store = Store(tmp_path / "old.db")
+    store.upsert_session("old", agent="a", source="test")
+    store.add_interactions("old", [normalise(_sized("h.example", 10))])
+    row = normalise(_sized("h.example", 20))
+    store.add_interactions("old", [row])
+    store._db.execute(
+        "UPDATE interactions SET request_size = 'huge' WHERE id = (SELECT MAX(id) FROM interactions)"
+    )
+    store._db.commit()
+
+    assert store.observed_profile("old")["observed"]["upload_bytes"] == [
+        {"value": "h.example", "count": 1, "total_bytes": 10, "max_bytes": 10}
+    ]
+    store.close()
+
+
+def test_an_agent_profile_counts_only_that_agents_bytes(client):
+    client.post(
+        "/webhook/http-interactions",
+        json={"session_id": "agent-sizes", "interactions": [
+            _sized("files.example", 100, agent_key="alpha"),
+            _sized("files.example", 9_000, agent_key="beta"),
+            _sized("files.example", 7_000),  # unattributed
+        ]},
+    ).raise_for_status()
+
+    observed = client.get(
+        "/api/profile", params={"session_id": "agent-sizes", "agent_key": "alpha"}
+    ).json()["observed"]
+
+    assert observed["upload_bytes"] == [
+        {"value": "files.example", "count": 1, "total_bytes": 100, "max_bytes": 100}
+    ]
 
 
 def test_opening_a_pre_dr132_database_fills_in_content_kinds(tmp_path):

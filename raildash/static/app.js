@@ -878,6 +878,26 @@ function profileValues(title, items) {
   return group;
 }
 
+function profileUploads(title, items) {
+  const group = el("section", "profile-group");
+  group.append(el("h3", null, title));
+  const values = el("div", "profile-values");
+  if (!items.length) {
+    values.append(el("span", "muted", "None observed"));
+  }
+  items.forEach((item) => {
+    const chip = el("span", "profile-chip");
+    chip.append(el("span", "profile-value", item.value));
+    chip.append(el(
+      "span", "profile-count",
+      `${fmtInt(item.count)} calls · ${fmtBytes(item.total_bytes)} · largest ${fmtBytes(item.max_bytes)}`
+    ));
+    values.append(chip);
+  });
+  group.append(values);
+  return group;
+}
+
 async function loadProfile() {
   const grid = $("profile-grid");
   const download = $("profile-download");
@@ -919,6 +939,7 @@ async function loadProfile() {
   grid.append(profileValues("Models", observed.models || []));
   grid.append(profileValues("Uploaded content", observed.content_kinds || []));
   grid.append(profileValues("Request content types", observed.request_media_types || []));
+  grid.append(profileUploads("Bytes sent per host", observed.upload_bytes || []));
 }
 
 function changedValues(before, after) {
@@ -963,6 +984,34 @@ function driftCounts(title, before, after, incomplete) {
   if (!changed.length) row.append(el("span", "muted", "Unchanged"));
   changed.forEach((item) => row.append(el(
     "span", "drift-label", `${item.value} ${fmtInt(previous.get(item.value))} → ${fmtInt(item.count)}`
+  )));
+  section.append(row);
+  return section;
+}
+
+// A host's largest request has to more than double before it counts, so
+// ordinary prompt growth stays quiet while a file many times the usual size
+// sent to a host the agent already uses does not.
+const UPLOAD_GROWTH_FACTOR = 2;
+
+function driftUploads(title, before, after, incomplete) {
+  const section = el("section", "drift-group");
+  section.append(el("h3", null, title));
+  if (incomplete) {
+    section.append(el("p", "note", "Comparison incomplete because one or both profiles truncated this dimension."));
+    return section;
+  }
+  const previous = new Map((before || []).map((item) => [item.value, item.max_bytes]));
+  const grown = (after || [])
+    .filter((item) => previous.has(item.value) &&
+      item.max_bytes > previous.get(item.value) * UPLOAD_GROWTH_FACTOR)
+    .sort((a, b) => a.value.localeCompare(b.value));
+  const row = el("div", "drift-change");
+  row.append(el("span", "drift-kind", "Largest"));
+  if (!grown.length) row.append(el("span", "muted", "Within 2× of before"));
+  grown.forEach((item) => row.append(el(
+    "span", "drift-label",
+    `${item.value} ${fmtBytes(previous.get(item.value))} → ${fmtBytes(item.max_bytes)}`
   )));
   section.append(row);
   return section;
@@ -1018,6 +1067,7 @@ async function loadDrift() {
     labels.append(driftLabels("Models", changedValues(before.models, after.models), incomplete("models")));
     labels.append(driftCounts("Uploaded content", before.content_kinds, after.content_kinds, false));
     labels.append(driftLabels("Request content types", changedValues(before.request_media_types, after.request_media_types), incomplete("request_media_types")));
+    labels.append(driftUploads("Bytes sent per host", before.upload_bytes, after.upload_bytes, incomplete("upload_bytes")));
     body.append(labels);
 
     const leftTotals = leftOverview.totals || {};
