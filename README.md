@@ -135,7 +135,7 @@ evidence values or digests) — unchanged from before. Everything that mutates
 custody state, plus the two reads that carry exact evidence
 (`GET /api/asps/{asp_id}/bundle`, `GET /api/asps/{asp_id}/drift/explained`,
 which is the per-attribute old/new/tier detail behind the dashboard's "drift
-explained" view), requires a per-start random token as an `X-RailDash-Token`
+explained" view), requires a local write token as an `X-RailDash-Token`
 header:
 
 | Route | CLI equivalent |
@@ -149,9 +149,23 @@ header:
 | `GET /api/asps/{asp_id}/bundle` | `asp export` |
 | `GET /api/asps/{asp_id}/drift/explained` | `asp drift-export` |
 
-`raildash serve` prints the token, and also writes it 0600 to `<db
-path>.token` for a co-located script to read (gitignored, alongside the
-database). RailDash injects the token into the page it serves itself (a
+The token is stable across restarts, so a RailMon configured once keeps
+delivering after RailDash restarts. RailDash takes it from, in order:
+
+1. `RAILDASH_TOKEN`, if set (at least 16 characters of `A-Z a-z 0-9 - _ . ~ +
+   / =`, e.g. `openssl rand -base64 32`) — handy when RailMon's
+   `RAIL_RAILDASH_TOKEN` is set from the same secret before either starts;
+2. otherwise `<db path>.token` from a previous start;
+3. otherwise a new random token, written 0600 to `<db path>.token`
+   (gitignored, alongside the database; `/data/raildash.db.token` in the
+   container).
+
+At startup RailDash logs where the token came from (`raildash: local write
+token reused from raildash.db.token`), never the token itself — read it with
+`cat raildash.db.token`. To rotate it, delete that file (or change
+`RAILDASH_TOKEN`) and restart, then give RailMon the new value.
+
+RailDash injects the token into the page it serves itself (a
 `<meta name="raildash-token">` tag), so the dashboard's own fetch calls
 attach it automatically — same-origin only, so a cross-site page cannot read
 it and cannot forge a write even though a browser will happily send

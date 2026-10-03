@@ -25,7 +25,7 @@ const $ = (id) => document.getElementById(id);
 const staticDemo = window.RAIL_DASH_STATIC_DEMO === true;
 let staticDataPromise = null;
 
-// DR-120: the per-start local write token RailDash injects into the page it
+// DR-120: the local write token RailDash injects into the page it
 // serves (see app.py's `index()`/`require_local_token`). Every write route,
 // plus the two reads that carry exact evidence (bundle/drift-explained),
 // check this header; a cross-site page cannot read it because it cannot read

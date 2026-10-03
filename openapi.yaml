@@ -433,9 +433,10 @@ components:
       in: header
       required: true
       description: |
-        The per-start local write token `raildash serve` prints and writes to
-        `<db path>.token`. Required on every write route and on the two reads
-        that carry exact evidence.
+        The local write token: `RAILDASH_TOKEN` if set, otherwise the contents
+        of `<db path>.token` (0600), which RailDash creates on first start and
+        reuses across restarts. Required on every write route and on the two
+        reads that carry exact evidence.
       schema: {type: string}
 
   schemas:

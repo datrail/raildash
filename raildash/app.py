@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -93,40 +94,125 @@ def get_store() -> Store:
 # this machine has open, from hitting a write route -- and that CSRF case is
 # exactly what a browser-based UI adds that the CLI never had to worry about.
 #
-# A per-start random token, generated in memory here and injected server-side
-# into the page RailDash itself serves (see `index()` below), is the same
-# pattern Jupyter's classic notebook server uses for the same reason: a
-# cross-site page cannot read the token without already having same-origin
-# access to this page, so it cannot forge a same-origin write even though the
-# browser will happily attach cookies. It is not multi-user auth -- anyone who
-# can read this process's memory, its stdout, or the token file next to the
-# database already has it, which is the same trust boundary the SQLite file's
-# 0600 permissions assume today.
-LOCAL_TOKEN = secrets.token_urlsafe(32)
+# A random token, injected server-side into the page RailDash itself serves
+# (see `index()` below), is the same pattern Jupyter's classic notebook server
+# uses for the same reason: a cross-site page cannot read the token without
+# already having same-origin access to this page, so it cannot forge a
+# same-origin write even though the browser will happily attach cookies. It is
+# not multi-user auth -- anyone who can read this process's memory or the
+# token file next to the database already has it, which is the same trust
+# boundary the SQLite file's 0600 permissions assume today.
+#
+# The token is stable across restarts (DR-156). RailMon delivers bundles
+# unattended with whatever token it was configured with, so a token that
+# changed on every start turned each RailDash restart into a stream of 403s
+# until somebody reconfigured RailMon by hand. Resolution order:
+#
+#   1. `RAILDASH_TOKEN`, when set -- the value to give RailMon as
+#      `RAIL_RAILDASH_TOKEN` is then known before either process starts;
+#   2. the existing `<db>.token` file next to the database;
+#   3. a new random token, written to `<db>.token` (0600) for the next start.
+#
+# Rotating it is deleting `<db>.token` (or changing `RAILDASH_TOKEN`) and
+# restarting.
+TOKEN_ENV_VAR = "RAILDASH_TOKEN"
+MIN_TOKEN_CHARS = 16
+# Restricted to characters that need no escaping in an HTTP header or in the
+# HTML attribute `index()` injects it into -- `secrets.token_urlsafe` output,
+# plus the base64 alphabet for anyone generating one with `openssl rand`.
+_TOKEN_ALPHABET = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.~+/="
+)
 
 
-def _write_local_token_file(db_path: str, token: str) -> None:
-    """Best-effort convenience copy of the token for a co-located CLI/script.
+def _valid_token(value: str) -> bool:
+    return len(value) >= MIN_TOKEN_CHARS and set(value) <= _TOKEN_ALPHABET
 
-    Every write route below checks the in-memory `LOCAL_TOKEN` above, not this
-    file -- so a failure here (read-only filesystem, in-memory database) is
-    not fatal, just less convenient. Named `<db>.token`, 0600, and covered by
-    the same `*.db*` gitignore pattern as the database itself.
-    """
-    if db_path == ":memory:":
-        return
-    token_path = Path(f"{db_path}.token")
+
+def _token_path(db_path: str) -> Path | None:
+    return None if db_path == ":memory:" else Path(f"{db_path}.token")
+
+
+def _read_local_token_file(token_path: Path) -> str | None:
+    """The token a previous start left next to the database, if usable."""
     try:
-        fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(token_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        # Tighten a copy someone restored with looser permissions; the file
+        # is a credential, not a log.
         try:
+            os.fchmod(fd, 0o600)
+        except OSError:
+            pass
+        value = os.read(fd, 4096).decode("ascii", "replace").strip()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    return value if _valid_token(value) else None
+
+
+def _write_local_token_file(token_path: Path, token: str) -> bool:
+    """Best-effort copy of the token for the next start and a co-located script.
+
+    Every write route below checks the in-memory `LOCAL_TOKEN`, not this file
+    -- so a failure here (read-only filesystem) is not fatal; the token just
+    will not survive a restart unless `RAILDASH_TOKEN` provides it. 0600, and
+    covered by the `*.db.token` gitignore pattern.
+    """
+    try:
+        fd = os.open(
+            token_path,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            os.fchmod(fd, 0o600)
             os.write(fd, token.encode("ascii"))
         finally:
             os.close(fd)
     except OSError:
-        pass
+        return False
+    return True
 
 
-_write_local_token_file(store.path, LOCAL_TOKEN)
+def resolve_local_token(
+    db_path: str, environ: Any = os.environ
+) -> tuple[str, str]:
+    """Return `(token, where_it_came_from)` per the order described above."""
+    token_path = _token_path(db_path)
+    configured = (environ.get(TOKEN_ENV_VAR) or "").strip()
+    if configured:
+        if not _valid_token(configured):
+            raise RuntimeError(
+                f"{TOKEN_ENV_VAR} must be at least {MIN_TOKEN_CHARS} characters "
+                "of A-Z a-z 0-9 - _ . ~ + / ="
+            )
+        # Keep the file in step, so a script reading `<db>.token` gets the
+        # token this process actually checks.
+        if token_path is not None:
+            _write_local_token_file(token_path, configured)
+        return configured, f"from {TOKEN_ENV_VAR}"
+    if token_path is None:
+        return secrets.token_urlsafe(32), "generated for this in-memory database"
+    existing = _read_local_token_file(token_path)
+    if existing is not None:
+        return existing, f"reused from {token_path}"
+    token = secrets.token_urlsafe(32)
+    if _write_local_token_file(token_path, token):
+        return token, f"generated and written to {token_path}"
+    return token, (
+        f"generated, but {token_path} could not be written -- it will change on "
+        f"restart; set {TOKEN_ENV_VAR} to keep it stable"
+    )
+
+
+LOCAL_TOKEN, LOCAL_TOKEN_SOURCE = resolve_local_token(store.path)
+# Where to find the token, never the token itself: stdout is often a container
+# log that more people can read than the 0600 file.
+print(f"raildash: local write token {LOCAL_TOKEN_SOURCE}", file=sys.stderr)
 
 
 def require_local_token(
@@ -646,8 +732,9 @@ async def ingest_evidence_bundle(
 
         POST /v1/evidence-bundles?agent_key=<optional>
         Headers:
-            X-RailDash-Token: <the token printed at `raildash serve` startup,
-                also written 0600 to `<db-path>.token`>
+            X-RailDash-Token: <the local write token: `RAILDASH_TOKEN` if
+                set, otherwise the contents of `<db-path>.token` (0600);
+                stable across restarts>
             X-RailDash-Agent-Key: <optional alternative to the query param>
         Body: the exact evidence-bundle bytes, unmodified and not
             reserialized or multipart-wrapped -- up to
