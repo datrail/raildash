@@ -46,6 +46,14 @@ pip install -r requirements-dev.txt
 make test
 ```
 
+`raildash/schemas/evidence-bundle-v*.schema.json` are byte-for-byte copies of
+[RailMon's](https://github.com/datrail/railmon/tree/master/schemas), and a test
+compares them. Point it at a RailMon checkout with
+`RAILMON_SCHEMAS_DIR=<railmon>/schemas` (a sibling `../railmon` checkout is
+found on its own). Without one, the test skips locally. In CI it checks
+RailMon's default branch out and the test fails, never skips, if the schemas
+are missing.
+
 The API contract is in [`openapi.yaml`](openapi.yaml). If you change a route,
 change that file in the same commit — it is what the other components are
 written against.

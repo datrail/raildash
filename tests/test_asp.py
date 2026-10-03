@@ -75,14 +75,20 @@ def test_real_railmon_fixture_passes_the_vendored_schema_and_runtime_validator()
     }
 
 
-def _sibling_railmon_schema(name: str) -> Path | None:
-    """A sibling RailMon checkout, if one is present next to this repo: the
-    workspace's `repo/datrail/{railmon,raildash}` layout, or dev-toolkits'
-    flat sibling clone under `$RAIL_WORKSPACE_HOME`. Both put RailMon two
-    directories up from this repo's own root. Standalone CI for this repo
-    alone checks out only raildash, so it has neither — the drift check
-    below skips there rather than failing for a reason outside the test's
-    control (see its skip message)."""
+def _railmon_schema(name: str) -> Path | None:
+    """RailMon's copy of a schema, if a RailMon checkout is reachable.
+
+    `$RAILMON_SCHEMAS_DIR` if set (CI checks RailMon's `schemas/` out and
+    points this at it), and only that. Otherwise a sibling checkout -- the workspace's
+    `repo/datrail/{railmon,raildash}` layout -- at `../railmon`; and
+    dev-toolkits' flat clone under `$RAIL_WORKSPACE_HOME/railmon`.
+    """
+    schemas_dir = os.environ.get("RAILMON_SCHEMAS_DIR")
+    if schemas_dir:
+        # Explicit, so no fallback: a wrong path must not quietly compare
+        # against some other, possibly stale, checkout instead.
+        path = Path(schemas_dir) / name
+        return path if path.is_file() else None
     repo_root = Path(__file__).resolve().parents[1]
     candidates = [repo_root.parent / "railmon" / "schemas" / name]
     workspace_home = os.environ.get("RAIL_WORKSPACE_HOME")
@@ -91,20 +97,29 @@ def _sibling_railmon_schema(name: str) -> Path | None:
     return next((path for path in candidates if path.is_file()), None)
 
 
+def _running_in_ci() -> bool:
+    return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
+
+
 @pytest.mark.parametrize("name", ["evidence-bundle-v1.schema.json", "evidence-bundle-v2.schema.json"])
 def test_vendored_schema_is_byte_for_byte_identical_to_railmon(name: str):
-    railmon_schema = _sibling_railmon_schema(name)
+    railmon_schema = _railmon_schema(name)
     if railmon_schema is None:
-        pytest.skip(
-            f"no sibling RailMon checkout found next to this repo (checked "
-            f"../railmon and $RAIL_WORKSPACE_HOME/railmon) — can't check "
-            f"{name} for drift from here; this repo's own standalone CI has "
-            f"the same gap"
+        message = (
+            f"no RailMon schemas found ($RAILMON_SCHEMAS_DIR if set, otherwise "
+            f"../railmon/schemas and $RAIL_WORKSPACE_HOME/railmon/schemas) -- "
+            f"can't check {name} for drift"
         )
+        # A skip is fine on a laptop with only this repo cloned; in CI it
+        # would hide the one check that ties this copy to its producer, so
+        # there it is a failure of the CI setup, not a reason to pass.
+        if _running_in_ci():
+            pytest.fail(message + "; CI must check RailMon out and set RAILMON_SCHEMAS_DIR")
+        pytest.skip(message)
     vendored = SCHEMAS / name
     assert vendored.read_bytes() == railmon_schema.read_bytes(), (
-        f"raildash/schemas/{name} has drifted from RailMon's copy — "
-        f"re-vendor it byte-for-byte from the pinned RailMon version"
+        f"raildash/schemas/{name} has drifted from RailMon's copy "
+        f"({railmon_schema}) -- re-vendor it byte-for-byte"
     )
 
 
