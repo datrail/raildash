@@ -898,6 +898,31 @@ function profileUploads(title, items) {
   return group;
 }
 
+function fileOps(item) {
+  const parts = [];
+  if (item.read) parts.push(`${fmtInt(item.read)} read`);
+  if (item.write) parts.push(`${fmtInt(item.write)} write`);
+  return parts.join(" · ");
+}
+
+function profileFiles(title, items) {
+  const group = el("section", "profile-group");
+  group.append(el("h3", null, title));
+  group.append(el("p", "note", "Asked of file tools in the captured conversation; not a filesystem trace."));
+  const values = el("div", "profile-values");
+  if (!items.length) {
+    values.append(el("span", "muted", "None observed"));
+  }
+  items.forEach((item) => {
+    const chip = el("span", "profile-chip");
+    chip.append(el("span", "profile-value", item.value));
+    chip.append(el("span", "profile-count", fileOps(item)));
+    values.append(chip);
+  });
+  group.append(values);
+  return group;
+}
+
 async function loadProfile() {
   const grid = $("profile-grid");
   const download = $("profile-download");
@@ -940,6 +965,8 @@ async function loadProfile() {
   grid.append(profileValues("Uploaded content", observed.content_kinds || []));
   grid.append(profileValues("Request content types", observed.request_media_types || []));
   grid.append(profileUploads("Bytes sent per host", observed.upload_bytes || []));
+  grid.append(profileFiles("Files", observed.file_access || []));
+  grid.append(profileFiles("File types", observed.file_types || []));
 }
 
 function changedValues(before, after) {
@@ -1017,6 +1044,13 @@ function driftUploads(title, before, after, incomplete) {
   return section;
 }
 
+// Reading a new file is worth seeing; writing one the agent never wrote
+// before is the artifact-write case, so the two are compared separately.
+// Both come from tool calls the model made, so the headings say "asked".
+function withOperation(items, operation) {
+  return (items || []).filter((item) => item[operation] > 0);
+}
+
 function signed(value, formatter) {
   if (value === null) return "not captured";
   if (value === 0) return formatter(0);
@@ -1068,6 +1102,9 @@ async function loadDrift() {
     labels.append(driftCounts("Uploaded content", before.content_kinds, after.content_kinds, false));
     labels.append(driftLabels("Request content types", changedValues(before.request_media_types, after.request_media_types), incomplete("request_media_types")));
     labels.append(driftUploads("Bytes sent per host", before.upload_bytes, after.upload_bytes, incomplete("upload_bytes")));
+    labels.append(driftLabels("Files asked to write", changedValues(withOperation(before.file_access, "write"), withOperation(after.file_access, "write")), incomplete("file_writes")));
+    labels.append(driftLabels("Files asked to read", changedValues(withOperation(before.file_access, "read"), withOperation(after.file_access, "read")), incomplete("file_access")));
+    labels.append(driftLabels("File types asked to write", changedValues(withOperation(before.file_types, "write"), withOperation(after.file_types, "write")), incomplete("file_types")));
     body.append(labels);
 
     const leftTotals = leftOverview.totals || {};

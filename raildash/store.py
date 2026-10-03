@@ -14,6 +14,7 @@ locally with no control plane behind it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -21,7 +22,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from .ingest import (
     interaction_has_ticket,
@@ -60,6 +61,34 @@ MAX_PROFILE_TOOL_ROWS = 10_000
 MAX_PROFILE_TOOL_NAMES = 1_000
 MAX_PROFILE_DIMENSION_VALUES = 100
 MAX_PROFILE_VALUE_CHARS = 256
+MAX_PROFILE_FILE_CALLS = 100_000
+MAX_PROFILE_CALL_ID_CHARS = 64
+MAX_FILE_TYPE_CHARS = 16
+# Tools whose input names a file, what they do to it, and which input keys
+# hold the path(s): Claude Code's built-ins and the MCP reference filesystem
+# server, whose tool names are matched under any MCP server name. A tool not
+# listed here contributes nothing to file access; guessing from an arbitrary
+# `path` argument would turn URLs and keys into "files".
+FILE_TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "Read": ("read", ("file_path",)),
+    "NotebookRead": ("read", ("notebook_path",)),
+    "Write": ("write", ("file_path",)),
+    "Edit": ("write", ("file_path",)),
+    "MultiEdit": ("write", ("file_path",)),
+    "NotebookEdit": ("write", ("notebook_path",)),
+    "read_file": ("read", ("path",)),
+    "read_text_file": ("read", ("path",)),
+    "read_media_file": ("read", ("path",)),
+    "read_multiple_files": ("read", ("paths",)),
+    "get_file_info": ("read", ("path",)),
+    "write_file": ("write", ("path",)),
+    "edit_file": ("write", ("path",)),
+    "move_file": ("write", ("source", "destination")),
+}
+# Anthropic's text editor tool names one file and says what to do in
+# `command`; only `view` leaves the file as it was.
+TEXT_EDITOR_TOOLS = frozenset({"str_replace_based_edit_tool", "str_replace_editor"})
+TEXT_EDITOR_WRITE_COMMANDS = frozenset({"create", "str_replace", "insert", "undo_edit"})
 ASP_RETENTION_COUNT = 100
 ASP_RETENTION_DAYS = 30
 
@@ -1247,7 +1276,8 @@ class Store:
 
         This deliberately contains no score or inferred posture. Values come
         only from the already-redacted interaction columns and captured
-        ``tool_use`` names.
+        ``tool_use`` blocks: their names, and the file paths known file
+        tools were asked to read or write.
 
         With ``agent_key`` the summary covers only interactions attributed to
         that agent. Ambiguous, unknown and conflict rows never carry an
@@ -1308,6 +1338,12 @@ class Store:
 
         tool_counts: dict[str, int] = {}
         tool_names_truncated = False
+        # A request replays every earlier turn, so the same tool_use block
+        # reappears in each later call; its id counts it once per capture.
+        file_calls_seen: set[str] = set()
+        file_counts: dict[str, dict[str, int]] = {}
+        type_counts: dict[str, dict[str, int]] = {}
+        file_calls_truncated = False
         raw_rows = self._db.execute(
             f"""SELECT raw FROM interactions
                WHERE {scope} AND tool_calls > 0
@@ -1317,9 +1353,66 @@ class Store:
         for index, row in enumerate(raw_rows):
             if index == MAX_PROFILE_TOOL_ROWS:
                 tool_names_truncated = True
+                file_calls_truncated = True
                 break
+            raw = self._safe_raw(row["raw"])
+            for block in self._tool_use_blocks(raw):
+                accesses = self._file_access(block)
+                if not accesses:
+                    continue
+                call_id = block.get("id")
+                if isinstance(call_id, str) and call_id:
+                    # An id is attacker-sized; keep a digest of a long one
+                    # so the seen set stays small.
+                    if len(call_id) > MAX_PROFILE_CALL_ID_CHARS:
+                        call_id = hashlib.sha256(
+                            call_id.encode("utf-8", "surrogatepass")
+                        ).hexdigest()
+                    if call_id in file_calls_seen:
+                        continue
+                    if len(file_calls_seen) >= MAX_PROFILE_FILE_CALLS:
+                        file_calls_truncated = True
+                        continue
+                    file_calls_seen.add(call_id)
+                if len(accesses) > MAX_PROFILE_TOOL_NAMES:
+                    accesses = accesses[:MAX_PROFILE_TOOL_NAMES]
+                    # One call does one thing to every file it names.
+                    mark_truncated("file_access")
+                    mark_truncated("file_types")
+                    if accesses[0][0] == "write":
+                        mark_truncated("file_writes")
+                for operation, path in accesses:
+                    file_type = self._file_type(path)
+                    if len(path) > MAX_PROFILE_VALUE_CHARS:
+                        path = path[:MAX_PROFILE_VALUE_CHARS]
+                        mark_truncated("file_access")
+                        if operation == "write":
+                            mark_truncated("file_writes")
+                    for counts, key, label in (
+                        (file_counts, path, "file_access"),
+                        (type_counts, file_type, "file_types"),
+                    ):
+                        if key not in counts:
+                            if len(counts) >= MAX_PROFILE_TOOL_NAMES:
+                                mark_truncated(label)
+                                # A new written path displaces one only read.
+                                displaced = (
+                                    next(
+                                        (k for k, ops in counts.items() if not ops["write"]),
+                                        None,
+                                    )
+                                    if label == "file_access" and operation == "write"
+                                    else None
+                                )
+                                if displaced is None:
+                                    if label == "file_access" and operation == "write":
+                                        mark_truncated("file_writes")
+                                    continue
+                                del counts[displaced]
+                            counts[key] = {"read": 0, "write": 0}
+                        counts[key][operation] += 1
             names = self._tool_names(
-                self._safe_raw(row["raw"]),
+                raw,
                 deduplicate=False,
                 limit=MAX_PROFILE_TOOL_NAMES + 1,
             )
@@ -1381,6 +1474,43 @@ class Store:
         if any(row["value_truncated"] for row in upload_rows):
             mark_truncated("upload_bytes")
 
+        if file_calls_truncated:
+            # The rows or calls not read could have named any file.
+            mark_truncated("file_access")
+            mark_truncated("file_writes")
+            mark_truncated("file_types")
+
+        # Anything written ranks ahead of anything only read, and displaces
+        # a read-only path at the counting cap above, so reading many files
+        # cannot push a write out; only more written values than either
+        # limit makes writes incomplete.
+        def by_calls(counts: dict[str, dict[str, int]], label: str) -> list[dict[str, Any]]:
+            ranked = sorted(
+                counts.items(),
+                key=lambda item: (
+                    item[1]["write"] == 0,
+                    -(item[1]["read"] + item[1]["write"]),
+                    item[0],
+                ),
+            )
+            if len(ranked) > MAX_PROFILE_DIMENSION_VALUES:
+                mark_truncated(label)
+                if label == "file_access" and ranked[MAX_PROFILE_DIMENSION_VALUES][1]["write"]:
+                    mark_truncated("file_writes")
+                ranked = ranked[:MAX_PROFILE_DIMENSION_VALUES]
+            return [
+                {
+                    "value": value,
+                    "count": ops["read"] + ops["write"],
+                    "read": ops["read"],
+                    "write": ops["write"],
+                }
+                for value, ops in ranked
+            ]
+
+        file_access = by_calls(file_counts, "file_access")
+        file_types = by_calls(type_counts, "file_types")
+
         interaction_count = int(totals["interactions"])
         error_count = int(totals["errors"])
         ticket_count = int(totals["ticket_interactions"])
@@ -1435,6 +1565,8 @@ class Store:
                     }
                     for row in upload_rows
                 ],
+                "file_access": file_access,
+                "file_types": file_types,
                 "truncated_dimensions": [
                     label
                     for label in (
@@ -1444,6 +1576,9 @@ class Store:
                         "tool_names",
                         "request_media_types",
                         "upload_bytes",
+                        "file_access",
+                        "file_writes",
+                        "file_types",
                     )
                     if label in truncated_dimensions
                 ],
@@ -1529,35 +1664,22 @@ class Store:
         return out
 
     @staticmethod
-    def _tool_names(
-        raw: Any, *, deduplicate: bool = True, limit: int | None = None
-    ) -> list[str]:
-        """Return ordered tool_use names from captured message blocks.
+    def _tool_use_blocks(raw: Any) -> Iterator[dict[str, Any]]:
+        """Yield tool_use blocks from captured Anthropic message locations.
 
-        Capture bodies are untrusted, so only the known Anthropic message
-        locations are inspected and every unexpected shape is ignored.
+        Capture bodies are untrusted, so only the known locations are
+        inspected and every unexpected shape is ignored.
         """
         raw = legacy_exchange(raw)
         if not isinstance(raw, dict):
-            return []
+            return
 
-        names: list[str] = []
-
-        def add_blocks(content: Any) -> None:
+        def blocks(content: Any) -> Iterator[dict[str, Any]]:
             if not isinstance(content, list):
                 return
             for block in content:
-                if limit is not None and len(names) >= limit:
-                    return
-                if not isinstance(block, dict) or block.get("type") != "tool_use":
-                    continue
-                name = block.get("name")
-                if (
-                    isinstance(name, str)
-                    and name
-                    and (not deduplicate or name not in names)
-                ):
-                    names.append(name)
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    yield block
 
         for direction in ("request", "response"):
             message = raw.get(direction)
@@ -1566,13 +1688,82 @@ class Store:
             body = message.get("body")
             if not isinstance(body, dict):
                 continue
-            add_blocks(body.get("content"))
+            yield from blocks(body.get("content"))
             messages = body.get("messages")
             if isinstance(messages, list):
                 for nested in messages:
                     if isinstance(nested, dict):
-                        add_blocks(nested.get("content"))
+                        yield from blocks(nested.get("content"))
+
+    @classmethod
+    def _tool_names(
+        cls, raw: Any, *, deduplicate: bool = True, limit: int | None = None
+    ) -> list[str]:
+        """Return ordered tool_use names from captured message blocks."""
+        names: list[str] = []
+        for block in cls._tool_use_blocks(raw):
+            if limit is not None and len(names) >= limit:
+                break
+            name = block.get("name")
+            if (
+                isinstance(name, str)
+                and name
+                and (not deduplicate or name not in names)
+            ):
+                names.append(name)
         return names
+
+    @staticmethod
+    def _file_access(block: dict[str, Any]) -> list[tuple[str, str]]:
+        """The (operation, path) pairs one tool_use block asks for.
+
+        This is what the model asked a tool to do, read from the captured
+        conversation; it is not a filesystem trace and says nothing about
+        whether the tool ran or succeeded.
+        """
+        name = block.get("name")
+        arguments = block.get("input")
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return []
+        # Claude Code names MCP tools mcp__<server>__<tool>.
+        if name.startswith("mcp__"):
+            name = name.rsplit("__", 1)[-1]
+        if name in TEXT_EDITOR_TOOLS:
+            command = arguments.get("command")
+            if command == "view":
+                operation = "read"
+            elif command in TEXT_EDITOR_WRITE_COMMANDS:
+                operation = "write"
+            else:
+                return []
+            keys: tuple[str, ...] = ("path",)
+        elif name in FILE_TOOLS:
+            operation, keys = FILE_TOOLS[name]
+        else:
+            return []
+        accesses: list[tuple[str, str]] = []
+        for key in keys:
+            value = arguments.get(key)
+            # Only a `paths` argument is a list; anything else names one file.
+            paths = value if key == "paths" and isinstance(value, list) else [value]
+            for path in paths:
+                if isinstance(path, str) and path.strip():
+                    accesses.append((operation, path.strip()))
+                    # One more than the caller keeps, so it can tell.
+                    if len(accesses) > MAX_PROFILE_TOOL_NAMES:
+                        return accesses
+        return accesses
+
+    @staticmethod
+    def _file_type(path: str) -> str:
+        """A path's lower-cased extension, `(none)` without one."""
+        base = path.replace("\\", "/").rsplit("/", 1)[-1]
+        stem, dot, extension = base.rpartition(".")
+        if not dot or not stem or not extension:
+            return "(none)"
+        if len(extension) >= MAX_FILE_TYPE_CHARS:
+            return "(other)"
+        return "." + extension.lower()
 
     def _interaction_summary(self, row: sqlite3.Row) -> dict[str, Any]:
         summary = dict(row)
