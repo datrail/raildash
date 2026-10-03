@@ -52,7 +52,8 @@ see RailMon's README.
 
 To run RailMon and RailDash together, use
 [datrail-project](https://github.com/datrail/datrail-project#quick-start):
-clone it and run `docker compose up -d`, which builds both images from source.
+clone it with `--recursive` and run `docker compose up -d`, which builds both
+images from source.
 [INSTALL.md](https://github.com/datrail/datrail-project/blob/master/INSTALL.md)
 covers prerequisites, platform support, settings (including the RailDash
 token), published images, verification, and troubleshooting.
