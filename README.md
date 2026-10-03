@@ -5,6 +5,12 @@ RailDash is a local dashboard for traffic captured by
 responses, failures, tool calls, and `x-rail` presence without requiring a
 cloud account or Rail Center.
 
+It also keeps the evidence bundles RailMon's scanner delivers as Agent
+Security Profiles (ASPs): what an agent is set up to use and was observed
+doing. You can lock an ASP as a baseline and see later drift from it. These
+terms are defined in the
+[DatRail glossary](https://github.com/datrail/datrail-project/blob/master/docs/glossary.md).
+
 ## Quick start
 
 Python 3.10+ with `venv` and `make` is required:
@@ -26,13 +32,21 @@ pip install -e .
 raildash load capture.jsonl --serve
 ```
 
-Or receive live interactions:
+Or receive live interactions. Start RailDash, then point RailMon's collector
+at its webhook:
 
 ```bash
 raildash serve
-sudo railmon collect --mode http \
-  --webhook http://127.0.0.1:8000/webhook/http-interactions
+docker run --rm --privileged --pid host --network host railmon collect \
+  --mode http --webhook http://127.0.0.1:8000/webhook/http-interactions
 ```
+
+`railmon collect` is the RailMon container image's command, so it exists only
+inside that container (`railmon` here is an image built from the
+[RailMon](https://github.com/datrail/railmon) repository). There is no `sudo
+railmon collect` on the host. A native RailMon build runs the collector binary
+directly with the same `--mode`/`--webhook` flags and no `collect` command;
+see RailMon's README.
 
 ## Running the full stack
 
@@ -78,9 +92,9 @@ make test
 
 RailDash retains validated RailMon evidence bundles as immutable ASPs and can
 lock any stored ASP as an alignment version. Every one of these steps works
-from either the CLI or the live dashboard — the dashboard does not need the
-server stopped, and the CLI is a thin wrapper over the same underlying calls
-(standing decision: the ASP feature must not depend on the CLI):
+from either the CLI or the live dashboard. The dashboard does not need the
+server stopped, and the CLI is an optional thin wrapper over the same
+underlying calls:
 
 ```bash
 raildash asp load evidence-bundle.json

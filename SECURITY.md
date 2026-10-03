@@ -40,6 +40,11 @@ POST /webhook/events              raw SSL events from RailMon
 POST /webhook/http-interactions   parsed HTTP interactions
 ```
 
+Its Agent Security Profile routes (evidence-bundle ingest, lock, switch,
+accept drift, retention, prune, and the two reads that return exact evidence)
+require the local write token in an `X-RailDash-Token` header. The README's
+"local write safety" section describes it.
+
 The dashboard, its `/api/*` query routes, the compatibility
 `/webhook/sessions*` reads, and FastAPI's OpenAPI pages can read the resulting
 SQLite database. The write routes accept UTF-8 JSON only, cap a request at 16
@@ -51,14 +56,14 @@ tree. Parsing runs outside the async event loop. Credential headers — includin
 the `x-rail` ticket — are redacted before the raw interaction is persisted.
 
 It does **not** register agents, issue tickets, evaluate policy, or record
-gateway refusals. Standing in for the control plane is what DR-9 asks it to
-become; it is not what this code does. There is no ticket-minting or signing
-surface here to attack, because there is no ticket-minting surface at all.
+gateway refusals. There is no ticket-minting or signing surface here to
+attack, because there is no ticket-minting surface at all.
 
 Known and deliberate, in the current scope:
 
-- **No authentication and no authorisation.** Any caller that can reach the
-  port can post interactions and read every session.
+- **No authentication and no authorisation on captures.** Any caller that can
+  reach the port can post interactions and read every session. The local
+  write token guards only the Agent Security Profile routes listed above.
 - **No tenancy.** `GET /webhook/sessions/{id}` returns any session to any
   caller.
 - **No source authentication.** A process that can reach either webhook can
@@ -97,7 +102,7 @@ what we already say.
   a viewer's browser. Captured data is attacker-influenced by definition — an
   agent talks to the open internet — so it must never be rendered as markup.
 
-Out of scope: the three deliberate gaps above, and vulnerabilities in FastAPI,
+Out of scope: the deliberate gaps above, and vulnerabilities in FastAPI,
 Uvicorn or other dependencies (report those upstream; we will help).
 
 ## Deployment expectation

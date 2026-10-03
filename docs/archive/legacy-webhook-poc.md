@@ -1,4 +1,11 @@
-# DatRail eBPF Webhook
+# DatRail eBPF Webhook (archived)
+
+> **Archived.** This describes the proof of concept RailDash grew out of. Its
+> `collector.py` is not in this repository: capture moved to
+> [RailMon](https://github.com/datrail/railmon), and the single-file webhook
+> server became the `raildash` package (`uvicorn webhook_server:app` still
+> starts it). For current usage, see the [README](../../README.md) and
+> [`openapi.yaml`](../../openapi.yaml). It is kept only as history.
 
 Captures SSL/TLS traffic from AI agents (e.g. Claude Code) using eBPF sslsniff,
 parses HTTP request/response pairs, and forwards them to a webhook endpoint.
@@ -66,7 +73,7 @@ The collector captures all HTTPS traffic and forwards it to the webhook.
 
 ## API Endpoints
 
-See [openapi.yaml](openapi.yaml) for the full OpenAPI specification.
+See [openapi.yaml](../../openapi.yaml) for the current OpenAPI specification.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
