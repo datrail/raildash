@@ -1,20 +1,22 @@
 openapi: 3.1.0
 info:
-  title: RailDash Webhook API
+  title: RailDash API
   description: |
-    Wave 1 dashboard API for receiving DatRail capture events.
+    Local dashboard API for DatRail captures and Agent Security Profiles.
 
-    RailMon captures and parses runtime traffic, then forwards structured
-    events to this webhook for inspection.
-
-    Data flows: Claude Code → Anthropic API (HTTPS) → eBPF sslsniff captures → Python collector parses → POST to this webhook.
-  version: 0.1.0
+    RailMon's collector captures and parses an agent's runtime traffic and
+    posts it to the webhook routes. RailMon's scanner delivers evidence
+    bundles to `/v1/evidence-bundles`, which RailDash keeps as Agent Security
+    Profiles (ASPs) that can be locked as baselines and checked for drift.
+    The dashboard's own UI (`/`, `/app.js`, `/app.css`) is not part of this
+    contract.
+  version: 0.2.0
   contact:
     name: DatRail
 
 servers:
   - url: http://localhost:8000
-    description: Local development webhook server
+    description: Local RailDash (`raildash serve`)
 
 paths:
   /api/asps:
@@ -92,7 +94,7 @@ paths:
   /api/asps/{asp_id}/bundle:
     get:
       operationId: getAspBundle
-      summary: Get the full parsed evidence bundle for one ASP (DR-120)
+      summary: Get the full parsed evidence bundle for one ASP
       description: |
         Token-gated (`X-RailDash-Token`): unlike the redacted routes above,
         this returns exact evidence values -- the same content
@@ -108,7 +110,7 @@ paths:
   /api/asps/{asp_id}/drift/explained:
     get:
       operationId: getAspDriftExplained
-      summary: Get one bounded page of drift changes with old/new values and tier (DR-120)
+      summary: Get one bounded page of drift changes with old/new values and tier
       description: |
         Token-gated (`X-RailDash-Token`): the per-attribute detail behind the
         dashboard's "drift explained" view -- same full evidence
@@ -126,7 +128,7 @@ paths:
   /api/asps/{asp_id}/lock:
     post:
       operationId: lockAsp
-      summary: Lock one stored ASP as a new immutable alignment version (DR-120)
+      summary: Lock one stored ASP as a new immutable alignment version
       description: Token-gated. Equivalent to `raildash asp lock <asp_id> --version <version>`.
       parameters:
         - {$ref: '#/components/parameters/AspId'}
@@ -148,7 +150,7 @@ paths:
   /api/alignments/{alignment_version_id}/switch:
     post:
       operationId: switchAlignment
-      summary: Make one alignment version active for its agent identity (DR-120)
+      summary: Make one alignment version active for its agent identity
       description: Token-gated. Equivalent to `raildash asp switch <alignment_version_id>`.
       parameters:
         - name: alignment_version_id
@@ -164,7 +166,7 @@ paths:
   /api/asps/{asp_id}/accept-drift:
     post:
       operationId: acceptDrift
-      summary: Lock the current drifted ASP as a new baseline and switch to it (DR-120)
+      summary: Lock the current drifted ASP as a new baseline and switch to it
       description: |
         Token-gated. Equivalent to `raildash asp lock` immediately followed by
         `raildash asp switch` on the version it just locked.
@@ -188,12 +190,12 @@ paths:
   /api/settings/asp-retention:
     get:
       operationId: getAspRetention
-      summary: Get the current ASP retention bounds (DR-120)
+      summary: Get the current ASP retention bounds
       responses:
         '200': {description: Current keep_count and max_age_days}
     post:
       operationId: setAspRetention
-      summary: Persist a new ASP retention bound (DR-120)
+      summary: Persist a new ASP retention bound
       description: |
         Token-gated. Equivalent to `raildash asp retention-set`. Stored in the
         database, so it survives a restart without an env var.
@@ -217,7 +219,7 @@ paths:
   /api/asps/prune:
     post:
       operationId: pruneAsps
-      summary: Prune unlocked ASP history now (DR-120)
+      summary: Prune unlocked ASP history now
       description: Token-gated. Equivalent to `raildash asp prune`.
       parameters:
         - {$ref: '#/components/parameters/RailDashToken'}
@@ -234,7 +236,7 @@ paths:
   /v1/evidence-bundles:
     post:
       operationId: ingestEvidenceBundle
-      summary: Ingest one Agent Security Profile evidence bundle (DR-120/DR-121)
+      summary: Ingest one Agent Security Profile evidence bundle
       description: |
         Token-gated. RailDash's counterpart to Rail Center's own
         `POST /v1/evidence-bundles` -- same path and general shape, RailDash's
@@ -256,6 +258,39 @@ paths:
         '403': {description: Missing or invalid X-RailDash-Token}
         '409': {description: This id/identity already names different stored bytes}
         '422': {description: Malformed or unresolvable evidence bundle}
+
+  /api/sessions:
+    get:
+      operationId: listSessions
+      summary: List capture sessions, most recently active first
+      responses:
+        '200':
+          description: |
+            Array of sessions: session_id, agent, capture_start, first_seen,
+            last_seen, source, interaction_count, error_count, event_count.
+
+  /api/overview:
+    get:
+      operationId: getOverview
+      summary: Summary counts for the dashboard, for one session or all
+      parameters:
+        - {name: session_id, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: |
+            {totals, hosts[], models[], statuses[]}: interaction, host, error
+            and tool-call counts, latency and byte totals, and per-host,
+            per-model and per-status breakdowns.
+
+  /api/filters:
+    get:
+      operationId: listFilterValues
+      summary: Distinct values the interaction filters can take
+      parameters:
+        - {name: session_id, in: query, schema: {type: string}}
+      responses:
+        '200':
+          description: '{hosts[], methods[], agent_keys[]}'
 
   /api/profile:
     get:
@@ -397,6 +432,32 @@ paths:
         '500':
           description: Server error
 
+  /webhook/sessions:
+    get:
+      operationId: listWebhookSessions
+      summary: List capture sessions (compatibility route)
+      description: Kept for clients of the earlier webhook server; prefer /api/sessions.
+      responses:
+        '200':
+          description: |
+            Array of {session_id, agent, capture_start, event_count,
+            interaction_count}.
+
+  /webhook/sessions/{session_id}:
+    get:
+      operationId: getWebhookSession
+      summary: One capture session with up to 500 of its interactions (compatibility route)
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The session's fields plus http_interactions[].
+        '404':
+          description: Session not found
+
   /webhook/health:
     get:
       operationId: healthCheck
@@ -507,7 +568,7 @@ components:
       type: object
       description: >-
         Contract v1 (evidence bundle v1) changes carry no `agent_key`. Contract
-        v2 (evidence bundle v2, DR-109) changes always carry it: null for the
+        v2 (evidence bundle v2) changes always carry it: null for the
         shared sandbox scope and for attestations, otherwise the agent the
         change is in. AGENT_* changes are v2 only; their `name` is the agent_key.
       required: [type, name, fields]
