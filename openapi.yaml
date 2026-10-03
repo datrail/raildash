@@ -61,6 +61,21 @@ paths:
                         type: array
                         items: {$ref: '#/components/schemas/AlignmentSummary'}
 
+  /api/asps/history:
+    get:
+      operationId: listAspHistory
+      summary: List received ASPs newest first, with baseline/locked/candidate status
+      description: |
+        Redacted metadata like `/api/asps`, plus each ASP's `status`
+        (`baseline`, `locked` or `candidate`), its locked version labels,
+        whether it is the newest for its agent, and its comparison with the
+        active baseline when one was made.
+      parameters:
+        - {$ref: '#/components/parameters/PageLimit'}
+        - {$ref: '#/components/parameters/PageOffset'}
+      responses:
+        '200': {description: One page of ASP history}
+
   /api/asps/{asp_id}/state:
     get:
       operationId: getAspState
@@ -107,6 +122,22 @@ paths:
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: ASP not found}
 
+  /api/asps/{asp_id}/raw:
+    get:
+      operationId: downloadAspRaw
+      summary: Download the ASP's evidence bundle exactly as it was received
+      description: |
+        Token-gated (`X-RailDash-Token`). The response body is byte-for-byte
+        the bundle RailDash received, the same bytes `raildash asp export`
+        writes, served as an attachment named `<asp_id>.json`.
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: The exact received bytes (application/json)}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: ASP not found}
+
   /api/asps/{asp_id}/drift/explained:
     get:
       operationId: getAspDriftExplained
@@ -145,7 +176,33 @@ paths:
         '201': {description: The new alignment version}
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such ASP}
-        '409': {description: That version already exists for this agent identity}
+        '409': {description: That version already exists for this agent identity, or this ASP is already locked}
+
+  /api/asps/{asp_id}/baseline:
+    post:
+      operationId: makeBaseline
+      summary: Make one stored ASP the active baseline, locking it first if needed
+      description: |
+        Token-gated. Idempotent: an ASP is locked at most once, and an ASP
+        that is already the active baseline is left as it is. `version` is
+        needed only when the ASP is not locked yet. Equivalent to
+        `raildash asp baseline <asp_id> [--version <version>]`.
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {version: {type: string, minLength: 1, maxLength: 128}}
+      responses:
+        '201': {description: This call locked the ASP; the new alignment version and its active binding}
+        '200': {description: The ASP was already locked; its alignment version and the active binding}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such ASP}
+        '409': {description: A version label is needed, or that label already exists for this agent identity}
 
   /api/alignments/{alignment_version_id}/switch:
     post:
@@ -166,10 +223,11 @@ paths:
   /api/asps/{asp_id}/accept-drift:
     post:
       operationId: acceptDrift
-      summary: Lock the current drifted ASP as a new baseline and switch to it
+      summary: Accept the current drifted ASP as the new baseline
       description: |
-        Token-gated. Equivalent to `raildash asp lock` immediately followed by
-        `raildash asp switch` on the version it just locked.
+        Token-gated. The same idempotent action as
+        `POST /api/asps/{asp_id}/baseline`: accepting an ASP that is already
+        locked reuses its alignment version instead of locking it again.
       parameters:
         - {$ref: '#/components/parameters/AspId'}
         - {$ref: '#/components/parameters/RailDashToken'}
@@ -182,7 +240,8 @@ paths:
               required: [version]
               properties: {version: {type: string, minLength: 1, maxLength: 128}}
       responses:
-        '201': {description: The new alignment version and its active binding}
+        '201': {description: This call locked the ASP; the new alignment version and its active binding}
+        '200': {description: The ASP was already locked; its alignment version and the active binding}
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such ASP}
         '409': {description: That version already exists for this agent identity}

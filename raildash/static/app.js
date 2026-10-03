@@ -19,6 +19,7 @@ const state = {
   driftLeft: null,
   driftRight: null,
   aspDriftOffsets: {},
+  aspHistoryOffset: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -32,6 +33,13 @@ let staticDataPromise = null;
 // this page's own DOM.
 const LOCAL_TOKEN = (() => {
   const meta = document.querySelector('meta[name="raildash-token"]');
+  return meta ? meta.content : "";
+})();
+
+// The absolute path of the database this server uses, so the commands the
+// page suggests run against it as pasted (index() injects it).
+const DB_PATH = (() => {
+  const meta = document.querySelector('meta[name="raildash-db"]');
   return meta ? meta.content : "";
 })();
 
@@ -73,6 +81,12 @@ function fmtTime(iso) {
   if (Number.isNaN(d.getTime())) return String(iso).slice(0, 19);
   return d.toLocaleTimeString([], { hour12: false }) +
     "." + String(d.getMilliseconds()).padStart(3, "0");
+}
+
+function fmtDateTime(iso) {
+  const d = new Date(iso);
+  if (!iso || Number.isNaN(d.getTime())) return iso ? String(iso).slice(0, 19) : "—";
+  return d.toLocaleString([], { hour12: false });
 }
 
 function statusPill(code) {
@@ -238,6 +252,47 @@ function aspCommand(command) {
   return block;
 }
 
+function shellQuote(value) {
+  const text = String(value);
+  if (/^[A-Za-z0-9_@%+=:,./-]+$/.test(text)) return text;
+  return `'${text.replace(/'/g, "'\\''")}'`;
+}
+
+// A `raildash` command for this server's own database. Safe to run while the
+// dashboard is up: the CLI and the server share the database.
+function raildashCommand(args) {
+  return DB_PATH ? `raildash --db ${shellQuote(DB_PATH)} ${args}` : `raildash ${args}`;
+}
+
+// Shell text that reads the write token RailDash keeps next to its database.
+function tokenFromFile() {
+  return DB_PATH ? `$(cat ${shellQuote(`${DB_PATH}.token`)})` : "$(cat raildash.db.token)";
+}
+
+function renderAspEmptyState() {
+  const empty = el("section", "asp-empty");
+  empty.append(el("h3", null, "No Agent Security Profile received yet"));
+  empty.append(el("p", "muted",
+    "RailMon sends one here after every scan once it knows this dashboard's " +
+    "address and write token. Set these where RailMon's scan runs:"));
+  empty.append(aspCommand(`RAIL_RAILDASH_URL=${window.location.origin}`));
+  empty.append(aspCommand(`RAIL_RAILDASH_TOKEN="${tokenFromFile()}"`));
+  empty.append(el("p", "muted",
+    "Add --interval 300 to the scan (or set RAIL_SCAN_INTERVAL_IN_SECONDS=300) " +
+    "and it scans and delivers every five minutes on its own. If RailMon runs " +
+    "in a container, give it an address of this machine that the container " +
+    "can reach, and pass the token's value rather than the cat command."));
+  empty.append(el("p", "muted",
+    "To add a bundle by hand, drop it on the box above, or run one of these:"));
+  empty.append(aspCommand(raildashCommand("asp load evidence-bundle.json")));
+  empty.append(aspCommand(
+    `curl -X POST -H "X-RailDash-Token: ${tokenFromFile()}" ` +
+    '-H "Content-Type: application/json" --data-binary @evidence-bundle.json ' +
+    `${window.location.origin}/v1/evidence-bundles`
+  ));
+  return empty;
+}
+
 function statePresentation(name) {
   const states = {
     NO_ACTIVE_ALIGNMENT: ["No active alignment", "neutral"],
@@ -299,7 +354,36 @@ function setInlineStatus(node, message, tone) {
 }
 
 function suggestNextVersion(existingVersions) {
-  return `v${(existingVersions || []).length + 1}.0`;
+  const taken = new Set((existingVersions || []).map((v) => v.version));
+  let next = taken.size + 1;
+  while (taken.has(`v${next}.0`)) next += 1;
+  return `v${next}.0`;
+}
+
+// Lock (if needed) and activate one ASP. Idempotent on the server: an ASP is
+// locked at most once, so repeating this never adds a duplicate version.
+function makeBaseline(aspId, version) {
+  return postJSON(
+    `/api/asps/${encodeURIComponent(aspId)}/baseline`,
+    version ? { version } : {}
+  );
+}
+
+// The ASP exactly as RailMon delivered it. The route needs the write token,
+// so fetch it and hand the browser a blob rather than a bare link.
+async function downloadAspRaw(aspId) {
+  const res = await fetch(`/api/asps/${encodeURIComponent(aspId)}/raw`, {
+    headers: { "X-RailDash-Token": LOCAL_TOKEN },
+  });
+  if (!res.ok) throw await _apiError(res);
+  const href = URL.createObjectURL(await res.blob());
+  const link = el("a");
+  link.href = href;
+  link.download = `${aspId}.json`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(href), 30_000);
 }
 
 async function fetchAllPages(path, extraParams) {
@@ -456,6 +540,142 @@ function renderInspectToggle(aspId) {
   return wrap;
 }
 
+const ASP_HISTORY_PAGE_SIZE = 20;
+
+function historyStatus(item) {
+  const label = (item.locked_versions || []).map((v) => v.version).join(", ");
+  if (item.status === "baseline") return el("span", "pill pill-ok", `Current baseline · ${label}`);
+  if (item.status === "locked") return el("span", "pill pill-none", `Locked · ${label}`);
+  return el("span", "pill pill-none", "Candidate");
+}
+
+function historyComparison(item) {
+  const c = item.comparison;
+  if (item.status === "baseline") return "—";
+  if (!c) return "Not compared";
+  if (c.state === "ALIGNED") return `Matches ${c.against_version}`;
+  if (c.state === "DRIFT_DETECTED") {
+    return `${c.change_count} change${c.change_count === 1 ? "" : "s"} from ${c.against_version}`;
+  }
+  return `Not comparable with ${c.against_version}`;
+}
+
+// Every received ASP, newest first: what it is now (baseline, locked, or a
+// candidate nobody locked), how it compares with the baseline, and actions to
+// make it the baseline or download exactly what RailMon sent.
+async function renderAspHistory(versionsByIdentity) {
+  const section = el("section", "asp-history");
+  section.setAttribute("aria-labelledby", "asp-history-h");
+  const heading = el("h3", null, "Received profiles");
+  heading.id = "asp-history-h";
+  section.append(heading, el("p", "hint",
+    "Newest first. Any of them can become the baseline; a locked one keeps its version label."));
+
+  let page = await getJSON("/api/asps/history", {
+    limit: ASP_HISTORY_PAGE_SIZE, offset: state.aspHistoryOffset,
+  });
+  if (!page.items.length && state.aspHistoryOffset > 0) {
+    state.aspHistoryOffset = 0;
+    page = await getJSON("/api/asps/history", { limit: ASP_HISTORY_PAGE_SIZE, offset: 0 });
+  }
+  const refresh = () => loadAspAlignments("history", "action");
+
+  const table = el("table", "asp-history-table");
+  const head = el("tr");
+  ["Received", "Agent", "Status", "Against baseline", "Actions"].forEach((name) => {
+    const th = el("th", null, name);
+    th.scope = "col";
+    head.append(th);
+  });
+  const thead = el("thead");
+  thead.append(head);
+  const tbody = el("tbody");
+  page.items.forEach((item) => {
+    const row = el("tr");
+    row.dataset.aspId = item.asp_id;
+    const received = el("td");
+    received.append(el("span", null, fmtDateTime(item.stored_at)));
+    if (item.latest_for_agent) received.append(el("span", "asp-latest", "Latest"));
+    const agent = el("td");
+    agent.append(el("span", null, identityLabel(item.agent_identity)));
+    agent.append(el("span", "asp-subject",
+      `${item.subject.host_id} / ${item.subject.sandbox_name} · ${item.asp_id}`));
+    const status = el("td");
+    status.append(historyStatus(item));
+    const comparison = el("td", "asp-history-comparison", historyComparison(item));
+    const actions = el("td", "asp-history-actions");
+    const message = el("span", "asp-status-msg");
+    message.setAttribute("aria-live", "polite");
+    if (item.status === "locked") {
+      const use = el("button", "btn", "Use as baseline");
+      use.type = "button";
+      use.addEventListener("click", async () => {
+        use.disabled = true;
+        setInlineStatus(message, "Working…");
+        try {
+          await makeBaseline(item.asp_id, null);
+          refresh();
+        } catch (error) {
+          setInlineStatus(message, error.message, "err");
+          use.disabled = false;
+        }
+      });
+      actions.append(use);
+    } else if (item.status === "candidate") {
+      const versions = versionsByIdentity.get(JSON.stringify(item.agent_identity)) || [];
+      actions.append(renderLockForm({
+        suggestedVersion: suggestNextVersion(versions),
+        buttonLabel: "Lock as baseline",
+        onLock: async (version) => {
+          await makeBaseline(item.asp_id, version);
+          refresh();
+        },
+      }));
+    }
+    const download = el("button", "btn btn-quiet", "Download");
+    download.type = "button";
+    download.setAttribute("aria-label", `Download ${item.asp_id} as received`);
+    download.addEventListener("click", async () => {
+      try {
+        await downloadAspRaw(item.asp_id);
+      } catch (error) {
+        setInlineStatus(message, error.message, "err");
+      }
+    });
+    actions.append(download, message);
+    row.append(received, agent, status, comparison, actions);
+    tbody.append(row);
+  });
+  table.append(thead, tbody);
+  const wrap = el("div", "asp-history-wrap");
+  wrap.append(table);
+  section.append(wrap);
+
+  if (page.total > ASP_HISTORY_PAGE_SIZE) {
+    const offset = page.offset;
+    const pager = el("div", "asp-drift-pager");
+    const previous = el("button", "btn btn-quiet", "Newer");
+    previous.type = "button";
+    previous.disabled = offset === 0;
+    previous.addEventListener("click", () => {
+      state.aspHistoryOffset = Math.max(0, offset - ASP_HISTORY_PAGE_SIZE);
+      loadAspAlignments("history", "action").catch((error) => console.error(error));
+    });
+    const next = el("button", "btn btn-quiet", "Older");
+    next.type = "button";
+    next.disabled = offset + page.items.length >= page.total;
+    next.addEventListener("click", () => {
+      state.aspHistoryOffset = offset + ASP_HISTORY_PAGE_SIZE;
+      loadAspAlignments("history", "action").catch((error) => console.error(error));
+    });
+    pager.append(previous,
+      el("span", "pager-text", `${offset + 1}–${offset + page.items.length} of ${page.total}`),
+      next);
+    section.append(pager);
+  }
+  return section;
+}
+
 async function loadAspAlignments(focusKey = null, focusAction = null) {
   const body = $("asp-alignment-body");
   // Polling must not destroy a keyboard user's focused command or pager.
@@ -470,11 +690,7 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
 
   const asps = await fetchAllPages("/api/asps");
   if (!asps.length) {
-    const empty = el("section", "asp-empty");
-    empty.append(el("h3", null, "No ASP loaded"));
-    empty.append(el("p", "muted", "Drop a validated RailMon evidence bundle on the box above, or:"));
-    empty.append(aspCommand("raildash asp load evidence-bundle.json"));
-    body.append(empty);
+    body.append(renderAspEmptyState());
     return;
   }
 
@@ -531,17 +747,13 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
     const versions = versionsByIdentity.get(key) || [];
     const activeVersion = versions.find((v) => v.active);
     const refresh = () => loadAspAlignments(key, "action");
-    const doLock = async (version) => {
-      await postJSON(`/api/asps/${encodeURIComponent(asp.asp_id)}/lock`, { version });
+    const doMakeBaseline = async (version) => {
+      await makeBaseline(asp.asp_id, version);
       refresh();
     };
-    const doLockAndActivate = async (version) => {
-      const locked = await postJSON(`/api/asps/${encodeURIComponent(asp.asp_id)}/lock`, { version });
-      await postJSON(
-        `/api/alignments/${encodeURIComponent(locked.alignment_version_id)}/switch`, {}
-      );
-      refresh();
-    };
+    const baselineCommand = (version) => aspCommand(
+      raildashCommand(`asp baseline ${asp.asp_id} --version ${shellQuote(version)}`)
+    );
     const doSwitch = async (alignmentVersionId) => {
       await postJSON(`/api/alignments/${encodeURIComponent(alignmentVersionId)}/switch`, {});
       refresh();
@@ -563,41 +775,38 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
       banner.append(renderLockForm({
         suggestedVersion: "v1.0",
         buttonLabel: "Lock this as your alignment baseline",
-        onLock: doLockAndActivate,
+        onLock: doMakeBaseline,
       }));
-      banner.append(aspCommand(
-        `raildash asp lock ${alignment.asp.asp_id} --version v1.0 && raildash asp switch <returned-id>`
-      ));
+      banner.append(baselineCommand("v1.0"));
       card.append(banner);
     } else if (alignment.state === "NO_ACTIVE_ALIGNMENT") {
       card.append(el("p", "muted", "No alignment version is active yet for this agent identity."));
       card.append(renderVersionPicker(versions, null, doSwitch));
       card.append(renderLockForm({
         suggestedVersion: suggestNextVersion(versions),
-        buttonLabel: "Lock this ASP as a new version",
-        onLock: doLock,
+        buttonLabel: "Use this ASP as the baseline",
+        onLock: doMakeBaseline,
       }));
-      card.append(aspCommand("raildash asp switch aspver-..."));
+      card.append(baselineCommand(suggestNextVersion(versions)));
     } else if (alignment.state === "COMPARISON_UNAVAILABLE") {
       card.append(el("p", "asp-reason", `Reason: ${alignment.drift.reason}`));
       card.append(el("p", "muted",
-        "This ASP cannot be compared with the active alignment. Lock it as a new version, then switch to it."));
+        "This ASP cannot be compared with the active alignment. Use it as the new baseline to compare later ones with it."));
       card.append(renderVersionPicker(
         versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
       ));
       card.append(renderLockForm({
         suggestedVersion: suggestNextVersion(versions),
         buttonLabel: "Lock as new baseline",
-        onLock: doLock,
+        onLock: doMakeBaseline,
       }));
-      card.append(aspCommand(`raildash asp lock ${alignment.asp.asp_id} --version ${suggestNextVersion(versions)}`));
-      card.append(aspCommand("raildash asp switch aspver-..."));
+      card.append(baselineCommand(suggestNextVersion(versions)));
     } else if (alignment.state === "ALIGNMENT_ACTIVE") {
       card.append(el("p", "muted", "Load a later ASP for this agent to run the first comparison."));
       card.append(renderVersionPicker(
         versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
       ));
-      card.append(aspCommand("raildash asp load evidence-bundle.json"));
+      card.append(aspCommand(raildashCommand("asp load evidence-bundle.json")));
     } else if (alignment.state === "ALIGNED") {
       card.append(renderVersionPicker(
         versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
@@ -615,8 +824,7 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
         onLock: doAccept,
       }));
       card.append(acceptWrap);
-      card.append(aspCommand(`raildash asp lock ${alignment.asp.asp_id} --version ${suggestNextVersion(versions)}`));
-      card.append(aspCommand("raildash asp switch aspver-..."));
+      card.append(baselineCommand(suggestNextVersion(versions)));
     }
 
     card.append(renderInspectToggle(asp.asp_id));
@@ -658,6 +866,7 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
     }
     body.append(card);
   }
+  body.append(await renderAspHistory(versionsByIdentity));
   const announcement = states
     .map(({ alignment }) => (
       `${identityLabel(alignment.asp.agent_identity)}: ${statePresentation(alignment.state)[0]}`

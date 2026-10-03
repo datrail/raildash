@@ -20,12 +20,13 @@ import json
 import os
 import secrets
 import sys
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from .ingest import normalise, redact_raw_event
 from .json_safety import (
@@ -500,6 +501,17 @@ def api_asps(
     }
 
 
+@app.get("/api/asps/history")
+def api_asp_history(
+    limit: int = Query(DEFAULT_DRIFT_PAGE_SIZE, ge=1, le=MAX_DRIFT_PAGE_SIZE),
+    offset: int = Query(0, ge=0),
+) -> dict[str, Any]:
+    """Every received ASP, newest first, with its baseline/locked/candidate
+    status and its comparison with the active baseline. Redacted like
+    `/api/asps`: version labels and states, never evidence values."""
+    return get_store().asp_history(limit=limit, offset=offset)
+
+
 @app.get("/api/alignments")
 def api_alignments(
     limit: int = Query(DEFAULT_DRIFT_PAGE_SIZE, ge=1, le=MAX_DRIFT_PAGE_SIZE),
@@ -559,6 +571,30 @@ def api_asp_bundle(asp_id: str) -> dict[str, Any]:
     if bundle is None:
         raise HTTPException(404, "no such ASP")
     return bundle
+
+
+@app.get("/api/asps/{asp_id}/raw", dependencies=[Depends(require_local_token)])
+def api_asp_raw(asp_id: str) -> Response:
+    """The ASP's evidence bundle exactly as it was received, byte for byte.
+
+    The same bytes `raildash asp export` writes, and the bytes the stored
+    digest was computed over, so a download can be re-imported or checked
+    elsewhere without a reserialization changing its hash. Token-gated like
+    the parsed view above. The filename comes from RailDash's own id, never
+    from the untrusted bundle content.
+    """
+    raw = get_store().asp_exact_bytes(asp_id)
+    if raw is None:
+        raise HTTPException(404, "no such ASP")
+    return Response(
+        content=raw,
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{asp_id}.json"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @app.get(
@@ -625,34 +661,57 @@ def api_switch_alignment(alignment_version_id: str) -> dict[str, Any]:
         raise HTTPException(404, str(exc)) from exc
 
 
+async def _optional_version(request: Request) -> str | None:
+    body = await _json_body(request, max_bytes=MAX_CONTROL_BODY_BYTES)
+    if not isinstance(body, dict):
+        raise HTTPException(422, "expected an object")
+    version = body.get("version")
+    if version is not None and not isinstance(version, str):
+        raise HTTPException(422, "version must be a string")
+    return version
+
+
+def _make_baseline(asp_id: str, version: str | None) -> JSONResponse:
+    try:
+        result = get_store().make_baseline(asp_id, version)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return JSONResponse(result, status_code=201 if result["locked"] else 200)
+
+
+@app.post(
+    "/api/asps/{asp_id}/baseline",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_make_baseline(asp_id: str, request: Request) -> JSONResponse:
+    """Make one stored ASP -- the newest or any older one -- the active baseline.
+
+    Body: `{"version": "v3.0"}`; the label is used only when the ASP is not
+    locked yet and may be omitted for one that is. Idempotent: an ASP is
+    locked at most once, and an already-active baseline is left as it is.
+    201 when this call locked the ASP, 200 when it reused its existing
+    alignment version. Equivalent to `raildash asp baseline <asp_id>`.
+    """
+    return _make_baseline(asp_id, await _optional_version(request))
+
+
 @app.post(
     "/api/asps/{asp_id}/accept-drift",
     status_code=201,
     dependencies=[Depends(require_local_token)],
 )
-async def api_accept_drift(asp_id: str, request: Request) -> dict[str, Any]:
+async def api_accept_drift(asp_id: str, request: Request) -> JSONResponse:
     """Accept a drifted ASP's current state as the new baseline, in one call.
 
-    Body: `{"version": "v2.0"}`. Equivalent to running
-    `raildash asp lock <asp_id> --version <version>` followed immediately by
-    `raildash asp switch <the returned alignment_version_id>` -- the "accept
-    new state as new baseline" action next to a drift result.
+    Body: `{"version": "v2.0"}`. The same idempotent action as
+    `POST /api/asps/{asp_id}/baseline`: accepting the same ASP again reuses
+    the alignment version the first accept created instead of locking the
+    same evidence a second time.
     """
-    body = await _json_body(request, max_bytes=MAX_CONTROL_BODY_BYTES)
-    if not isinstance(body, dict):
-        raise HTTPException(422, "expected an object")
-    version = body.get("version")
-    if not isinstance(version, str):
-        raise HTTPException(422, "version must be a string")
-    db = get_store()
-    try:
-        locked = db.lock_alignment(asp_id, version)
-    except KeyError as exc:
-        raise HTTPException(404, str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(409, str(exc)) from exc
-    binding = db.switch_alignment(locked["alignment_version_id"])
-    return {"alignment_version": locked, "binding": binding}
+    return _make_baseline(asp_id, await _optional_version(request))
 
 
 @app.get("/api/settings/asp-retention")
@@ -832,9 +891,15 @@ def index() -> HTMLResponse:
     # same-origin, so the UI's own fetch calls can read it and attach it to
     # every write request -- see the `require_local_token` docstring above.
     html = (STATIC / "index.html").read_text(encoding="utf-8")
+    # The database path lets the page show copy-pasteable commands for this
+    # exact database (`raildash --db ...`, `<db>.token`) instead of guesses.
+    db_meta = ""
+    if get_store().path != ":memory:":
+        db_path = html_escape(str(Path(get_store().path).resolve()), quote=True)
+        db_meta = f'<meta name="raildash-db" content="{db_path}">\n'
     injected = html.replace(
         "</head>",
-        f'<meta name="raildash-token" content="{LOCAL_TOKEN}">\n</head>',
+        f'<meta name="raildash-token" content="{LOCAL_TOKEN}">\n{db_meta}</head>',
         1,
     )
     return HTMLResponse(injected)
