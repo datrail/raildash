@@ -1209,7 +1209,7 @@ function profileUploads(title, items) {
     values.append(el("span", "muted", "None observed"));
   }
   items.forEach((item) => {
-    const chip = el("span", "profile-chip");
+    const chip = el("span", "profile-chip profile-chip-stacked");
     chip.append(el("span", "profile-value", item.value));
     chip.append(el(
       "span", "profile-count",
