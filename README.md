@@ -177,8 +177,9 @@ custody state, plus the four reads that carry exact evidence
 (`GET /api/asps/{asp_id}/bundle`, `GET /api/asps/{asp_id}/raw`,
 `GET /api/asps/{asp_id}/drift/explained`,
 which is the per-attribute old/new/tier detail behind the dashboard's "drift
-explained" view, and `GET /api/profile/kernel-file-access`, below), requires a local write token as an `X-RailDash-Token`
-header:
+explained" view, and `GET /api/profile/kernel-file-access`, described under
+"Files: asked and kernel-observed" above), requires a local write token as
+an `X-RailDash-Token` header:
 
 | Route | CLI equivalent |
 | --- | --- |

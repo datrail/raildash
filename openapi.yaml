@@ -421,7 +421,8 @@ paths:
         capture that names none, from the latest ASP of every sandbox
         (`matched_by: latest`). At most 8 sources. Kept apart from the files
         the capture's tool calls asked for (`/api/profile`). `evidence` is
-        null for an ASP whose rule pack predates the attribute.
+        null for an ASP whose rule pack predates the attribute, or whose
+        stored bundle no longer validates (then `error` says so).
       parameters:
         - name: session_id
           in: query
@@ -612,7 +613,7 @@ components:
       description: |
         The local write token: `RAILDASH_TOKEN` if set, otherwise the contents
         of `<db path>.token` (0600), which RailDash creates on first start and
-        reuses across restarts. Required on every write route and on the three
+        reuses across restarts. Required on every write route and on the four
         reads that carry exact evidence (`bundle`, `raw`, `drift/explained`,
         `profile/kernel-file-access`).
       schema: {type: string}
@@ -632,9 +633,12 @@ components:
           maxItems: 8
           items:
             type: object
-            required: [asp_id, collected_at, stored_at, subject, contract, evidence]
+            required: [asp_id, collected_at, stored_at, subject, contract, evidence, error]
             properties:
               asp_id: {type: string}
+              error:
+                type: ['string', 'null']
+                description: Set when the stored bundle no longer passes this RailDash's validation; evidence is then null.
               collected_at: {type: string, format: date-time}
               stored_at: {type: string, format: date-time}
               subject:

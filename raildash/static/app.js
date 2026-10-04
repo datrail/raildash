@@ -1228,8 +1228,8 @@ function fileOps(item) {
   return parts.join(" · ");
 }
 
-function profileFiles(title, items) {
-  const group = el("section", "profile-group profile-files-asked");
+function profileFiles(title, items, className) {
+  const group = el("section", className ? `profile-group ${className}` : "profile-group");
   group.append(el("h3", null, title));
   group.append(el("p", "note", "Asked of file tools in the captured conversation; not a filesystem trace."));
   const values = el("div", "profile-values");
@@ -1272,6 +1272,12 @@ function kernelFileSource(source) {
     `${source.subject.host_id} / ${source.subject.sandbox_name} · ` +
     `collected ${fmtDateTime(source.collected_at)} · ${source.asp_id}`));
   const evidence = source.evidence;
+  if (source.error) {
+    const message = el("p", "asp-status-msg", `Cannot show this ASP: ${source.error}.`);
+    message.dataset.tone = "err";
+    block.append(message);
+    return block;
+  }
   if (!evidence) {
     block.append(el("span", "muted",
       `This ASP (rule pack ${source.contract.rule_pack_version}) does not carry kernel-observed files.`));
@@ -1305,7 +1311,7 @@ function kernelFileSource(source) {
   });
   if (ranked.length > MAX_KERNEL_FILE_CHIPS) {
     values.append(el("span", "muted",
-      `+${fmtInt(ranked.length - MAX_KERNEL_FILE_CHIPS)} more read-only files in the ASP`));
+      `+${fmtInt(ranked.length - MAX_KERNEL_FILE_CHIPS)} more files in the ASP`));
   }
   block.append(values);
   return block;
@@ -1330,8 +1336,9 @@ function profileKernelFiles(data, error) {
   }
   const sources = data.sources || [];
   if (data.matched_by === "latest" && sources.length) {
-    group.append(el("p", "muted",
-      "This capture names no sandbox, so this is the latest ASP from each sandbox."));
+    group.append(el("p", "muted", data.agent_key
+      ? `No call by ${data.agent_key} in this capture names a sandbox, so this is the latest ASP from each sandbox.`
+      : "This capture names no sandbox, so this is the latest ASP from each sandbox."));
   }
   if (!sources.length) {
     group.append(el("span", "muted", data.matched_by === "sandbox"
@@ -1374,8 +1381,8 @@ async function loadProfile() {
   const path = `/api/profile?session_id=${encodeURIComponent(state.sessionId)}` +
     (agentKey ? `&agent_key=${encodeURIComponent(agentKey)}` : "");
   const profile = await getJSON("/api/profile", { session_id: state.sessionId, agent_key: agentKey });
-  // Fetched before anything is drawn, so the five-second refresh replaces
-  // the group in one step instead of flashing a loading state.
+  // Fetched before the grid is filled, so the group is drawn with the rest
+  // of the profile rather than showing a loading state of its own.
   const [kernelFiles, kernelError] = await loadKernelFiles(state.sessionId, agentKey);
   const observed = profile.observed || {};
   download.href = staticDemo ? "./profile.json" : path;
@@ -1402,7 +1409,7 @@ async function loadProfile() {
   grid.append(profileValues("Uploaded content", observed.content_kinds || []));
   grid.append(profileValues("Request content types", observed.request_media_types || []));
   grid.append(profileUploads("Bytes sent per host", observed.upload_bytes || []));
-  grid.append(profileFiles("Files · asked", observed.file_access || []));
+  grid.append(profileFiles("Files · asked", observed.file_access || [], "profile-files-asked"));
   grid.append(profileKernelFiles(kernelFiles, kernelError));
   grid.append(profileFiles("File types", observed.file_types || []));
 }

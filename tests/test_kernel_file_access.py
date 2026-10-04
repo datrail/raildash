@@ -289,3 +289,26 @@ def test_a_newly_written_path_is_drift_on_this_attribute_alone(client):
     rewritten = load(bundle("bnd-rewrite", [dict(READ, write=True)],
                            collected_at="2026-09-24T03:00:00Z"))
     assert client.get(f"/api/asps/{rewritten}/state").json()["state"] == "DRIFT_DETECTED"
+
+
+def test_a_stored_bundle_that_no_longer_validates_is_that_sandboxs_error(client, monkeypatch):
+    # A bundle stored under an older vendored schema can fail this one. ASPs
+    # are immutable in the database, so the stricter validation is simulated.
+    from raildash import store as store_module
+    from raildash.asp import BundleValidationError, parse_bundle
+
+    capture("s")
+    good = load(bundle("bnd-good", [WROTE], sandbox="good"))
+    stale = load(bundle("bnd-stale", [READ], sandbox="stale"))
+
+    def stricter(raw):
+        if b"bnd-stale" in raw:
+            raise BundleValidationError(["attributes.observed_file_access.value: stricter now"])
+        return parse_bundle(raw)
+
+    monkeypatch.setattr(store_module, "parse_bundle", stricter)
+    by_id = {s["asp_id"]: s for s in kernel(client, "s")["sources"]}
+    assert by_id[stale]["evidence"] is None
+    assert "does not pass" in by_id[stale]["error"]
+    assert by_id[good]["error"] is None
+    assert by_id[good]["evidence"]["files"] == [WROTE]

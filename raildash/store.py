@@ -42,6 +42,7 @@ from .json_safety import (
 from .asp import (
     BUNDLE_VERSION_V2,
     DEFAULT_DRIFT_PAGE_SIZE,
+    BundleValidationError,
     FILE_ACCESS_ATTRIBUTE,
     MAX_DRIFT_PAGE_SIZE,
     bundle_digest,
@@ -1211,7 +1212,8 @@ class Store:
         is a single-agent RailMon's, names none; then it is the latest ASP
         of every sandbox (`matched_by: "latest"`), and the caller must say
         so. An ASP whose rule pack predates the attribute has `evidence:
-        null`.
+        null`; so does one whose stored bytes no longer validate, with
+        `error` saying so.
         """
         if self._db.execute(
             "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
@@ -1246,7 +1248,24 @@ class Store:
             ).fetchone()
             if row is None:
                 continue
-            bundle = parse_bundle(bytes(row["exact_bundle"]))
+            summary = self._asp_summary(row, replayed=False, include_digest=False)
+            source = {
+                "asp_id": summary["asp_id"],
+                "collected_at": summary["collected_at"],
+                "stored_at": summary["stored_at"],
+                "subject": summary["subject"],
+                "contract": summary["contract"],
+                "evidence": None,
+                "error": None,
+            }
+            sources.append(source)
+            # Stored under an older vendored schema, a bundle can fail a
+            # stricter one; that is this sandbox's problem, not the page's.
+            try:
+                bundle = parse_bundle(bytes(row["exact_bundle"]))
+            except BundleValidationError:
+                source["error"] = "the stored bundle does not pass this RailDash's validation"
+                continue
             attributes = (
                 bundle["sandbox"]["attributes"]
                 if bundle["bundle_version"] == BUNDLE_VERSION_V2
@@ -1261,17 +1280,7 @@ class Store:
                 }
                 value = attribute.get("value")
                 evidence["files"] = value if isinstance(value, list) else []
-            summary = self._asp_summary(row, replayed=False, include_digest=False)
-            sources.append(
-                {
-                    "asp_id": summary["asp_id"],
-                    "collected_at": summary["collected_at"],
-                    "stored_at": summary["stored_at"],
-                    "subject": summary["subject"],
-                    "contract": summary["contract"],
-                    "evidence": evidence,
-                }
-            )
+            source["evidence"] = evidence
         return {
             "session_id": session_id,
             "agent_key": agent_key or None,
