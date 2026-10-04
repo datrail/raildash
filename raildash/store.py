@@ -267,12 +267,16 @@ class Store:
     def __init__(self, path: str | Path = "raildash.db") -> None:
         self.path = str(path)
         self._prepare_private_database_path(Path(path))
-        self._asp_retention_count = self._retention_setting(
-            "RAILDASH_ASP_RETENTION_COUNT", ASP_RETENTION_COUNT
-        )
-        self._asp_retention_days = self._retention_setting(
-            "RAILDASH_ASP_RETENTION_DAYS", ASP_RETENTION_DAYS
-        )
+        # Env-var/default retention bounds; a value stored by
+        # `set_asp_retention` overrides them (see `_retention_locked`).
+        self._asp_retention_defaults = {
+            "keep_count": self._retention_setting(
+                "RAILDASH_ASP_RETENTION_COUNT", ASP_RETENTION_COUNT
+            ),
+            "max_age_days": self._retention_setting(
+                "RAILDASH_ASP_RETENTION_DAYS", ASP_RETENTION_DAYS
+            ),
+        }
         self._lock = threading.Lock()
         self._db = sqlite3.connect(
             self.path, timeout=BUSY_TIMEOUT_SECONDS, check_same_thread=False
@@ -289,13 +293,16 @@ class Store:
         self._db.execute("SELECT count(*) FROM sqlite_master").fetchone()
         # Upgrading an older database -- the credential migration above all --
         # runs under an exclusive lock, so no other process inserts an
-        # unredacted row between migration pages or after the schema version
-        # has advanced. Every other open stays in NORMAL locking mode. RailDash
-        # once held the exclusive lock for the life of the process, which kept
-        # every `raildash asp ...` command out of the database while
-        # `raildash serve` ran, even though the dashboard suggests those
-        # commands; SQLite's WAL locking already serializes writers across
-        # processes, and each write transaction here is short.
+        # unredacted row between migration pages or before the upgraded schema
+        # version is committed. Every other open stays in NORMAL locking mode,
+        # so an old pre-redaction RailDash started later against an upgraded
+        # database is no longer locked out; its rows are still scrubbed when
+        # read back (`_safe_raw`). RailDash once held the exclusive lock for
+        # the life of the process, which kept every `raildash asp ...` command
+        # out of the database while `raildash serve` ran, even though the
+        # dashboard suggests those commands; SQLite's WAL locking already
+        # serializes writers across processes, and each write transaction here
+        # is short.
         upgrading = self._needs_upgrade()
         if upgrading:
             locking_mode = self._db.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()[0]
@@ -314,12 +321,6 @@ class Store:
         self._ensure_multi_agent_columns()
         self._ensure_content_columns()
         self._migrate()
-        # A UI-driven retention change (`set_asp_retention`) persists here so it
-        # survives a restart without re-exporting an env var. It only overrides
-        # the env-var/default value computed above once the settings table
-        # actually holds one -- an env var alone, with no prior UI change, still
-        # behaves exactly as it always has.
-        self._apply_stored_retention_overrides()
         self._db.commit()
         if upgrading:
             # Back to NORMAL; SQLite releases the lock on the next access.
@@ -470,8 +471,17 @@ class Store:
         "max_age_days": "asp_retention_max_age_days",
     }
 
-    def _apply_stored_retention_overrides(self) -> None:
-        attrs = {"keep_count": "_asp_retention_count", "max_age_days": "_asp_retention_days"}
+    def _retention_locked(self) -> dict[str, int]:
+        """The retention bounds in force right now, read from the database.
+
+        A UI/CLI retention change (`set_asp_retention`) persists in the
+        settings table so it survives a restart without re-exporting an env
+        var, and overrides the env-var/default value only once the table holds
+        one. It is read on every use rather than cached, because another
+        process -- `raildash asp retention-set` beside a running server -- may
+        have changed it; a stale copy would prune ASPs under the old bounds.
+        """
+        bounds = dict(self._asp_retention_defaults)
         for name, key in self._RETENTION_SETTINGS_KEYS.items():
             row = self._db.execute(
                 "SELECT value FROM settings WHERE key = ?", (key,)
@@ -483,14 +493,13 @@ class Store:
             except ValueError:
                 continue
             if value > 0:
-                setattr(self, attrs[name], value)
+                bounds[name] = value
+        return bounds
 
     def get_asp_retention(self) -> dict[str, int]:
         """Current retention bounds -- env-var/default unless a UI change overrode them."""
-        return {
-            "keep_count": self._asp_retention_count,
-            "max_age_days": self._asp_retention_days,
-        }
+        with self._lock:
+            return self._retention_locked()
 
     def set_asp_retention(self, *, keep_count: int, max_age_days: int) -> dict[str, int]:
         """Persist a UI/CLI-driven retention change so it survives a restart.
@@ -502,16 +511,13 @@ class Store:
         """
         if keep_count <= 0 or max_age_days <= 0:
             raise ValueError("keep_count and max_age_days must be positive integers")
-        with self._lock:
+        with self._write_transaction():
             for name, value in (("keep_count", keep_count), ("max_age_days", max_age_days)):
                 self._db.execute(
                     """INSERT INTO settings (key, value) VALUES (?, ?)
                        ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
                     (self._RETENTION_SETTINGS_KEYS[name], str(value)),
                 )
-            self._db.commit()
-        self._asp_retention_count = keep_count
-        self._asp_retention_days = max_age_days
         return self.get_asp_retention()
 
     def _secure_database_files(self) -> None:
@@ -715,10 +721,7 @@ class Store:
                 ),
             )
             self._compare_active_locked(asp_id, raw, identity_kind, identity_value)
-            self._prune_asp_history_locked(
-                keep_count=self._asp_retention_count,
-                max_age_days=self._asp_retention_days,
-            )
+            self._prune_asp_history_locked(**self._retention_locked())
             row = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
         self._secure_database_files()
         return self._asp_summary(row, replayed=False)
@@ -788,9 +791,14 @@ class Store:
             raise ValueError("version must be a non-empty trimmed string of at most 128 characters")
 
     def _locked_version_of(self, asp_id: str) -> sqlite3.Row | None:
+        # A database written before an ASP could be locked only once may hold
+        # several versions for one ASP; prefer the active one, then the first.
         return self._db.execute(
-            """SELECT * FROM alignment_versions WHERE asp_id = ?
-               ORDER BY locked_at, rowid LIMIT 1""",
+            """SELECT v.* FROM alignment_versions v
+               LEFT JOIN active_bindings b
+                 ON b.alignment_version_id = v.alignment_version_id
+               WHERE v.asp_id = ?
+               ORDER BY b.alignment_version_id IS NULL, v.locked_at, v.rowid LIMIT 1""",
             (asp_id,),
         ).fetchone()
 
@@ -1266,12 +1274,13 @@ class Store:
     def prune_asp_history(self, *, keep_count: int = ASP_RETENTION_COUNT, max_age_days: int = ASP_RETENTION_DAYS) -> int:
         if keep_count < 0 or max_age_days < 0:
             raise ValueError("retention bounds must be non-negative")
-        with self._lock:
-            removed = self._prune_asp_history_locked(
+        # One IMMEDIATE transaction: the candidates chosen here are still
+        # unlocked when they are deleted, even if a `raildash asp ...` command
+        # locks one at the same moment, and any error rolls the whole prune back.
+        with self._write_transaction():
+            return self._prune_asp_history_locked(
                 keep_count=keep_count, max_age_days=max_age_days
             )
-            self._db.commit()
-            return removed
 
     def _prune_asp_history_locked(self, *, keep_count: int, max_age_days: int) -> int:
         rows = self._db.execute(

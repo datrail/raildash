@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+import sqlite3
 import subprocess
 import sys
 import time
@@ -218,6 +219,52 @@ def test_index_names_the_database_for_copyable_commands(client):
     html = client.get("/").text
     path = str(Path(app_module.store.path).resolve())
     assert f'<meta name="raildash-db" content="{path}">' in html
+
+
+# ------------------------------------------- two processes, one database
+
+
+def test_a_retention_change_from_another_process_takes_effect_at_once(tmp_path):
+    """`raildash asp retention-set` beside a running server: the server must
+    prune under the new bounds, not a copy it read at startup."""
+    database = tmp_path / "shared.db"
+    server = Store(database)
+    cli = Store(database)
+    assert cli.set_asp_retention(keep_count=2, max_age_days=365) == {
+        "keep_count": 2, "max_age_days": 365
+    }
+    cli.close()
+    assert server.get_asp_retention() == {"keep_count": 2, "max_age_days": 365}
+    for index in range(3):
+        server.load_asp(
+            changed_bundle(f"bnd-r{index}", f"r{index}.example", "2026-09-24T01:00:00Z")
+        )
+    assert server.asp_count() == 2
+    server.close()
+
+
+def test_a_failed_prune_rolls_back_and_leaves_no_open_transaction(tmp_path, monkeypatch):
+    store = Store(tmp_path / "prune.db")
+    first = store.load_asp(ASP_FIXTURE.read_bytes())
+    store.make_baseline(first["asp_id"], "v1.0")
+    store.load_asp(changed_bundle("bnd-p", "p.example", "2026-09-24T01:00:00Z"))
+    drift_rows = store._db.execute("SELECT count(*) FROM drift_results").fetchone()[0]  # noqa: SLF001
+    assert drift_rows
+
+    def half_done(**_bounds):
+        store._db.execute("DELETE FROM drift_results")  # noqa: SLF001
+        raise sqlite3.IntegrityError("asps are immutable")
+
+    monkeypatch.setattr(store, "_prune_asp_history_locked", half_done)
+    with pytest.raises(sqlite3.IntegrityError):
+        store.prune_asp_history(keep_count=0, max_age_days=0)
+    assert not store._db.in_transaction  # noqa: SLF001
+    assert store._db.execute("SELECT count(*) FROM drift_results").fetchone()[0] == drift_rows  # noqa: SLF001
+    other = sqlite3.connect(tmp_path / "prune.db", timeout=0.1)
+    other.execute("INSERT INTO sessions (session_id) VALUES ('after-prune')")
+    other.commit()
+    other.close()
+    store.close()
 
 
 # ----------------------------------------------------- CLI beside a server

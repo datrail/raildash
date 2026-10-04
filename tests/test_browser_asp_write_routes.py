@@ -539,3 +539,33 @@ def test_history_locks_an_older_asp_downloads_exact_bytes_and_accepts_once(tmp_p
             browser.close()
     finally:
         _stop(process)
+
+
+def test_history_pager_keeps_keyboard_focus(tmp_path):
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    for index in range(21):
+        store.load_asp(
+            _drifted_bundle_bytes(bundle_id=f"bnd-page-{index}", destination=f"p{index}.example")
+        )
+    store.close()
+
+    process, url = _serve(database)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle")
+            history = page.locator(".asp-history")
+            assert history.locator("tbody tr").count() == 20
+            history.get_by_role("button", name="Older").focus()
+            page.keyboard.press("Enter")
+            page.wait_for_selector(".asp-history .pager-text:has-text('21–21 of 21')")
+            # "Older" is disabled on the last page, so focus moves to "Newer".
+            assert page.evaluate("document.activeElement.textContent") == "Newer"
+            page.keyboard.press("Enter")
+            page.wait_for_selector(".asp-history .pager-text:has-text('1–20 of 21')")
+            assert page.evaluate("document.activeElement.textContent") == "Older"
+            browser.close()
+    finally:
+        _stop(process)

@@ -74,7 +74,18 @@ paths:
         - {$ref: '#/components/parameters/PageLimit'}
         - {$ref: '#/components/parameters/PageOffset'}
       responses:
-        '200': {description: One page of ASP history}
+        '200':
+          description: One page of ASP history
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: '#/components/schemas/Page'}
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: {$ref: '#/components/schemas/AspHistoryItem'}
 
   /api/asps/{asp_id}/state:
     get:
@@ -198,8 +209,16 @@ paths:
               type: object
               properties: {version: {type: string, minLength: 1, maxLength: 128}}
       responses:
-        '201': {description: This call locked the ASP; the new alignment version and its active binding}
-        '200': {description: The ASP was already locked; its alignment version and the active binding}
+        '201':
+          description: This call locked the ASP; the new alignment version and its active binding
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BaselineResult'}
+        '200':
+          description: The ASP was already locked; its alignment version and the active binding
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BaselineResult'}
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such ASP}
         '409': {description: A version label is needed, or that label already exists for this agent identity}
@@ -237,14 +256,21 @@ paths:
           application/json:
             schema:
               type: object
-              required: [version]
               properties: {version: {type: string, minLength: 1, maxLength: 128}}
       responses:
-        '201': {description: This call locked the ASP; the new alignment version and its active binding}
-        '200': {description: The ASP was already locked; its alignment version and the active binding}
+        '201':
+          description: This call locked the ASP; the new alignment version and its active binding
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BaselineResult'}
+        '200':
+          description: The ASP was already locked; its alignment version and the active binding
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BaselineResult'}
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such ASP}
-        '409': {description: That version already exists for this agent identity}
+        '409': {description: A version label is needed, or that label already exists for this agent identity}
 
   /api/settings/asp-retention:
     get:
@@ -555,11 +581,48 @@ components:
       description: |
         The local write token: `RAILDASH_TOKEN` if set, otherwise the contents
         of `<db path>.token` (0600), which RailDash creates on first start and
-        reuses across restarts. Required on every write route and on the two
-        reads that carry exact evidence.
+        reuses across restarts. Required on every write route and on the three
+        reads that carry exact evidence (`bundle`, `raw`, `drift/explained`).
       schema: {type: string}
 
   schemas:
+    BaselineResult:
+      type: object
+      required: [alignment_version, binding, locked, switched]
+      properties:
+        alignment_version: {type: object, description: The ASP's alignment version}
+        binding: {type: object, description: The agent identity's active binding}
+        locked: {type: boolean, description: Whether this call locked the ASP}
+        switched: {type: boolean, description: Whether this call changed the active baseline}
+
+    AspHistoryItem:
+      description: An AspSummary without its digest, plus where the ASP stands now.
+      allOf:
+        - {$ref: '#/components/schemas/AspSummary'}
+        - type: object
+          required: [status, latest_for_agent, locked_versions, comparison]
+          properties:
+            status: {type: string, enum: [baseline, locked, candidate]}
+            latest_for_agent: {type: boolean}
+            locked_versions:
+              type: array
+              items:
+                type: object
+                required: [alignment_version_id, version, locked_at, active]
+                properties:
+                  alignment_version_id: {type: string}
+                  version: {type: string}
+                  locked_at: {type: string, format: date-time}
+                  active: {type: boolean}
+            comparison:
+              nullable: true
+              type: object
+              required: [against_version, state, change_count]
+              properties:
+                against_version: {type: string}
+                state: {type: string, enum: [ALIGNED, DRIFT_DETECTED, COMPARISON_UNAVAILABLE]}
+                change_count: {type: integer, minimum: 0}
+
     Page:
       type: object
       required: [total, items, limit, offset]

@@ -562,8 +562,9 @@ function historyComparison(item) {
 
 // Every received ASP, newest first: what it is now (baseline, locked, or a
 // candidate nobody locked), how it compares with the baseline, and actions to
-// make it the baseline or download exactly what RailMon sent.
-async function renderAspHistory(versionsByIdentity) {
+// make it the baseline or download exactly what RailMon sent. Returns the
+// section and, after paging, the pager button keyboard focus goes back to.
+async function renderAspHistory(versionsByIdentity, focusAction) {
   const section = el("section", "asp-history");
   section.setAttribute("aria-labelledby", "asp-history-h");
   const heading = el("h3", null, "Received profiles");
@@ -651,6 +652,7 @@ async function renderAspHistory(versionsByIdentity) {
   wrap.append(table);
   section.append(wrap);
 
+  let focusTarget = null;
   if (page.total > ASP_HISTORY_PAGE_SIZE) {
     const offset = page.offset;
     const pager = el("div", "asp-drift-pager");
@@ -659,21 +661,25 @@ async function renderAspHistory(versionsByIdentity) {
     previous.disabled = offset === 0;
     previous.addEventListener("click", () => {
       state.aspHistoryOffset = Math.max(0, offset - ASP_HISTORY_PAGE_SIZE);
-      loadAspAlignments("history", "action").catch((error) => console.error(error));
+      loadAspAlignments("history", "previous").catch((error) => console.error(error));
     });
     const next = el("button", "btn btn-quiet", "Older");
     next.type = "button";
     next.disabled = offset + page.items.length >= page.total;
     next.addEventListener("click", () => {
       state.aspHistoryOffset = offset + ASP_HISTORY_PAGE_SIZE;
-      loadAspAlignments("history", "action").catch((error) => console.error(error));
+      loadAspAlignments("history", "next").catch((error) => console.error(error));
     });
     pager.append(previous,
       el("span", "pager-text", `${offset + 1}–${offset + page.items.length} of ${page.total}`),
       next);
     section.append(pager);
+    if (focusAction === "previous" || focusAction === "next") {
+      focusTarget = focusAction === "previous" ? previous : next;
+      if (focusTarget.disabled) focusTarget = focusAction === "previous" ? next : previous;
+    }
   }
-  return section;
+  return [section, focusTarget];
 }
 
 async function loadAspAlignments(focusKey = null, focusAction = null) {
@@ -866,7 +872,11 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
     }
     body.append(card);
   }
-  body.append(await renderAspHistory(versionsByIdentity));
+  const [history, historyFocus] = await renderAspHistory(
+    versionsByIdentity, focusKey === "history" ? focusAction : null
+  );
+  body.append(history);
+  if (historyFocus) focusTarget = historyFocus;
   const announcement = states
     .map(({ alignment }) => (
       `${identityLabel(alignment.asp.agent_identity)}: ${statePresentation(alignment.state)[0]}`

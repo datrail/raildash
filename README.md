@@ -156,8 +156,9 @@ malformed or unresolvable bundle.
 `GET /api/asps`, `/api/asps/history`, `/api/alignments`, and per-ASP
 `state`/`drift` stay unauthenticated, redacted metadata (change names and field names, never
 evidence values or digests) — unchanged from before. Everything that mutates
-custody state, plus the two reads that carry exact evidence
-(`GET /api/asps/{asp_id}/bundle`, `GET /api/asps/{asp_id}/drift/explained`,
+custody state, plus the three reads that carry exact evidence
+(`GET /api/asps/{asp_id}/bundle`, `GET /api/asps/{asp_id}/raw`,
+`GET /api/asps/{asp_id}/drift/explained`,
 which is the per-attribute old/new/tier detail behind the dashboard's "drift
 explained" view), requires a local write token as an `X-RailDash-Token`
 header:
