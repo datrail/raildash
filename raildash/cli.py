@@ -93,7 +93,7 @@ def _open_store(args: argparse.Namespace) -> Store:
     try:
         return Store(args.db)
     except Exception as exc:
-        print(f"raildash: cannot open database exclusively: {exc}", file=sys.stderr)
+        print(f"raildash: cannot open database: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
 
@@ -145,6 +145,19 @@ def cmd_asp_switch(args: argparse.Namespace) -> int:
         store.close()
     except KeyError as exc:
         print(f"raildash: ASP switch failed: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+def cmd_asp_baseline(args: argparse.Namespace) -> int:
+    """Lock (if needed) and activate one ASP -- the UI's "use as baseline"."""
+    try:
+        store = _open_store(args)
+        result = store.make_baseline(args.asp_id, args.version)
+        store.close()
+    except (KeyError, ValueError) as exc:
+        print(f"raildash: ASP baseline failed: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
@@ -287,6 +300,16 @@ def build_parser() -> argparse.ArgumentParser:
     asp_switch = asp_sub.add_parser("switch", help="make an alignment version active")
     asp_switch.add_argument("alignment_version_id")
     asp_switch.set_defaults(func=cmd_asp_switch)
+
+    asp_baseline = asp_sub.add_parser(
+        "baseline",
+        help="make one stored ASP the active baseline, locking it first if needed",
+    )
+    asp_baseline.add_argument("asp_id")
+    asp_baseline.add_argument(
+        "--version", help="label for the new alignment version (needed only if not locked yet)"
+    )
+    asp_baseline.set_defaults(func=cmd_asp_baseline)
 
     asp_export = asp_sub.add_parser("export", help="export exact ASP evidence to a private file")
     asp_export.add_argument("asp_id")

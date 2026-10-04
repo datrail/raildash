@@ -61,6 +61,32 @@ paths:
                         type: array
                         items: {$ref: '#/components/schemas/AlignmentSummary'}
 
+  /api/asps/history:
+    get:
+      operationId: listAspHistory
+      summary: List received ASPs newest first, with baseline/locked/candidate status
+      description: |
+        Redacted metadata like `/api/asps`, plus each ASP's `status`
+        (`baseline`, `locked` or `candidate`), its locked version labels,
+        whether it is the newest for its agent, and its comparison with the
+        active baseline when one was made.
+      parameters:
+        - {$ref: '#/components/parameters/PageLimit'}
+        - {$ref: '#/components/parameters/PageOffset'}
+      responses:
+        '200':
+          description: One page of ASP history
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - {$ref: '#/components/schemas/Page'}
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: {$ref: '#/components/schemas/AspHistoryItem'}
+
   /api/asps/{asp_id}/state:
     get:
       operationId: getAspState
@@ -107,6 +133,22 @@ paths:
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: ASP not found}
 
+  /api/asps/{asp_id}/raw:
+    get:
+      operationId: downloadAspRaw
+      summary: Download the ASP's evidence bundle exactly as it was received
+      description: |
+        Token-gated (`X-RailDash-Token`). The response body is byte-for-byte
+        the bundle RailDash received, the same bytes `raildash asp export`
+        writes, served as an attachment named `<asp_id>.json`.
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: The exact received bytes (application/json)}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: ASP not found}
+
   /api/asps/{asp_id}/drift/explained:
     get:
       operationId: getAspDriftExplained
@@ -145,7 +187,41 @@ paths:
         '201': {description: The new alignment version}
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such ASP}
-        '409': {description: That version already exists for this agent identity}
+        '409': {description: That version already exists for this agent identity, or this ASP is already locked}
+
+  /api/asps/{asp_id}/baseline:
+    post:
+      operationId: makeBaseline
+      summary: Make one stored ASP the active baseline, locking it first if needed
+      description: |
+        Token-gated. Idempotent: an ASP is locked at most once, and an ASP
+        that is already the active baseline is left as it is. `version` is
+        needed only when the ASP is not locked yet. Equivalent to
+        `raildash asp baseline <asp_id> [--version <version>]`.
+      parameters:
+        - {$ref: '#/components/parameters/AspId'}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties: {version: {type: string, minLength: 1, maxLength: 128}}
+      responses:
+        '201':
+          description: This call locked the ASP; the new alignment version and its active binding
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BaselineResult'}
+        '200':
+          description: The ASP was already locked; its alignment version and the active binding
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BaselineResult'}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such ASP}
+        '409': {description: A version label is needed, or that label already exists for this agent identity}
 
   /api/alignments/{alignment_version_id}/switch:
     post:
@@ -166,10 +242,11 @@ paths:
   /api/asps/{asp_id}/accept-drift:
     post:
       operationId: acceptDrift
-      summary: Lock the current drifted ASP as a new baseline and switch to it
+      summary: Accept the current drifted ASP as the new baseline
       description: |
-        Token-gated. Equivalent to `raildash asp lock` immediately followed by
-        `raildash asp switch` on the version it just locked.
+        Token-gated. The same idempotent action as
+        `POST /api/asps/{asp_id}/baseline`: accepting an ASP that is already
+        locked reuses its alignment version instead of locking it again.
       parameters:
         - {$ref: '#/components/parameters/AspId'}
         - {$ref: '#/components/parameters/RailDashToken'}
@@ -179,13 +256,21 @@ paths:
           application/json:
             schema:
               type: object
-              required: [version]
               properties: {version: {type: string, minLength: 1, maxLength: 128}}
       responses:
-        '201': {description: The new alignment version and its active binding}
+        '201':
+          description: This call locked the ASP; the new alignment version and its active binding
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BaselineResult'}
+        '200':
+          description: The ASP was already locked; its alignment version and the active binding
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BaselineResult'}
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such ASP}
-        '409': {description: That version already exists for this agent identity}
+        '409': {description: A version label is needed, or that label already exists for this agent identity}
 
   /api/settings/asp-retention:
     get:
@@ -496,11 +581,48 @@ components:
       description: |
         The local write token: `RAILDASH_TOKEN` if set, otherwise the contents
         of `<db path>.token` (0600), which RailDash creates on first start and
-        reuses across restarts. Required on every write route and on the two
-        reads that carry exact evidence.
+        reuses across restarts. Required on every write route and on the three
+        reads that carry exact evidence (`bundle`, `raw`, `drift/explained`).
       schema: {type: string}
 
   schemas:
+    BaselineResult:
+      type: object
+      required: [alignment_version, binding, locked, switched]
+      properties:
+        alignment_version: {type: object, description: The ASP's alignment version}
+        binding: {type: object, description: The agent identity's active binding}
+        locked: {type: boolean, description: Whether this call locked the ASP}
+        switched: {type: boolean, description: Whether this call changed the active baseline}
+
+    AspHistoryItem:
+      description: An AspSummary without its digest, plus where the ASP stands now.
+      allOf:
+        - {$ref: '#/components/schemas/AspSummary'}
+        - type: object
+          required: [status, latest_for_agent, locked_versions, comparison]
+          properties:
+            status: {type: string, enum: [baseline, locked, candidate]}
+            latest_for_agent: {type: boolean}
+            locked_versions:
+              type: array
+              items:
+                type: object
+                required: [alignment_version_id, version, locked_at, active]
+                properties:
+                  alignment_version_id: {type: string}
+                  version: {type: string}
+                  locked_at: {type: string, format: date-time}
+                  active: {type: boolean}
+            comparison:
+              nullable: true
+              type: object
+              required: [against_version, state, change_count]
+              properties:
+                against_version: {type: string}
+                state: {type: string, enum: [ALIGNED, DRIFT_DETECTED, COMPARISON_UNAVAILABLE]}
+                change_count: {type: integer, minimum: 0}
+
     Page:
       type: object
       required: [total, items, limit, offset]

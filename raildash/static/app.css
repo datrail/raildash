@@ -452,6 +452,22 @@ code { font-family: var(--mono); }
 .asp-diff-old { color: var(--fail); }
 .asp-diff-new { color: var(--ok); }
 
+.asp-history { display: grid; gap: 6px; margin-top: 4px; }
+.asp-history h3 { font-size: 13px; }
+.asp-history .hint { margin: 0; }
+.asp-history-wrap { overflow-x: auto; }
+.asp-history-table th, .asp-history-table td {
+  padding: 6px 8px; text-align: left; vertical-align: top;
+  border-bottom: 1px solid var(--line-soft);
+}
+.asp-history-table th { color: var(--ink-faint); font-weight: 500; font-size: 11.5px; }
+.asp-history-table td > span { display: block; }
+.asp-history-table td .pill { display: inline-block; white-space: nowrap; }
+.asp-history-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.asp-latest {
+  margin-top: 2px; color: var(--accent);
+  font: 11px var(--mono); text-transform: uppercase; letter-spacing: 0.04em;
+}
 .asp-bundle-view {
   margin-top: 8px; padding: 8px;
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);

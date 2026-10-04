@@ -79,8 +79,12 @@ def test_asp_alignment_ui_is_accessible_redacted_and_offers_real_write_actions()
     assert '/drift`' in js
     # DR-120: real one-click write actions, not copy-paste-only CLI text. The
     # CLI equivalents stay documented alongside them (parity, not a fallback).
-    assert "raildash asp lock" in js
-    assert "raildash asp switch" in js
+    # The suggested commands name a real ASP and this server's database, so
+    # they run as pasted, while the server is up.
+    assert 'raildashCommand(`asp baseline ${asp.asp_id}' in js
+    assert "aspver-..." not in js
+    assert "<returned-id>" not in js
+    assert "/raw`" in js
     assert '"X-RailDash-Token"' in js
     assert "postJSON(" in js
     assert "postRawBody(" in js

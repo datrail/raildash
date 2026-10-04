@@ -139,7 +139,7 @@ def test_asp_write_actions_drive_the_full_custody_flow_from_the_ui(tmp_path):
             assert "lock this as your alignment baseline" in card.inner_text().lower()
 
             with page.expect_response(
-                lambda response: response.url.endswith("/lock") and response.status == 201
+                lambda response: response.url.endswith("/baseline") and response.status == 201
             ):
                 card.get_by_role("button", name="Lock this as your alignment baseline").click()
             # Locking and switching to it immediately self-compares the ASP
@@ -362,7 +362,7 @@ def test_a_v2_baseline_locks_from_the_ui_and_drift_names_the_agent(tmp_path):
             page.goto(url, wait_until="networkidle")
             card = page.locator(".asp-state-card").first
             with page.expect_response(
-                lambda response: response.url.endswith("/lock") and response.status == 201
+                lambda response: response.url.endswith("/baseline") and response.status == 201
             ):
                 card.get_by_role("button", name="Lock this as your alignment baseline").click()
             page.wait_for_selector(".asp-state-card:has-text('Aligned')")
@@ -387,3 +387,185 @@ def test_a_v2_baseline_locks_from_the_ui_and_drift_names_the_agent(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def _serve(database: Path) -> tuple[subprocess.Popen[str], str]:
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [
+            sys.executable, "-m", "raildash.cli",
+            "--db", str(database),
+            "serve", "--host", "127.0.0.1", "--port", str(port),
+        ],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _wait_until_ready(url, process)
+    return process, url
+
+
+def _stop(process: subprocess.Popen[str]) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def test_empty_state_explains_railmon_auto_delivery(tmp_path):
+    database = tmp_path / "raildash.db"
+    process, url = _serve(database)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle")
+            empty = page.locator(".asp-empty")
+            empty.wait_for()
+            text = empty.inner_text()
+            assert f"RAIL_RAILDASH_URL={url}" in text
+            assert f"RAIL_RAILDASH_TOKEN=\"$(cat {database}.token)\"" in text
+            assert "--interval" in text
+            assert f"raildash --db {database} asp load evidence-bundle.json" in text
+            assert f"{url}/v1/evidence-bundles" in text
+            browser.close()
+    finally:
+        _stop(process)
+
+
+def test_history_locks_an_older_asp_downloads_exact_bytes_and_accepts_once(tmp_path):
+    database = tmp_path / "raildash.db"
+    oldest_bytes = FIXTURE.read_bytes()
+    # Pretty-printed differently from anything RailDash would write, so a
+    # download that reserialized the JSON could not match.
+    middle_value = json.loads(
+        _drifted_bundle_bytes(bundle_id="bnd-history-middle", destination="middle.example")
+    )
+    middle_bytes = json.dumps(middle_value, indent=5).encode() + b"\n\n"
+    newest_bytes = _drifted_bundle_bytes(
+        bundle_id="bnd-history-newest", destination="newest.example"
+    )
+    store = Store(database)
+    oldest = store.load_asp(oldest_bytes)
+    middle = store.load_asp(middle_bytes)
+    newest = store.load_asp(newest_bytes)
+    store.close()
+
+    process, url = _serve(database)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(accept_downloads=True)
+            errors: list[str] = []
+            page.on(
+                "console",
+                lambda message: errors.append(message.text) if message.type == "error" else None,
+            )
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url, wait_until="networkidle")
+
+            rows = page.locator(".asp-history-table tbody tr")
+            assert rows.count() == 3
+            assert [rows.nth(i).get_attribute("data-asp-id") for i in range(3)] == [
+                newest["asp_id"], middle["asp_id"], oldest["asp_id"]
+            ]
+            assert "latest" in rows.nth(0).inner_text().lower()
+            assert all("Candidate" in rows.nth(i).inner_text() for i in range(3))
+
+            # Lock the oldest one as the baseline from the history list.
+            oldest_row = page.locator(f'tr[data-asp-id="{oldest["asp_id"]}"]')
+            with page.expect_response(
+                lambda response: response.url.endswith("/baseline") and response.status == 201
+            ):
+                oldest_row.get_by_role("button", name="Lock as baseline").click()
+            page.wait_for_selector(
+                f'tr[data-asp-id="{oldest["asp_id"]}"]:has-text("Current baseline · v1.0")'
+            )
+            newest_row = page.locator(f'tr[data-asp-id="{newest["asp_id"]}"]')
+            assert "1 change from v1.0" in newest_row.inner_text()
+            page.wait_for_selector(".asp-state-card:has-text('Drift detected')")
+
+            # Download the middle one: exactly the bytes that were received.
+            middle_row = page.locator(f'tr[data-asp-id="{middle["asp_id"]}"]')
+            with page.expect_download() as download_info:
+                middle_row.get_by_role("button", name=f"Download {middle['asp_id']} as received").click()
+            download = download_info.value
+            assert download.suggested_filename == f"{middle['asp_id']}.json"
+            assert Path(download.path()).read_bytes() == middle_bytes
+
+            # Accept the drift, switch back, and accept again: one version only.
+            drifted_card = page.locator(".asp-state-card", has_text="Drift detected").first
+            with page.expect_response(
+                lambda response: "/accept-drift" in response.url and response.status == 201
+            ):
+                drifted_card.get_by_role("button", name="Accept new state as new baseline").click()
+            page.wait_for_selector(".asp-state-card:has-text('Aligned')")
+            card = page.locator(".asp-state-card").first
+            card.locator("select").select_option(label="v1.0")
+            with page.expect_response(
+                lambda response: "/switch" in response.url and response.status == 200
+            ):
+                card.get_by_role("button", name="Switch").click()
+            drifted_card = page.locator(".asp-state-card", has_text="Drift detected").first
+            drifted_card.wait_for()
+            with page.expect_response(
+                lambda response: "/accept-drift" in response.url and response.status == 200
+            ):
+                drifted_card.get_by_role("button", name="Accept new state as new baseline").click()
+            page.wait_for_selector(".asp-state-card:has-text('Aligned')")
+            versions = json.loads(urlopen(f"{url}/api/alignments").read())["items"]
+            assert sorted(v["version"] for v in versions) == ["v1.0", "v2.0"]
+
+            # The oldest is now only locked; one click (no label) restores it.
+            page.wait_for_selector(
+                f'tr[data-asp-id="{oldest["asp_id"]}"]:has-text("Locked · v1.0")'
+            )
+            oldest_row = page.locator(f'tr[data-asp-id="{oldest["asp_id"]}"]')
+            with page.expect_response(
+                lambda response: response.url.endswith("/baseline") and response.status == 200
+            ):
+                oldest_row.get_by_role("button", name="Use as baseline").click()
+            page.wait_for_selector(
+                f'tr[data-asp-id="{oldest["asp_id"]}"]:has-text("Current baseline · v1.0")'
+            )
+            versions = json.loads(urlopen(f"{url}/api/alignments").read())["items"]
+            assert len(versions) == 2
+
+            assert errors == []
+            browser.close()
+    finally:
+        _stop(process)
+
+
+def test_history_pager_keeps_keyboard_focus(tmp_path):
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    for index in range(21):
+        store.load_asp(
+            _drifted_bundle_bytes(bundle_id=f"bnd-page-{index}", destination=f"p{index}.example")
+        )
+    store.close()
+
+    process, url = _serve(database)
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle")
+            history = page.locator(".asp-history")
+            assert history.locator("tbody tr").count() == 20
+            history.get_by_role("button", name="Older").focus()
+            page.keyboard.press("Enter")
+            page.wait_for_selector(".asp-history .pager-text:has-text('21–21 of 21')")
+            # "Older" is disabled on the last page, so focus moves to "Newer".
+            assert page.evaluate("document.activeElement.textContent") == "Newer"
+            page.keyboard.press("Enter")
+            page.wait_for_selector(".asp-history .pager-text:has-text('1–20 of 21')")
+            assert page.evaluate("document.activeElement.textContent") == "Older"
+            browser.close()
+    finally:
+        _stop(process)

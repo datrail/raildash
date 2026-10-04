@@ -17,9 +17,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
@@ -58,6 +60,10 @@ UNSAFE_LEGACY_CAPTURE = {
 # unattributed queue and never count toward any one agent.
 UNATTRIBUTED_SQL = "('ambiguous', 'unknown', 'conflict')"
 MAX_PROFILE_TOOL_ROWS = 10_000
+# How long a statement waits for another process's write to finish -- a
+# `raildash asp ...` command run while `raildash serve` is up, or the reverse.
+# Every write transaction here is a few milliseconds, so this is headroom.
+BUSY_TIMEOUT_SECONDS = 10.0
 MAX_PROFILE_TOOL_NAMES = 1_000
 MAX_PROFILE_DIMENSION_VALUES = 100
 MAX_PROFILE_VALUE_CHARS = 256
@@ -231,6 +237,23 @@ BEFORE DELETE ON alignment_versions
 BEGIN SELECT RAISE(ABORT, 'alignment versions are immutable'); END;
 """
 
+SCHEMA_TABLES = frozenset(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA))
+# Columns `_ensure_multi_agent_columns`/`_ensure_content_columns` add to a
+# database created before them.
+UPGRADE_INTERACTION_COLUMNS = frozenset(
+    (
+        "agent_host_id",
+        "sandbox_name",
+        "agent_key",
+        "attribution_state",
+        "attribution_method",
+        "attribution_reason",
+        "attribution_target",
+        "request_media_type",
+        "content_kinds",
+    )
+)
+
 
 class Store:
     """A SQLite-backed store. Safe to share across FastAPI's threadpool.
@@ -244,37 +267,93 @@ class Store:
     def __init__(self, path: str | Path = "raildash.db") -> None:
         self.path = str(path)
         self._prepare_private_database_path(Path(path))
-        self._asp_retention_count = self._retention_setting(
-            "RAILDASH_ASP_RETENTION_COUNT", ASP_RETENTION_COUNT
-        )
-        self._asp_retention_days = self._retention_setting(
-            "RAILDASH_ASP_RETENTION_DAYS", ASP_RETENTION_DAYS
-        )
+        # Env-var/default retention bounds; a value stored by
+        # `set_asp_retention` overrides them (see `_retention_locked`).
+        self._asp_retention_defaults = {
+            "keep_count": self._retention_setting(
+                "RAILDASH_ASP_RETENTION_COUNT", ASP_RETENTION_COUNT
+            ),
+            "max_age_days": self._retention_setting(
+                "RAILDASH_ASP_RETENTION_DAYS", ASP_RETENTION_DAYS
+            ),
+        }
         self._lock = threading.Lock()
-        self._db = sqlite3.connect(self.path, timeout=1.0, check_same_thread=False)
+        self._db = sqlite3.connect(
+            self.path, timeout=BUSY_TIMEOUT_SECONDS, check_same_thread=False
+        )
         self._db.row_factory = sqlite3.Row
-        # A RailDash database is single-process.  Keeping SQLite's exclusive
-        # locking mode for this connection prevents an older process from
-        # inserting an unredacted row between migration pages and after the
-        # schema version has already advanced.
-        locking_mode = self._db.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()[0]
-        if locking_mode.casefold() != "exclusive":
-            raise RuntimeError("RailDash requires exclusive SQLite locking")
         # WAL so a read while a webhook is writing does not block; the
-        # dashboard polls, and a stalled poll looks like a hung page.
+        # dashboard polls, and a stalled poll looks like a hung page. Entered
+        # in NORMAL locking mode on purpose: SQLite only lets a WAL connection
+        # drop an exclusive lock again if it did not first enter WAL while
+        # exclusive, and the lock below has to be dropped once startup ends.
         self._db.execute("PRAGMA journal_mode=WAL")
+        # On a brand-new file the switch to WAL only takes effect on first
+        # access; make that access now, while still in NORMAL mode.
+        self._db.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        # Upgrading an older database -- the credential migration above all --
+        # runs under an exclusive lock, so no other process inserts an
+        # unredacted row between migration pages or before the upgraded schema
+        # version is committed. Every other open stays in NORMAL locking mode,
+        # so an old pre-redaction RailDash started later against an upgraded
+        # database is no longer locked out; its rows are still scrubbed when
+        # read back (`_safe_raw`). RailDash once held the exclusive lock for
+        # the life of the process, which kept every `raildash asp ...` command
+        # out of the database while `raildash serve` ran, even though the
+        # dashboard suggests those commands; SQLite's WAL locking already
+        # serializes writers across processes, and each write transaction here
+        # is short.
+        upgrading = self._needs_upgrade()
+        if upgrading:
+            locking_mode = self._db.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()[0]
+            if locking_mode.casefold() != "exclusive":
+                raise RuntimeError("RailDash requires exclusive SQLite locking to upgrade")
+            try:
+                self._db.execute("BEGIN EXCLUSIVE")
+            except sqlite3.OperationalError as exc:
+                self._db.close()
+                raise RuntimeError(
+                    "this database needs a one-time upgrade; stop other RailDash "
+                    f"processes using it and retry ({exc})"
+                ) from exc
+            self._db.commit()
         self._db.executescript(SCHEMA)
         self._ensure_multi_agent_columns()
         self._ensure_content_columns()
         self._migrate()
-        # A UI-driven retention change (`set_asp_retention`) persists here so it
-        # survives a restart without re-exporting an env var. It only overrides
-        # the env-var/default value computed above once the settings table
-        # actually holds one -- an env var alone, with no prior UI change, still
-        # behaves exactly as it always has.
-        self._apply_stored_retention_overrides()
         self._db.commit()
+        if upgrading:
+            # Back to NORMAL; SQLite releases the lock on the next access.
+            self._db.execute("PRAGMA locking_mode=NORMAL")
+            self._db.execute("SELECT count(*) FROM sqlite_master").fetchone()
         self._secure_database_files()
+
+    def _needs_upgrade(self) -> bool:
+        """Whether opening this database will change its schema or rows."""
+        if (
+            self._db.execute("PRAGMA user_version").fetchone()[0]
+            < CREDENTIAL_REDACTION_SCHEMA_VERSION
+        ):
+            return True
+        tables = {
+            row[0]
+            for row in self._db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if not SCHEMA_TABLES <= tables:
+            return True
+        columns = {
+            row["name"] for row in self._db.execute("PRAGMA table_info(interactions)")
+        }
+        if not UPGRADE_INTERACTION_COLUMNS <= columns:
+            return True
+        return (
+            self._db.execute(
+                "SELECT 1 FROM interactions WHERE content_kinds IS NULL LIMIT 1"
+            ).fetchone()
+            is not None
+        )
 
     def _ensure_multi_agent_columns(self) -> None:
         """Add DR-109 read columns without rewriting existing capture rows."""
@@ -392,8 +471,17 @@ class Store:
         "max_age_days": "asp_retention_max_age_days",
     }
 
-    def _apply_stored_retention_overrides(self) -> None:
-        attrs = {"keep_count": "_asp_retention_count", "max_age_days": "_asp_retention_days"}
+    def _retention_locked(self) -> dict[str, int]:
+        """The retention bounds in force right now, read from the database.
+
+        A UI/CLI retention change (`set_asp_retention`) persists in the
+        settings table so it survives a restart without re-exporting an env
+        var, and overrides the env-var/default value only once the table holds
+        one. It is read on every use rather than cached, because another
+        process -- `raildash asp retention-set` beside a running server -- may
+        have changed it; a stale copy would prune ASPs under the old bounds.
+        """
+        bounds = dict(self._asp_retention_defaults)
         for name, key in self._RETENTION_SETTINGS_KEYS.items():
             row = self._db.execute(
                 "SELECT value FROM settings WHERE key = ?", (key,)
@@ -405,14 +493,13 @@ class Store:
             except ValueError:
                 continue
             if value > 0:
-                setattr(self, attrs[name], value)
+                bounds[name] = value
+        return bounds
 
     def get_asp_retention(self) -> dict[str, int]:
         """Current retention bounds -- env-var/default unless a UI change overrode them."""
-        return {
-            "keep_count": self._asp_retention_count,
-            "max_age_days": self._asp_retention_days,
-        }
+        with self._lock:
+            return self._retention_locked()
 
     def set_asp_retention(self, *, keep_count: int, max_age_days: int) -> dict[str, int]:
         """Persist a UI/CLI-driven retention change so it survives a restart.
@@ -424,16 +511,13 @@ class Store:
         """
         if keep_count <= 0 or max_age_days <= 0:
             raise ValueError("keep_count and max_age_days must be positive integers")
-        with self._lock:
+        with self._write_transaction():
             for name, value in (("keep_count", keep_count), ("max_age_days", max_age_days)):
                 self._db.execute(
                     """INSERT INTO settings (key, value) VALUES (?, ?)
                        ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
                     (self._RETENTION_SETTINGS_KEYS[name], str(value)),
                 )
-            self._db.commit()
-        self._asp_retention_count = keep_count
-        self._asp_retention_days = max_age_days
         return self.get_asp_retention()
 
     def _secure_database_files(self) -> None:
@@ -594,7 +678,7 @@ class Store:
         identity = resolve_identity(bundle, agent_key)
         identity_kind, identity_value = self._identity_columns(identity)
         digest = bundle_digest(raw)
-        with self._lock:
+        with self._write_transaction():
             existing = self._db.execute(
                 "SELECT * FROM asps WHERE digest = ?", (digest,)
             ).fetchone()
@@ -637,14 +721,10 @@ class Store:
                 ),
             )
             self._compare_active_locked(asp_id, raw, identity_kind, identity_value)
-            self._prune_asp_history_locked(
-                keep_count=self._asp_retention_count,
-                max_age_days=self._asp_retention_days,
-            )
-            self._db.commit()
+            self._prune_asp_history_locked(**self._retention_locked())
             row = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
-            self._secure_database_files()
-            return self._asp_summary(row, replayed=False)
+        self._secure_database_files()
+        return self._asp_summary(row, replayed=False)
 
     def _compare_active_locked(
         self, asp_id: str, raw: bytes, identity_kind: str, identity_value: str
@@ -682,99 +762,274 @@ class Store:
             ),
         )
 
-    def lock_alignment(self, asp_id: str, version: str) -> dict[str, Any]:
-        if not version or len(version) > 128 or version.strip() != version:
-            raise ValueError("version must be a non-empty trimmed string of at most 128 characters")
+    @contextmanager
+    def _write_transaction(self) -> Iterator[None]:
+        """One atomic write: committed on success, rolled back on any error.
+
+        `BEGIN IMMEDIATE` takes SQLite's write lock up front, so a check made
+        inside the block (is this digest stored? is this ASP locked?) still
+        holds when the write lands, even if another process -- a
+        `raildash asp ...` command beside a running server -- writes too.
+        """
         with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+            except BaseException:
+                self._db.rollback()
+                raise
+            self._db.commit()
+
+    @staticmethod
+    def _check_version_label(version: str) -> None:
+        if (
+            not isinstance(version, str)
+            or not version
+            or len(version) > 128
+            or version.strip() != version
+        ):
+            raise ValueError("version must be a non-empty trimmed string of at most 128 characters")
+
+    def _locked_version_of(self, asp_id: str) -> sqlite3.Row | None:
+        # A database written before an ASP could be locked only once may hold
+        # several versions for one ASP; prefer the active one, then the first.
+        return self._db.execute(
+            """SELECT v.* FROM alignment_versions v
+               LEFT JOIN active_bindings b
+                 ON b.alignment_version_id = v.alignment_version_id
+               WHERE v.asp_id = ?
+               ORDER BY b.alignment_version_id IS NULL, v.locked_at, v.rowid LIMIT 1""",
+            (asp_id,),
+        ).fetchone()
+
+    def _lock_locked(self, asp: sqlite3.Row, version: str) -> sqlite3.Row:
+        # Every later compare validates this identity; one stored that it
+        # rejects would fail every ingest for that identity from then on.
+        problems = identity_problems(
+            self._identity_object(asp["identity_kind"], asp["identity_value"])
+        )
+        if problems:
+            raise ValueError(
+                "this ASP's identity cannot be locked as a baseline: " + "; ".join(problems)
+            )
+        alignment_id = f"aspver-{uuid.uuid4()}"
+        try:
+            self._db.execute(
+                """INSERT INTO alignment_versions (
+                   alignment_version_id, version, locked_at, identity_kind,
+                   identity_value, bundle_version, rule_pack_version, asp_id, digest
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    alignment_id,
+                    version,
+                    self._now(),
+                    asp["identity_kind"],
+                    asp["identity_value"],
+                    asp["bundle_version"],
+                    asp["rule_pack_version"],
+                    asp["asp_id"],
+                    asp["digest"],
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(
+                "that alignment version already exists for this agent identity"
+            ) from exc
+        return self._db.execute(
+            "SELECT * FROM alignment_versions WHERE alignment_version_id = ?",
+            (alignment_id,),
+        ).fetchone()
+
+    def lock_alignment(self, asp_id: str, version: str) -> dict[str, Any]:
+        """Lock one stored ASP as a new, immutable alignment version.
+
+        An ASP is locked at most once: locking it again under another label
+        would only add a second history row for the same evidence. Use
+        `make_baseline` to activate an ASP whether or not it is locked yet.
+        """
+        self._check_version_label(version)
+        with self._write_transaction():
             asp = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
             if asp is None:
                 raise KeyError("no such ASP")
-            # Every later compare validates this identity; one stored that it
-            # rejects would fail every ingest for that identity from then on.
-            problems = identity_problems(
-                self._identity_object(asp["identity_kind"], asp["identity_value"])
+            existing = self._locked_version_of(asp_id)
+            if existing is not None:
+                raise ValueError(
+                    f"this ASP is already locked as {existing['version']}"
+                    f" ({existing['alignment_version_id']})"
+                )
+            row = self._lock_locked(asp, version)
+        return self._alignment_contract(row)
+
+    def _switch_locked(self, version: sqlite3.Row) -> dict[str, Any]:
+        switched_at = self._now()
+        self._db.execute(
+            """INSERT INTO active_bindings (
+                   identity_kind, identity_value, alignment_version_id, switched_at
+               ) VALUES (?, ?, ?, ?)
+               ON CONFLICT(identity_kind, identity_value) DO UPDATE SET
+                   alignment_version_id = excluded.alignment_version_id,
+                   switched_at = excluded.switched_at""",
+            (
+                version["identity_kind"],
+                version["identity_value"],
+                version["alignment_version_id"],
+                switched_at,
+            ),
+        )
+        latest = self._db.execute(
+            """SELECT asp_id, exact_bundle FROM asps
+               WHERE identity_kind = ? AND identity_value = ?
+               ORDER BY stored_at DESC, rowid DESC LIMIT 1""",
+            (version["identity_kind"], version["identity_value"]),
+        ).fetchone()
+        if latest is not None:
+            self._compare_active_locked(
+                latest["asp_id"],
+                bytes(latest["exact_bundle"]),
+                version["identity_kind"],
+                version["identity_value"],
             )
-            if problems:
-                raise ValueError(
-                    "this ASP's identity cannot be locked as a baseline: " + "; ".join(problems)
-                )
-            alignment_id = f"aspver-{uuid.uuid4()}"
-            locked_at = self._now()
-            try:
-                self._db.execute(
-                    """INSERT INTO alignment_versions (
-                       alignment_version_id, version, locked_at, identity_kind,
-                       identity_value, bundle_version, rule_pack_version, asp_id, digest
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        alignment_id,
-                        version,
-                        locked_at,
-                        asp["identity_kind"],
-                        asp["identity_value"],
-                        asp["bundle_version"],
-                        asp["rule_pack_version"],
-                        asp_id,
-                        asp["digest"],
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                self._db.rollback()
-                raise ValueError(
-                    "that alignment version already exists for this agent identity"
-                ) from exc
-            self._db.commit()
-            row = self._db.execute(
-                "SELECT * FROM alignment_versions WHERE alignment_version_id = ?",
-                (alignment_id,),
-            ).fetchone()
-            return self._alignment_contract(row)
+        return self._binding_contract(version, switched_at)
+
+    def _binding_contract(self, version: sqlite3.Row, switched_at: str) -> dict[str, Any]:
+        return {
+            "binding_contract_version": 1,
+            "agent_identity": self._identity_object(
+                version["identity_kind"], version["identity_value"]
+            ),
+            "alignment_version_id": version["alignment_version_id"],
+            "switched_at": switched_at,
+        }
 
     def switch_alignment(self, alignment_version_id: str) -> dict[str, Any]:
-        with self._lock:
+        with self._write_transaction():
             version = self._db.execute(
                 "SELECT * FROM alignment_versions WHERE alignment_version_id = ?",
                 (alignment_version_id,),
             ).fetchone()
             if version is None:
                 raise KeyError("no such alignment version")
-            switched_at = self._now()
-            self._db.execute(
-                """INSERT INTO active_bindings (
-                       identity_kind, identity_value, alignment_version_id, switched_at
-                   ) VALUES (?, ?, ?, ?)
-                   ON CONFLICT(identity_kind, identity_value) DO UPDATE SET
-                       alignment_version_id = excluded.alignment_version_id,
-                       switched_at = excluded.switched_at""",
-                (
-                    version["identity_kind"],
-                    version["identity_value"],
-                    alignment_version_id,
-                    switched_at,
-                ),
-            )
-            latest = self._db.execute(
-                """SELECT asp_id, exact_bundle FROM asps
+            return self._switch_locked(version)
+
+    def make_baseline(self, asp_id: str, version: str | None) -> dict[str, Any]:
+        """Make one stored ASP the active baseline for its agent, idempotently.
+
+        Locks it under `version` only if it is not locked yet, then makes that
+        alignment version active unless it already is. Accepting the same
+        drifted ASP twice, or picking an older locked ASP from the history,
+        therefore never adds a second alignment version for the same evidence.
+        `version` is required only when the ASP still has to be locked.
+        """
+        if version is not None:
+            self._check_version_label(version)
+        with self._write_transaction():
+            asp = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
+            if asp is None:
+                raise KeyError("no such ASP")
+            row = self._locked_version_of(asp_id)
+            locked = row is None
+            if locked:
+                if version is None:
+                    raise ValueError("a version label is required to lock this ASP")
+                row = self._lock_locked(asp, version)
+            active = self._db.execute(
+                """SELECT * FROM active_bindings
+                   WHERE identity_kind = ? AND identity_value = ?""",
+                (row["identity_kind"], row["identity_value"]),
+            ).fetchone()
+            if active is not None and active["alignment_version_id"] == row["alignment_version_id"]:
+                binding, switched = self._binding_contract(row, active["switched_at"]), False
+            else:
+                binding, switched = self._switch_locked(row), True
+            return {
+                "alignment_version": self._alignment_contract(row),
+                "binding": binding,
+                "locked": locked,
+                "switched": switched,
+            }
+
+    def asp_history(self, *, limit: int, offset: int = 0) -> dict[str, Any]:
+        """Received ASPs, newest first, each with where it stands now.
+
+        `status` is `baseline` (locked and the active version for its agent),
+        `locked` (an alignment version that is not active), or `candidate`
+        (received, never locked). `comparison` is the stored result against
+        the agent's active baseline, when this ASP was compared with it.
+        Metadata only: no evidence values or digests.
+        """
+        rows = self._db.execute(
+            "SELECT * FROM asps ORDER BY stored_at DESC, rowid DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
+        items = []
+        for row in rows:
+            versions = self._db.execute(
+                """SELECT v.alignment_version_id, v.version, v.locked_at,
+                          b.alignment_version_id IS NOT NULL AS active
+                   FROM alignment_versions v
+                   LEFT JOIN active_bindings b
+                     ON b.alignment_version_id = v.alignment_version_id
+                   WHERE v.asp_id = ? ORDER BY v.locked_at, v.rowid""",
+                (row["asp_id"],),
+            ).fetchall()
+            newest = self._db.execute(
+                """SELECT asp_id FROM asps
                    WHERE identity_kind = ? AND identity_value = ?
                    ORDER BY stored_at DESC, rowid DESC LIMIT 1""",
-                (version["identity_kind"], version["identity_value"]),
+                (row["identity_kind"], row["identity_value"]),
             ).fetchone()
-            if latest is not None:
-                self._compare_active_locked(
-                    latest["asp_id"],
-                    bytes(latest["exact_bundle"]),
-                    version["identity_kind"],
-                    version["identity_value"],
-                )
-            self._db.commit()
-            return {
-                "binding_contract_version": 1,
-                "agent_identity": self._identity_object(
-                    version["identity_kind"], version["identity_value"]
-                ),
-                "alignment_version_id": alignment_version_id,
-                "switched_at": switched_at,
-            }
+            compared = self._db.execute(
+                """SELECT d.comparable, d.has_drift, d.change_count, v.version
+                   FROM drift_results d
+                   JOIN active_bindings b
+                     ON b.alignment_version_id = d.alignment_version_id
+                    AND b.identity_kind = ? AND b.identity_value = ?
+                   JOIN alignment_versions v
+                     ON v.alignment_version_id = d.alignment_version_id
+                   WHERE d.current_asp_id = ?
+                   ORDER BY d.compared_at DESC LIMIT 1""",
+                (row["identity_kind"], row["identity_value"], row["asp_id"]),
+            ).fetchone()
+            locked_versions = [
+                {
+                    "alignment_version_id": v["alignment_version_id"],
+                    "version": v["version"],
+                    "locked_at": v["locked_at"],
+                    "active": bool(v["active"]),
+                }
+                for v in versions
+            ]
+            comparison = None
+            if compared is not None:
+                comparison = {
+                    "against_version": compared["version"],
+                    "state": (
+                        "COMPARISON_UNAVAILABLE"
+                        if not compared["comparable"]
+                        else "DRIFT_DETECTED"
+                        if compared["has_drift"]
+                        else "ALIGNED"
+                    ),
+                    "change_count": compared["change_count"],
+                }
+            items.append(
+                {
+                    **self._asp_summary(row, replayed=False, include_digest=False),
+                    "status": (
+                        "baseline"
+                        if any(v["active"] for v in locked_versions)
+                        else "locked"
+                        if locked_versions
+                        else "candidate"
+                    ),
+                    "latest_for_agent": newest is not None
+                    and newest["asp_id"] == row["asp_id"],
+                    "locked_versions": locked_versions,
+                    "comparison": comparison,
+                }
+            )
+        return {"total": self.asp_count(), "items": items, "limit": limit, "offset": offset}
 
     def asp_summaries(
         self,
@@ -1019,12 +1274,13 @@ class Store:
     def prune_asp_history(self, *, keep_count: int = ASP_RETENTION_COUNT, max_age_days: int = ASP_RETENTION_DAYS) -> int:
         if keep_count < 0 or max_age_days < 0:
             raise ValueError("retention bounds must be non-negative")
-        with self._lock:
-            removed = self._prune_asp_history_locked(
+        # One IMMEDIATE transaction: the candidates chosen here are still
+        # unlocked when they are deleted, even if a `raildash asp ...` command
+        # locks one at the same moment, and any error rolls the whole prune back.
+        with self._write_transaction():
+            return self._prune_asp_history_locked(
                 keep_count=keep_count, max_age_days=max_age_days
             )
-            self._db.commit()
-            return removed
 
     def _prune_asp_history_locked(self, *, keep_count: int, max_age_days: int) -> int:
         rows = self._db.execute(

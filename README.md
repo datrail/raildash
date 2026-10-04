@@ -95,16 +95,23 @@ make test
 
 RailDash retains validated RailMon evidence bundles as immutable ASPs and can
 lock any stored ASP as an alignment version. Every one of these steps works
-from either the CLI or the live dashboard. The dashboard does not need the
-server stopped, and the CLI is an optional thin wrapper over the same
-underlying calls:
+from either the CLI or the live dashboard, and neither needs the server
+stopped: the CLI is an optional thin wrapper over the same underlying calls
+and can run against the database while `raildash serve` is using it:
 
 ```bash
 raildash asp load evidence-bundle.json
 raildash asp list
+raildash asp baseline asp-... --version v1.0   # lock if needed, then activate
 raildash asp lock asp-... --version v1.0
 raildash asp switch aspver-...
 ```
+
+The dashboard lists every received ASP newest first, marked as the current
+baseline, locked, or a candidate. Any of them can be made the baseline from
+that list, and each can be downloaded exactly as it was received. Making an
+ASP the baseline, or accepting a drifted one, is idempotent: an ASP is locked
+at most once, so repeating the action reuses its alignment version.
 
 For a bundle without a complete deployment or host-scoped Compose identity,
 pass `--agent-key NAME` to `asp load` (HTTP: `?agent_key=NAME` or an
@@ -146,11 +153,12 @@ malformed or unresolvable bundle.
 
 ### HTTP: the rest of custody, and local write safety
 
-`GET /api/asps`, `/api/alignments`, and per-ASP `state`/`drift` stay
-unauthenticated, redacted metadata (change names and field names, never
+`GET /api/asps`, `/api/asps/history`, `/api/alignments`, and per-ASP
+`state`/`drift` stay unauthenticated, redacted metadata (change names and field names, never
 evidence values or digests) — unchanged from before. Everything that mutates
-custody state, plus the two reads that carry exact evidence
-(`GET /api/asps/{asp_id}/bundle`, `GET /api/asps/{asp_id}/drift/explained`,
+custody state, plus the three reads that carry exact evidence
+(`GET /api/asps/{asp_id}/bundle`, `GET /api/asps/{asp_id}/raw`,
+`GET /api/asps/{asp_id}/drift/explained`,
 which is the per-attribute old/new/tier detail behind the dashboard's "drift
 explained" view), requires a local write token as an `X-RailDash-Token`
 header:
@@ -160,10 +168,12 @@ header:
 | `POST /v1/evidence-bundles` | `asp load` |
 | `POST /api/asps/{asp_id}/lock` `{"version": "..."}` | `asp lock` |
 | `POST /api/alignments/{id}/switch` | `asp switch` |
-| `POST /api/asps/{asp_id}/accept-drift` `{"version": "..."}` | `asp lock` + `asp switch` in one call |
+| `POST /api/asps/{asp_id}/baseline` `{"version": "..."}` | `asp baseline` (lock if needed, then switch) |
+| `POST /api/asps/{asp_id}/accept-drift` `{"version": "..."}` | `asp baseline` |
 | `GET`/`POST /api/settings/asp-retention` | `asp retention-set` |
 | `POST /api/asps/prune` | `asp prune` |
 | `GET /api/asps/{asp_id}/bundle` | `asp export` |
+| `GET /api/asps/{asp_id}/raw` (exact received bytes) | `asp export` |
 | `GET /api/asps/{asp_id}/drift/explained` | `asp drift-export` |
 
 The token is stable across restarts, so a RailMon configured once keeps

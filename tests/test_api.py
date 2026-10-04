@@ -859,15 +859,45 @@ def test_old_runtime_interaction_migration_preserves_ticket_presence(tmp_path):
     migrated.close()
 
 
-def test_store_excludes_a_second_database_process(tmp_path):
-    path = tmp_path / "exclusive.db"
+def test_a_second_process_can_write_while_the_store_is_open(tmp_path):
+    """`raildash serve` must not lock `raildash asp ...` out of its database:
+    the dashboard suggests those commands while the server is running."""
+    path = tmp_path / "shared.db"
     owner = Store(path)
     contender = sqlite3.connect(path, timeout=0.05)
-    with pytest.raises(sqlite3.OperationalError, match="locked"):
-        contender.execute("INSERT INTO sessions (session_id) VALUES ('other')")
-        contender.commit()
+    contender.execute("INSERT INTO sessions (session_id) VALUES ('other')")
+    contender.commit()
     contender.close()
+
+    second = Store(path)
+    second.upsert_session("from-second-store")
+    second.close()
+    assert {s["session_id"] for s in owner.sessions()} >= {"other", "from-second-store"}
+    owner.upsert_session("from-owner")
     owner.close()
+
+
+def test_an_upgrade_refuses_to_run_beside_another_open_process(tmp_path, monkeypatch):
+    """The credential migration still runs under an exclusive lock, so no
+    other process can insert an unredacted row while it pages through."""
+    from raildash import store as store_module
+
+    path = tmp_path / "old.db"
+    db = sqlite3.connect(path)
+    db.execute("PRAGMA journal_mode=WAL")
+    db.executescript(SCHEMA)
+    db.commit()
+    assert db.execute("PRAGMA user_version").fetchone()[0] == 0
+    db.execute("SELECT count(*) FROM sessions").fetchone()  # stays open, idle
+
+    monkeypatch.setattr(store_module, "BUSY_TIMEOUT_SECONDS", 0.05)
+    with pytest.raises(RuntimeError, match="one-time upgrade"):
+        Store(path)
+    db.close()
+
+    upgraded = Store(path)
+    assert upgraded._db.execute("PRAGMA user_version").fetchone()[0] >= 1  # noqa: SLF001
+    upgraded.close()
 
 
 def test_old_database_migration_processes_multiple_bounded_batches(
