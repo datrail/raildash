@@ -433,10 +433,130 @@ def test_capture_drift_shows_a_file_the_agent_never_wrote_before(tmp_path):
 
             # The selected capture's observed profile lists the files it touched.
             files = page.locator(".profile-group").filter(
-                has=page.get_by_role("heading", name="Files", exact=True)
+                has=page.get_by_role("heading", name="Files · asked", exact=True)
             )
             files.locator(".profile-chip").first.wait_for()
             assert "not a filesystem trace" in files.locator(".note").inner_text()
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_kernel_observed_files_sit_beside_the_asked_ones_and_a_new_write_is_drift(tmp_path):
+    """DR-154: RailMon's kernel-observed file list, from its ASPs, is shown
+    next to the files the capture's tool calls asked for, labelled as
+    observed; after a baseline is locked in the UI, a newly written path is
+    drift, listed by path."""
+    import json
+
+    from raildash.ingest import normalise
+    from raildash.store import Store
+    from test_kernel_file_access import READ, WROTE, bundle, encode
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    store.upsert_session("work", agent="agent", source="test")
+    store.add_interactions("work", [normalise({
+        "interaction_id": "w1",
+        "request": {"method": "POST", "path": "/v1/messages",
+                    "headers": {"host": "api.anthropic.com"},
+                    "body": {"model": "claude-sonnet-5", "messages": []}},
+        "response": {"status_code": 200, "body": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Read",
+             "input": {"file_path": "/workspace/notes.md"}},
+        ]}},
+    })])
+    store.load_asp(encode(bundle("bnd-browser-base", [READ])))
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database), "serve",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1400, "height": 1000})
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on(
+                "console",
+                lambda message: errors.append(message.text) if message.type == "error" else None,
+            )
+            page.goto(url, wait_until="networkidle")
+
+            def group(title: str):
+                return page.locator(".profile-group").filter(
+                    has=page.get_by_role("heading", name=title, exact=True)
+                )
+
+            asked = group("Files · asked")
+            kernel = group("Files · kernel-observed")
+            kernel.locator(".kernel-file-chip").first.wait_for()
+            # Side by side in the same grid, asked first, never merged.
+            headings = page.locator("#profile-grid .profile-group h3").all_text_contents()
+            assert headings.index("Files · kernel-observed") == headings.index("Files · asked") + 1
+            assert asked.locator(".profile-value").all_inner_texts() == ["/workspace/notes.md"]
+            assert kernel.locator(".profile-value").all_inner_texts() == ["/workspace/config.json"]
+            assert kernel.get_attribute("data-evidence") == "observed"
+            assert "observed, not asked" in kernel.locator(".note").first.inner_text()
+            assert kernel.locator(".evidence-class").inner_text() == "evidence: observed"
+            assert "● ANSWERED" in kernel.locator(".pill").inner_text()
+            assert "names no sandbox" in kernel.inner_text()
+
+            card = page.locator(".asp-state-card").first
+            with page.expect_response(
+                lambda response: response.url.endswith("/baseline") and response.status == 201
+            ):
+                card.get_by_role("button", name="Lock this as your alignment baseline").click()
+            page.wait_for_selector(".asp-state-card:has-text('Aligned')")
+
+            token = page.locator('meta[name="raildash-token"]').get_attribute("content")
+            wrote = bundle("bnd-browser-wrote", [READ, WROTE], collected_at="2026-09-24T02:00:00Z")
+            response = page.request.post(
+                f"{url}/v1/evidence-bundles", data=encode(wrote),
+                headers={"X-RailDash-Token": token, "Content-Type": "application/json"},
+            )
+            assert response.status == 202, response.text()
+            page.locator("#refresh").click()
+            page.wait_for_selector(".asp-state-card:has-text('Drift detected')")
+
+            drifted = page.locator(".asp-state-card", has_text="Drift detected").first
+            row = drifted.locator(".asp-file-diff")
+            row.wait_for()
+            assert "observed_file_access" in row.locator(".asp-change-name").inner_text()
+            assert "evidence: observed" in row.inner_text()
+            changes = {
+                line.get_attribute("data-kind"): line.locator(".drift-label").all_inner_texts()
+                for line in row.locator(".asp-file-change").all()
+            }
+            assert changes == {"Newly written": ["/workspace/exfil.txt"]}
+            assert "1 file [ANSWERED, observed]" in row.locator(".asp-diff-old").inner_text()
+            assert "2 files [ANSWERED, observed]" in row.locator(".asp-diff-new").inner_text()
+            # The raw lists are not dumped in place of the per-path view.
+            assert json.dumps(WROTE) not in row.inner_text()
+
+            # The profile beside the capture now shows the newest ASP's list,
+            # written files first.
+            kernel = group("Files · kernel-observed")
+            kernel.locator(".profile-value", has_text="/workspace/exfil.txt").wait_for()
+            assert kernel.locator(".profile-value").all_inner_texts() == [
+                "/workspace/exfil.txt", "/workspace/config.json",
+            ]
+            assert kernel.locator(".profile-count").all_inner_texts() == ["write", "read"]
             assert errors == []
             browser.close()
     finally:

@@ -410,6 +410,37 @@ paths:
         '404':
           description: Session not found
 
+  /api/profile/kernel-file-access:
+    get:
+      operationId: getKernelFileAccess
+      summary: The files the kernel saw a capture's sandbox open
+      description: |
+        Token-gated (`X-RailDash-Token`). RailMon's kernel-observed
+        `observed_file_access` attribute from the latest ASP received for each
+        sandbox this capture's interactions name (`matched_by: sandbox`); for a
+        capture that names none, from the latest ASP of every sandbox
+        (`matched_by: latest`). At most 8 sources. Kept apart from the files
+        the capture's tool calls asked for (`/api/profile`). `evidence` is
+        null for an ASP whose rule pack predates the attribute.
+      parameters:
+        - name: session_id
+          in: query
+          required: true
+          schema: {type: string}
+        - name: agent_key
+          in: query
+          schema: {type: string}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200':
+          description: Kernel-observed file access per sandbox
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KernelFileAccess'
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: Session not found}
+
   /api/interactions:
     get:
       operationId: listInteractions
@@ -582,10 +613,63 @@ components:
         The local write token: `RAILDASH_TOKEN` if set, otherwise the contents
         of `<db path>.token` (0600), which RailDash creates on first start and
         reuses across restarts. Required on every write route and on the three
-        reads that carry exact evidence (`bundle`, `raw`, `drift/explained`).
+        reads that carry exact evidence (`bundle`, `raw`, `drift/explained`,
+        `profile/kernel-file-access`).
       schema: {type: string}
 
   schemas:
+    KernelFileAccess:
+      type: object
+      required: [session_id, agent_key, attribute, matched_by, sources, sources_truncated]
+      properties:
+        session_id: {type: string}
+        agent_key: {type: [string, 'null']}
+        attribute: {const: observed_file_access}
+        matched_by: {enum: [sandbox, latest]}
+        sources_truncated: {type: boolean}
+        sources:
+          type: array
+          maxItems: 8
+          items:
+            type: object
+            required: [asp_id, collected_at, stored_at, subject, contract, evidence]
+            properties:
+              asp_id: {type: string}
+              collected_at: {type: string, format: date-time}
+              stored_at: {type: string, format: date-time}
+              subject:
+                type: object
+                properties:
+                  host_id: {type: string}
+                  sandbox_name: {type: string}
+              contract:
+                type: object
+                properties:
+                  bundle_version: {type: integer}
+                  rule_pack_version: {type: integer}
+              evidence:
+                description: The attribute's qualifiers and its list; null if the ASP has no such attribute.
+                type: ['object', 'null']
+                required: [status, reason, tier, authored_by, note, files]
+                properties:
+                  status: {enum: [ANSWERED, ABSENT, TEMPLATED, PARTIAL, BLIND, FAILED]}
+                  reason: {type: [string, 'null']}
+                  tier: {type: string, description: "observed for RailMon's filesnoop"}
+                  authored_by: {type: [string, 'null']}
+                  note: {type: [string, 'null']}
+                  files:
+                    type: array
+                    description: Evidence-bundle v1 `$defs.file_access_value`; empty when the status carries no list.
+                    items:
+                      type: object
+                      required: [path, read, write, exec, layer]
+                      properties:
+                        path: {type: string}
+                        read: {type: boolean}
+                        write: {type: boolean}
+                        exec: {type: boolean}
+                        layer: {type: boolean}
+
     BaselineResult:
       type: object
       required: [alignment_version, binding, locked, switched]

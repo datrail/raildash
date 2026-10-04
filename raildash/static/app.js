@@ -28,7 +28,8 @@ let staticDataPromise = null;
 
 // DR-120: the local write token RailDash injects into the page it
 // serves (see app.py's `index()`/`require_local_token`). Every write route,
-// plus the two reads that carry exact evidence (bundle/drift-explained),
+// plus the reads that carry exact evidence (bundle, raw, drift-explained,
+// kernel-observed files),
 // check this header; a cross-site page cannot read it because it cannot read
 // this page's own DOM.
 const LOCAL_TOKEN = (() => {
@@ -115,9 +116,9 @@ async function getJSON(path, params) {
   return res.json();
 }
 
-// Same as getJSON, but for the two token-gated reads that carry exact
-// evidence (ASP bundle inspect, drift-explained) rather than redacted
-// summaries.
+// Same as getJSON, but for the token-gated reads that carry exact evidence
+// (ASP bundle inspect, drift-explained, kernel-observed files) rather than
+// redacted summaries.
 async function getJSONWithToken(path, params) {
   const url = new URL(path, window.location.origin);
   Object.entries(params || {}).forEach(([k, v]) => {
@@ -474,7 +475,110 @@ function describeEvidenceRecord(record) {
   return JSON.stringify(record);
 }
 
+// DR-154: RailMon's kernel-observed file list. Its drift is one
+// ATTRIBUTE_CHANGED on the whole list, which as two raw JSON arrays hides
+// the one thing that matters -- which path is newly written -- so it is
+// shown path by path, by what changed.
+const FILE_ACCESS_ATTRIBUTE = "observed_file_access";
+const FILE_OPERATIONS = [["write", "written"], ["exec", "run"], ["read", "read"]];
+const MAX_FILE_LABELS = 50;
+
+function fileLabel(entry) {
+  return entry.layer ? `${entry.path} (image layer)` : entry.path;
+}
+
+function fileEntries(record) {
+  const entries = new Map();
+  const value = record && Array.isArray(record.value) ? record.value : [];
+  value.forEach((entry) => {
+    if (entry && typeof entry.path === "string") {
+      entries.set(`${entry.layer ? 1 : 0}:${entry.path}`, entry);
+    }
+  });
+  return entries;
+}
+
+// Rows of [label, paths], in the order a reader cares about: what the
+// sandbox started doing before what it stopped doing, writes first.
+function fileAccessChanges(before, after) {
+  const previous = fileEntries(before);
+  const current = fileEntries(after);
+  const keys = [...new Set([...previous.keys(), ...current.keys()])];
+  const gained = [];
+  const lost = [];
+  FILE_OPERATIONS.forEach(([operation, word]) => {
+    const started = [];
+    const stopped = [];
+    keys.forEach((key) => {
+      const was = Boolean(previous.has(key) && previous.get(key)[operation] === true);
+      const now = Boolean(current.has(key) && current.get(key)[operation] === true);
+      const entry = current.get(key) || previous.get(key);
+      if (now && !was) started.push(fileLabel(entry));
+      if (was && !now) stopped.push(fileLabel(entry));
+    });
+    gained.push([`Newly ${word}`, started.sort()]);
+    lost.push([`No longer ${word}`, stopped.sort()]);
+  });
+  // An open with none of read/write/exec set still names a file.
+  const opened = (from, to) => keys
+    .filter((key) => to.has(key) && !from.has(key))
+    .map((key) => to.get(key))
+    .filter((entry) => FILE_OPERATIONS.every(([operation]) => entry[operation] !== true))
+    .map(fileLabel)
+    .sort();
+  gained.push(["Newly opened", opened(previous, current)]);
+  lost.push(["No longer opened", opened(current, previous)]);
+  return [...gained, ...lost].filter(([, paths]) => paths.length);
+}
+
+function describeFileAccessRecord(record) {
+  if (!record) return "(absent)";
+  const count = Array.isArray(record.value) ? record.value.length : 0;
+  const qualifiers = [record.status, record.reason, record.tier].filter(Boolean).join(", ");
+  return `${fmtInt(count)} file${count === 1 ? "" : "s"}${qualifiers ? ` [${qualifiers}]` : ""}`;
+}
+
+function renderFileAccessDiffRow(change) {
+  const row = el("div", "asp-diff-row asp-file-diff");
+  row.append(el("span", "asp-change-name", `${change.type} · ${changeLabel(change)}`));
+  row.append(el("span", "asp-evidence-class",
+    "Files the sandbox opened, as RailMon's kernel probe saw them · evidence: observed"));
+  const dl = el("dl");
+  dl.append(el("dt", null, "Before"));
+  dl.append(el("dd", "asp-diff-old", describeFileAccessRecord(change.baseline)));
+  dl.append(el("dt", null, "After"));
+  dl.append(el("dd", "asp-diff-new", describeFileAccessRecord(change.current)));
+  const notes = [change.baseline, change.current].map((record) => (record && record.note) || "");
+  if (notes[0] !== notes[1]) {
+    dl.append(el("dt", null, "Note now"));
+    dl.append(el("dd", null, notes[1] || "(none)"));
+  }
+  if ((change.fields || []).length) {
+    dl.append(el("dt", null, "Fields changed"));
+    dl.append(el("dd", null, change.fields.join(", ")));
+  }
+  row.append(dl);
+  const paths = fileAccessChanges(change.baseline, change.current);
+  paths.forEach(([label, items]) => {
+    const line = el("div", "drift-change asp-file-change");
+    line.dataset.kind = label;
+    line.append(el("span", "drift-kind asp-file-kind", label));
+    items.slice(0, MAX_FILE_LABELS).forEach((item) => line.append(el("span", "drift-label", item)));
+    if (items.length > MAX_FILE_LABELS) {
+      line.append(el("span", "muted", `+${fmtInt(items.length - MAX_FILE_LABELS)} more`));
+    }
+    row.append(line);
+  });
+  if (!paths.length) {
+    row.append(el("p", "muted", "The same files, opened the same way; only the qualifiers moved."));
+  }
+  return row;
+}
+
 function renderDiffRow(change) {
+  if (change.name === FILE_ACCESS_ATTRIBUTE && change.type.startsWith("ATTRIBUTE_")) {
+    return renderFileAccessDiffRow(change);
+  }
   const row = el("div", "asp-diff-row");
   row.append(el("span", "asp-change-name", `${change.type} · ${changeLabel(change)}`));
   const dl = el("dl");
@@ -1125,7 +1229,7 @@ function fileOps(item) {
 }
 
 function profileFiles(title, items) {
-  const group = el("section", "profile-group");
+  const group = el("section", "profile-group profile-files-asked");
   group.append(el("h3", null, title));
   group.append(el("p", "note", "Asked of file tools in the captured conversation; not a filesystem trace."));
   const values = el("div", "profile-values");
@@ -1140,6 +1244,117 @@ function profileFiles(title, items) {
   });
   group.append(values);
   return group;
+}
+
+// DR-154: what the kernel saw the sandbox open, beside what the model asked
+// for. It comes from RailMon's ASPs, not this capture, so it carries its own
+// provenance (which sandbox, which ASP, when) and its evidence class, and is
+// never merged into the asked list above it.
+const MAX_KERNEL_FILE_CHIPS = 100;
+const EVIDENCE_STATUS = {
+  ANSWERED: ["●", "pill-ok"],
+  PARTIAL: ["◐", "pill-warn"],
+  ABSENT: ["○", "pill-none"],
+  TEMPLATED: ["◌", "pill-none"],
+  BLIND: ["⊘", "pill-none"],
+  FAILED: ["✕", "pill-fail"],
+};
+
+function kernelFileOps(entry) {
+  const operations = ["read", "write", "exec"].filter((operation) => entry[operation] === true);
+  return operations.length ? operations.join(" · ") : "opened";
+}
+
+function kernelFileSource(source) {
+  const block = el("div", "kernel-file-source");
+  block.dataset.aspId = source.asp_id;
+  block.append(el("p", "asp-subject",
+    `${source.subject.host_id} / ${source.subject.sandbox_name} · ` +
+    `collected ${fmtDateTime(source.collected_at)} · ${source.asp_id}`));
+  const evidence = source.evidence;
+  if (!evidence) {
+    block.append(el("span", "muted",
+      `This ASP (rule pack ${source.contract.rule_pack_version}) does not carry kernel-observed files.`));
+    return block;
+  }
+  const [glyph, tone] = EVIDENCE_STATUS[evidence.status] || ["?", "pill-none"];
+  const qualifiers = el("div", "kernel-file-qualifiers");
+  qualifiers.append(el("span", `pill ${tone}`, `${glyph} ${evidence.status}`));
+  qualifiers.append(el("span", "evidence-class", `evidence: ${evidence.tier || "unknown"}`));
+  if (evidence.reason) qualifiers.append(el("span", "muted", evidence.reason));
+  block.append(qualifiers);
+  if (evidence.note && evidence.status !== "ANSWERED") {
+    block.append(el("p", "note", evidence.note));
+  }
+  const files = evidence.files || [];
+  const values = el("div", "profile-values");
+  if (!files.length) {
+    values.append(el("span", "muted", evidence.status === "ABSENT"
+      ? "No regular file opened in the window"
+      : "No files listed"));
+  }
+  // Written and run files first: they are the ones a baseline drifts on.
+  const ranked = [...files].sort((a, b) =>
+    Number(b.write === true || b.exec === true) - Number(a.write === true || a.exec === true) ||
+    String(a.path).localeCompare(String(b.path)));
+  ranked.slice(0, MAX_KERNEL_FILE_CHIPS).forEach((entry) => {
+    const chip = el("span", "profile-chip kernel-file-chip");
+    chip.append(el("span", "profile-value", fileLabel(entry)));
+    chip.append(el("span", "profile-count", kernelFileOps(entry)));
+    values.append(chip);
+  });
+  if (ranked.length > MAX_KERNEL_FILE_CHIPS) {
+    values.append(el("span", "muted",
+      `+${fmtInt(ranked.length - MAX_KERNEL_FILE_CHIPS)} more read-only files in the ASP`));
+  }
+  block.append(values);
+  return block;
+}
+
+function profileKernelFiles(data, error) {
+  const group = el("section", "profile-group profile-files-kernel");
+  group.dataset.evidence = "observed";
+  group.append(el("h3", null, "Files · kernel-observed"));
+  group.append(el("p", "note",
+    "Opened by the sandbox, as RailMon's kernel probe saw it: observed, not asked. " +
+    "From the Agent Security Profile RailMon delivered, not from this capture."));
+  if (staticDemo) {
+    group.append(el("span", "muted", "Available in the live local dashboard."));
+    return group;
+  }
+  if (error) {
+    const message = el("p", "asp-status-msg", `Could not load kernel-observed files: ${error.message}`);
+    message.dataset.tone = "err";
+    group.append(message);
+    return group;
+  }
+  const sources = data.sources || [];
+  if (data.matched_by === "latest" && sources.length) {
+    group.append(el("p", "muted",
+      "This capture names no sandbox, so this is the latest ASP from each sandbox."));
+  }
+  if (!sources.length) {
+    group.append(el("span", "muted", data.matched_by === "sandbox"
+      ? "No Agent Security Profile received for this capture's sandbox yet."
+      : "No Agent Security Profile received yet."));
+  }
+  sources.forEach((source) => group.append(kernelFileSource(source)));
+  if (data.sources_truncated) {
+    group.append(el("p", "muted", `Showing the first ${sources.length} sandboxes.`));
+  }
+  return group;
+}
+
+async function loadKernelFiles(sessionId, agentKey) {
+  if (staticDemo) return [null, null];
+  try {
+    const data = await getJSONWithToken("/api/profile/kernel-file-access", {
+      session_id: sessionId, agent_key: agentKey,
+    });
+    return [data, null];
+  } catch (error) {
+    return [null, error];
+  }
 }
 
 async function loadProfile() {
@@ -1159,6 +1374,9 @@ async function loadProfile() {
   const path = `/api/profile?session_id=${encodeURIComponent(state.sessionId)}` +
     (agentKey ? `&agent_key=${encodeURIComponent(agentKey)}` : "");
   const profile = await getJSON("/api/profile", { session_id: state.sessionId, agent_key: agentKey });
+  // Fetched before anything is drawn, so the five-second refresh replaces
+  // the group in one step instead of flashing a loading state.
+  const [kernelFiles, kernelError] = await loadKernelFiles(state.sessionId, agentKey);
   const observed = profile.observed || {};
   download.href = staticDemo ? "./profile.json" : path;
   download.removeAttribute("aria-disabled");
@@ -1184,7 +1402,8 @@ async function loadProfile() {
   grid.append(profileValues("Uploaded content", observed.content_kinds || []));
   grid.append(profileValues("Request content types", observed.request_media_types || []));
   grid.append(profileUploads("Bytes sent per host", observed.upload_bytes || []));
-  grid.append(profileFiles("Files", observed.file_access || []));
+  grid.append(profileFiles("Files · asked", observed.file_access || []));
+  grid.append(profileKernelFiles(kernelFiles, kernelError));
   grid.append(profileFiles("File types", observed.file_types || []));
 }
 

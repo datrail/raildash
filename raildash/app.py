@@ -598,6 +598,24 @@ def api_asp_raw(asp_id: str) -> Response:
 
 
 @app.get(
+    "/api/profile/kernel-file-access", dependencies=[Depends(require_local_token)]
+)
+def api_kernel_file_access(session_id: str, agent_key: str | None = None) -> dict[str, Any]:
+    """The files the kernel saw this capture's sandbox open (DR-154).
+
+    RailMon's `observed_file_access` from the latest ASP of each sandbox the
+    capture names (or of every sandbox, when it names none), shown beside the
+    files the capture's tool calls asked for and never merged with them.
+    Token-gated like the bundle view: the paths are evidence values the
+    summary routes do not carry.
+    """
+    result = get_store().kernel_file_access(session_id, agent_key=agent_key)
+    if result is None:
+        raise HTTPException(404, "no such session")
+    return result
+
+
+@app.get(
     "/api/asps/{asp_id}/drift/explained", dependencies=[Depends(require_local_token)]
 )
 def api_asp_drift_explained(

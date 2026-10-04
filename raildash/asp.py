@@ -36,6 +36,16 @@ _VALIDATOR_V2 = Draft202012Validator(SCHEMA_V2, format_checker=FormatChecker())
 _DEPLOYMENT_VALUE_VALIDATOR = Draft202012Validator(
     {**SCHEMA["$defs"]["deployment_value"], "$schema": SCHEMA["$schema"]}
 )
+# DR-154: the same holds for `observed_file_access`, which v1 publishes as
+# `file_access_value` and v2 carries sandbox-scoped with no shape of its own.
+_FILE_ACCESS_VALUE_VALIDATOR = Draft202012Validator(
+    {**SCHEMA["$defs"]["file_access_value"], "$schema": SCHEMA["$schema"]}
+)
+FILE_ACCESS_ATTRIBUTE = "observed_file_access"
+FILE_ACCESS_VALUED_STATUSES = frozenset({"ANSWERED", "PARTIAL"})
+# The bound the v1 schema's top-level `$comment` names as code-only: the value
+# as compact JSON with non-ASCII escaped, which is how RailMon writes it.
+FILE_ACCESS_VALUE_MAX_BYTES = 256 * 1024
 
 BUNDLE_VERSION = SCHEMA["properties"]["bundle_version"]["const"]
 BUNDLE_VERSION_V2 = SCHEMA_V2["properties"]["bundle_version"]["const"]
@@ -189,11 +199,12 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
     doesn't: every attestation_ref names a real attestation; two attestations
     never share an id (`uniqueItems` checks whole-item equality, not one
     field); a deployment value's byte length is measured in UTF-8 bytes,
-    which `maxLength` cannot — it counts Unicode code points; and
+    which `maxLength` cannot — it counts Unicode code points;
     `collected_at` must be UTC, which RailDash requires but the shared
     schema's `format: date-time` (any offset, per RFC 3339) does not — this
     predates the shared schema and is kept for the same reason `_date_time`
-    still enforces it on `locked_at`."""
+    still enforces it on `locked_at`; and an `observed_file_access` value's
+    byte bound (its shape is the schema's own `file_access_value`)."""
     problems: list[str] = []
     collected_at = bundle.get("collected_at")
     if isinstance(collected_at, str):
@@ -225,7 +236,20 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
             for key, item in value.items():
                 if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
                     problems.append(f"attributes.deployment.value.{key}: exceeds byte bound")
+    problems.extend(
+        _file_access_byte_problems(attributes.get(FILE_ACCESS_ATTRIBUTE), "attributes")
+    )
     return problems
+
+
+def _file_access_byte_problems(attribute: Any, where: str) -> list[str]:
+    """An ANSWERED or PARTIAL `observed_file_access` value's byte bound."""
+    if not isinstance(attribute, dict) or attribute.get("status") not in FILE_ACCESS_VALUED_STATUSES:
+        return []
+    size = len(json.dumps(attribute.get("value"), separators=(",", ":")))
+    if size > FILE_ACCESS_VALUE_MAX_BYTES:
+        return [f"{where}.{FILE_ACCESS_ATTRIBUTE}.value: exceeds byte bound"]
+    return []
 
 
 def _attestation_ref_problems(
@@ -251,7 +275,9 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
     the reserved `"default"` (kept for the unkeyed v1-compatible path); and
     `collected_at` must be UTC, for the same reason v1 requires it (see
     `_semantic_problems`); and an ANSWERED sandbox `deployment` value has
-    v1's shape and byte bound, since it resolves to the same identity."""
+    v1's shape and byte bound, since it resolves to the same identity; and
+    an ANSWERED or PARTIAL sandbox `observed_file_access` value has v1's
+    `file_access_value` shape and its byte bound (DR-154)."""
     problems: list[str] = []
     collected_at = bundle.get("collected_at")
     if isinstance(collected_at, str):
@@ -286,6 +312,18 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
             for key, item in value.items():
                 if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
                     problems.append(f"sandbox.attributes.deployment.value.{key}: exceeds byte bound")
+    file_access = (
+        sandbox_attributes.get(FILE_ACCESS_ATTRIBUTE)
+        if isinstance(sandbox_attributes, dict)
+        else None
+    )
+    if isinstance(file_access, dict) and file_access.get("status") in FILE_ACCESS_VALUED_STATUSES:
+        for error in _FILE_ACCESS_VALUE_VALIDATOR.iter_errors(file_access.get("value")):
+            location = "".join(f"[{part}]" if isinstance(part, int) else f".{part}" for part in error.path)
+            problems.append(
+                f"sandbox.attributes.{FILE_ACCESS_ATTRIBUTE}.value{location}: {error.message}"
+            )
+        problems.extend(_file_access_byte_problems(file_access, "sandbox.attributes"))
 
     agents = bundle.get("agents")
     agent_keys: list[str] = []

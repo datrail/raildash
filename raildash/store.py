@@ -40,7 +40,9 @@ from .json_safety import (
     check_json_structure,
 )
 from .asp import (
+    BUNDLE_VERSION_V2,
     DEFAULT_DRIFT_PAGE_SIZE,
+    FILE_ACCESS_ATTRIBUTE,
     MAX_DRIFT_PAGE_SIZE,
     bundle_digest,
     compare_alignment,
@@ -95,6 +97,10 @@ FILE_TOOLS: dict[str, tuple[str, tuple[str, ...]]] = {
 # `command`; only `view` leaves the file as it was.
 TEXT_EDITOR_TOOLS = frozenset({"str_replace_based_edit_tool", "str_replace_editor"})
 TEXT_EDITOR_WRITE_COMMANDS = frozenset({"create", "str_replace", "insert", "undo_edit"})
+# DR-154: how many sandboxes' kernel-observed file lists one profile view
+# shows. A capture normally names one sandbox; this bounds the response, not
+# a use case.
+MAX_KERNEL_FILE_SOURCES = 8
 ASP_RETENTION_COUNT = 100
 ASP_RETENTION_DAYS = 30
 
@@ -1188,6 +1194,91 @@ class Store:
             "summary": json.loads(row["result_json"]),
             "baseline": parse_bundle(bytes(row["baseline_bundle"])),
             "current": parse_bundle(bytes(row["current_bundle"])),
+        }
+
+    def kernel_file_access(
+        self, session_id: str, agent_key: str | None = None
+    ) -> dict[str, Any] | None:
+        """The files the kernel saw a capture's sandbox open, beside it (DR-154).
+
+        A capture's tool calls say which files the model *asked* for
+        (`observed_profile`'s `file_access`). RailMon's filesnoop says which
+        files the sandbox actually opened, in the `observed_file_access`
+        attribute of the ASPs it delivers. This returns that attribute,
+        unchanged in kind and kept apart from the asked list, from the latest
+        ASP received for each sandbox the capture's interactions name
+        (`matched_by: "sandbox"`). A capture with no sandbox identity, which
+        is a single-agent RailMon's, names none; then it is the latest ASP
+        of every sandbox (`matched_by: "latest"`), and the caller must say
+        so. An ASP whose rule pack predates the attribute has `evidence:
+        null`.
+        """
+        if self._db.execute(
+            "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchone() is None:
+            return None
+        scope, params = "session_id = ?", [session_id]
+        if agent_key:
+            scope += " AND agent_key = ?"
+            params.append(agent_key)
+        subjects = self._db.execute(
+            f"""SELECT DISTINCT agent_host_id, sandbox_name FROM interactions
+                WHERE {scope} AND agent_host_id IS NOT NULL AND sandbox_name IS NOT NULL
+                ORDER BY agent_host_id, sandbox_name LIMIT ?""",
+            (*params, MAX_KERNEL_FILE_SOURCES + 1),
+        ).fetchall()
+        matched_by = "sandbox"
+        if not subjects:
+            matched_by = "latest"
+            subjects = self._db.execute(
+                """SELECT host_id AS agent_host_id, sandbox_name FROM asps
+                   GROUP BY host_id, sandbox_name
+                   ORDER BY MAX(stored_at) DESC, host_id, sandbox_name LIMIT ?""",
+                (MAX_KERNEL_FILE_SOURCES + 1,),
+            ).fetchall()
+        truncated = len(subjects) > MAX_KERNEL_FILE_SOURCES
+        sources = []
+        for subject in subjects[:MAX_KERNEL_FILE_SOURCES]:
+            row = self._db.execute(
+                """SELECT * FROM asps WHERE host_id = ? AND sandbox_name = ?
+                   ORDER BY stored_at DESC, rowid DESC LIMIT 1""",
+                (subject["agent_host_id"], subject["sandbox_name"]),
+            ).fetchone()
+            if row is None:
+                continue
+            bundle = parse_bundle(bytes(row["exact_bundle"]))
+            attributes = (
+                bundle["sandbox"]["attributes"]
+                if bundle["bundle_version"] == BUNDLE_VERSION_V2
+                else bundle["attributes"]
+            )
+            attribute = attributes.get(FILE_ACCESS_ATTRIBUTE)
+            evidence = None
+            if isinstance(attribute, dict):
+                evidence = {
+                    key: attribute.get(key)
+                    for key in ("status", "reason", "tier", "authored_by", "note")
+                }
+                value = attribute.get("value")
+                evidence["files"] = value if isinstance(value, list) else []
+            summary = self._asp_summary(row, replayed=False, include_digest=False)
+            sources.append(
+                {
+                    "asp_id": summary["asp_id"],
+                    "collected_at": summary["collected_at"],
+                    "stored_at": summary["stored_at"],
+                    "subject": summary["subject"],
+                    "contract": summary["contract"],
+                    "evidence": evidence,
+                }
+            )
+        return {
+            "session_id": session_id,
+            "agent_key": agent_key or None,
+            "attribute": FILE_ACCESS_ATTRIBUTE,
+            "matched_by": matched_by,
+            "sources": sources,
+            "sources_truncated": truncated,
         }
 
     def drift_explained(

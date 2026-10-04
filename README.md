@@ -113,6 +113,23 @@ that list, and each can be downloaded exactly as it was received. Making an
 ASP the baseline, or accepting a drifted one, is idempotent: an ASP is locked
 at most once, so repeating the action reuses its alignment version.
 
+### Files: asked and kernel-observed
+
+A capture's profile lists the files its tool calls *asked* to read or write
+(**Files · asked**, from the captured conversation). Beside it,
+**Files · kernel-observed** lists what RailMon's filesnoop saw the sandbox
+actually open: the `observed_file_access` attribute (path, read, write, exec,
+layer) of the latest ASP received for each sandbox the capture names, or, for
+a capture that names no sandbox (a single-agent RailMon), the latest ASP of
+every sandbox, said as such. The two are never merged: one is what the model
+requested, the other what the kernel observed. The list comes from
+`GET /api/profile/kernel-file-access?session_id=...` (token-gated, since the
+paths are evidence values).
+
+`observed_file_access` takes part in drift like any attribute. When it
+changes, the drift view lists the paths by what changed (newly written, run
+or read; no longer written, run or read) instead of two raw lists.
+
 For a bundle without a complete deployment or host-scoped Compose identity,
 pass `--agent-key NAME` to `asp load` (HTTP: `?agent_key=NAME` or an
 `X-RailDash-Agent-Key` header, see below). Replaying identical bytes is
@@ -156,11 +173,11 @@ malformed or unresolvable bundle.
 `GET /api/asps`, `/api/asps/history`, `/api/alignments`, and per-ASP
 `state`/`drift` stay unauthenticated, redacted metadata (change names and field names, never
 evidence values or digests) — unchanged from before. Everything that mutates
-custody state, plus the three reads that carry exact evidence
+custody state, plus the four reads that carry exact evidence
 (`GET /api/asps/{asp_id}/bundle`, `GET /api/asps/{asp_id}/raw`,
 `GET /api/asps/{asp_id}/drift/explained`,
 which is the per-attribute old/new/tier detail behind the dashboard's "drift
-explained" view), requires a local write token as an `X-RailDash-Token`
+explained" view, and `GET /api/profile/kernel-file-access`, below), requires a local write token as an `X-RailDash-Token`
 header:
 
 | Route | CLI equivalent |
