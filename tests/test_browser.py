@@ -335,6 +335,16 @@ def test_capture_drift_shows_a_much_larger_upload_to_a_known_host(tmp_path):
             # The selected capture's observed profile lists the same fact.
             chip = page.locator(".profile-group", has_text="Bytes sent per host").locator(".profile-chip")
             chip.first.wait_for()
+            # The host name stays on one line at every grid width; the long
+            # count used to squeeze it to one character per line (~1180px).
+            for width in (1180, 1400, 900, 600):
+                page.set_viewport_size({"width": width, "height": 1000})
+                for box in chip.locator(".profile-value").evaluate_all(
+                    "(els) => els.map((e) => [e.textContent, e.getBoundingClientRect().height,"
+                    " parseFloat(getComputedStyle(e).lineHeight) || 16])"
+                ):
+                    name, height, line = box
+                    assert height < 1.5 * line + 8, f"{name} wraps at {width}px: {height}px tall"
             assert errors == []
             browser.close()
     finally:

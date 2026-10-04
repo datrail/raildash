@@ -522,6 +522,17 @@ code { font-family: var(--mono); }
   color: var(--ink-faint);
   font-variant-numeric: tabular-nums;
 }
+/* A count too long to sit beside its value ("3 calls · 1.1 KB · largest
+   531 B") goes underneath it. Side by side, the count never shrinks, so in a
+   narrow column the value was squeezed to one character per line. */
+.profile-chip-stacked {
+  flex-direction: column;
+  border-radius: 8px;
+}
+.profile-chip-stacked .profile-count {
+  border-left: 0;
+  border-top: 1px solid var(--line);
+}
 .profile-summary {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
