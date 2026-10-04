@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:railxia:asp:evidence-bundle:1",
   "title": "Evidence bundle, bundle_version 1",
-  "$comment": "Two rules are not expressible here and are checked in code instead: every attestation_ref names the id of an entry in attestations, and a deployment value's byte length is measured in UTF-8 bytes, not the Unicode code points maxLength counts.",
+  "$comment": "Three rules are not expressible here and are checked in code instead: every attestation_ref names the id of an entry in attestations, a deployment value's byte length is measured in UTF-8 bytes, not the Unicode code points maxLength counts, and an observed_file_access value is at most 262144 bytes as compact JSON with non-ASCII escaped, as the bundle is written.",
   "type": "object",
   "required": [
     "bundle_version",
@@ -93,6 +93,32 @@
                 "properties": {
                   "value": {
                     "$ref": "#/$defs/deployment_value"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "observed_file_access": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/attribute"
+            },
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ANSWERED",
+                      "PARTIAL"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "$ref": "#/$defs/file_access_value"
                   }
                 }
               }
@@ -219,6 +245,41 @@
         }
       },
       "$comment": "Each value's UTF-8 byte length must also stay under 253 bytes — checked in code, not here (see the top-level $comment)."
+    },
+    "file_access_value": {
+      "type": "array",
+      "maxItems": 512,
+      "items": {
+        "type": "object",
+        "required": [
+          "path",
+          "read",
+          "write",
+          "exec",
+          "layer"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "read": {
+            "type": "boolean"
+          },
+          "write": {
+            "type": "boolean"
+          },
+          "exec": {
+            "type": "boolean"
+          },
+          "layer": {
+            "type": "boolean"
+          }
+        }
+      },
+      "$comment": "The files the sandbox opened, as the kernel saw them (observed_file_access): one entry per (path, layer), read/write/exec the union of every open. ANSWERED and PARTIAL carry this list; RailMon writes null for ABSENT and BLIND. The whole value must also stay under 262144 bytes as compact JSON — checked in code, not here (see the top-level $comment)."
     },
     "non_runtime_source": {
       "allOf": [
