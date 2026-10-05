@@ -36,11 +36,11 @@ jobs:
     # 11-19, run by run (actions/runner-images#14748). Move on purpose (DR-133).
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -50,7 +50,7 @@ jobs:
       # copy is missing. Its default branch, not a pin: a RailMon schema change
       # RailDash has not re-vendored is exactly the break to surface here.
       # Sparse, so pytest never sees RailMon's own tests.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: datrail/railmon
           path: .ci/railmon
@@ -80,18 +80,18 @@ jobs:
   image:
     runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Build only — nothing is pushed from a pull request. Single-arch amd64:
       # this exists to catch a Dockerfile that does not build, or an image that
       # builds but fails the smoke test below, and the arm64 leg costs QEMU
       # emulation for a signal amd64 already gives. RailDash is pure Python, so
       # there is no arch-specific path to miss.
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64
