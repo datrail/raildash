@@ -498,6 +498,12 @@ function fileEntries(record) {
   return entries;
 }
 
+// DR-169: a list that declares a `window` holds only what that window saw,
+// so what a quieter window did not see is not something the sandbox stopped.
+function isWindowed(before, after) {
+  return [before, after].some((record) => Boolean(record && record.window));
+}
+
 // Rows of [label, paths], in the order a reader cares about: what the
 // sandbox started doing before what it stopped doing, writes first.
 function fileAccessChanges(before, after) {
@@ -528,7 +534,7 @@ function fileAccessChanges(before, after) {
     .sort();
   gained.push(["Newly opened", opened(previous, current)]);
   lost.push(["No longer opened", opened(current, previous)]);
-  return [...gained, ...lost].filter(([, paths]) => paths.length);
+  return [...gained, ...(isWindowed(before, after) ? [] : lost)].filter(([, paths]) => paths.length);
 }
 
 function describeFileAccessRecord(record) {
@@ -570,7 +576,9 @@ function renderFileAccessDiffRow(change) {
     row.append(line);
   });
   if (!paths.length) {
-    row.append(el("p", "muted", "The same files, opened the same way; only the qualifiers moved."));
+    row.append(el("p", "muted", isWindowed(change.baseline, change.current)
+      ? "Nothing newly opened; only the qualifiers moved."
+      : "The same files, opened the same way; only the qualifiers moved."));
   }
   return row;
 }

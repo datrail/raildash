@@ -768,3 +768,147 @@ def test_a_v2_deployment_value_is_held_to_the_v1_shape(namespace):
         problem.startswith("sandbox.attributes.deployment.value")
         for problem in bundle_problems(value)
     )
+
+
+# DR-169: RailMon's optional `window` member on a v2 attribute marks a list
+# that holds only what the observation window saw.
+DESTINATIONS_WINDOW = {"ignore": ["count", "error_count"]}
+FILES_WINDOW = {"union": ["exec", "read", "write"]}
+
+
+def _destination(host: str, count: int = 1) -> dict:
+    return {"host": host, "port": 443, "count": count, "error_count": 0}
+
+
+def _file(path: str, **flags: bool) -> dict:
+    return {"path": path, "layer": False, "read": False, "write": False, "exec": False, **flags}
+
+
+def _windowed_v2(destinations: list, files: list, *, window: bool = True) -> dict:
+    value = _keys_only_v2("executor")
+    agent = value["agents"][0]["attributes"]
+    agent["observed_destinations"] = {
+        "value": destinations, "status": "ANSWERED", "tier": "observed", "authored_by": "none",
+    }
+    value["sandbox"]["attributes"]["observed_file_access"] = {
+        "value": files, "status": "ANSWERED", "tier": "observed", "authored_by": "none",
+    }
+    if window:
+        agent["observed_destinations"]["window"] = DESTINATIONS_WINDOW
+        value["sandbox"]["attributes"]["observed_file_access"]["window"] = FILES_WINDOW
+    return value
+
+
+def _window_drift(baseline: dict, current: dict) -> list:
+    baseline_raw = raw(baseline)
+    current = copy.deepcopy(current)
+    current["bundle_id"] = "bnd-fixture-v2-next"
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
+    validate("drift-result-v2.schema.json", result)
+    assert result["drift_contract_version"] == 2
+    assert result["comparable"] is True, result["reason"]
+    return [(change["agent_key"], change["type"], change["name"], change["fields"])
+            for change in result["changes"]]
+
+
+@pytest.mark.parametrize(
+    "window", [{}, DESTINATIONS_WINDOW, FILES_WINDOW, {"ignore": ["count"], "union": ["read"]}]
+)
+def test_the_vendored_v2_schema_accepts_a_window(window):
+    value = _windowed_v2([_destination("a.example")], [], window=False)
+    value["agents"][0]["attributes"]["observed_destinations"]["window"] = window
+    validate("evidence-bundle-v2.schema.json", value)
+    assert bundle_problems(value) == []
+
+
+@pytest.mark.parametrize(
+    "window",
+    [None, [], {"counting": ["count"]}, {"ignore": "count"}, {"ignore": [1]},
+     {"ignore": [""]}, {"union": ["read", "read"]}],
+)
+def test_the_vendored_v2_schema_rejects_a_malformed_window(window):
+    value = _windowed_v2([_destination("a.example")], [], window=False)
+    value["agents"][0]["attributes"]["observed_destinations"]["window"] = window
+    with pytest.raises(ValidationError):
+        validate("evidence-bundle-v2.schema.json", value)
+    assert any("observed_destinations.window" in p for p in bundle_problems(value))
+
+
+def test_v1_has_no_window_member():
+    value = bundle()
+    value["attributes"]["tool_names"]["window"] = {}
+    assert any("window" in p for p in bundle_problems(value))
+
+
+def test_a_quieter_window_and_its_counts_are_not_drift():
+    baseline = _windowed_v2(
+        [_destination("a.example", 9), _destination("b.example")],
+        [_file("/etc/hosts", read=True), _file("/tmp/out", write=True, read=True)],
+    )
+    current = _windowed_v2(
+        [_destination("a.example", 1)], [_file("/tmp/out", read=True)]
+    )
+    assert _window_drift(baseline, current) == []
+    # A window seen on one side only covers both: a baseline locked before
+    # RailMon emitted the member compares the same way, and the member is
+    # never itself drift.
+    assert _window_drift(_windowed_v2(*_lists(baseline), window=False), current) == []
+    assert _window_drift(baseline, _windowed_v2(*_lists(current), window=False)) == []
+
+
+def _lists(value: dict) -> tuple[list, list]:
+    return (value["agents"][0]["attributes"]["observed_destinations"]["value"],
+            value["sandbox"]["attributes"]["observed_file_access"]["value"])
+
+
+def test_something_newly_seen_in_the_window_is_drift():
+    baseline = _windowed_v2([_destination("a.example")], [_file("/etc/hosts", read=True)])
+    new_host = _windowed_v2([_destination("c.example")], [_file("/etc/hosts", read=True)])
+    assert _window_drift(baseline, new_host) == [
+        ("executor", "ATTRIBUTE_CHANGED", "observed_destinations", ["value"]),
+    ]
+    newly_written = _windowed_v2([_destination("a.example")], [_file("/etc/hosts", write=True)])
+    assert _window_drift(baseline, newly_written) == [
+        (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
+    ]
+    new_file = _windowed_v2([], [_file("/etc/passwd")])
+    assert _window_drift(baseline, new_file) == [
+        (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
+    ]
+
+
+def test_a_windowed_attribute_still_drifts_on_its_qualifiers():
+    baseline = _windowed_v2([_destination("a.example")], [])
+    current = copy.deepcopy(baseline)
+    current["agents"][0]["attributes"]["observed_destinations"]["status"] = "PARTIAL"
+    current["agents"][0]["attributes"]["observed_destinations"]["reason"] = "NO_SOURCE_ACCESS"
+    current["agents"][0]["attributes"]["observed_destinations"]["value"] = []
+    assert _window_drift(baseline, current) == [
+        ("executor", "ATTRIBUTE_CHANGED", "observed_destinations", ["status", "reason"]),
+    ]
+
+
+def test_without_a_window_a_list_is_compared_exactly_as_before():
+    baseline = _windowed_v2(
+        [_destination("a.example", 9)], [_file("/tmp/out", write=True)], window=False
+    )
+    current = _windowed_v2([_destination("a.example", 1)], [_file("/tmp/out")], window=False)
+    assert _window_drift(baseline, current) == [
+        (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
+        ("executor", "ATTRIBUTE_CHANGED", "observed_destinations", ["value"]),
+    ]
+
+
+def test_a_window_that_saw_nothing_is_an_empty_list_not_a_value_change():
+    baseline = _windowed_v2([_destination("a.example")], [])
+    current = copy.deepcopy(baseline)
+    destinations = current["agents"][0]["attributes"]["observed_destinations"]
+    destinations.update(status="ABSENT", value=None, method="no destination seen in the window")
+    del destinations["authored_by"]
+    fields = ["status", "authored_by", "method"]
+    assert _window_drift(baseline, current) == [
+        ("executor", "ATTRIBUTE_CHANGED", "observed_destinations", fields),
+    ]
+    assert _window_drift(current, baseline) == [
+        ("executor", "ATTRIBUTE_CHANGED", "observed_destinations", ["value", *fields]),
+    ]

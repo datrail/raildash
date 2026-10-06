@@ -304,6 +304,29 @@
         "attestation_ref": {
           "type": "string",
           "minLength": 1
+        },
+        "window": {
+          "$comment": "Optional (DR-169). Present: the value holds only what the collector's observation window saw, so an item a quieter window did not see is not a removal; status is unchanged by it. ignore: item keys that count traffic in the window and are not part of an item's identity. union: boolean item keys that are true if the thing happened at any point in the window, so a key turning true is something newly seen. An empty object marks a window-bounded list whose items need neither.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ignore": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "union": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
         }
       },
       "allOf": [

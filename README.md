@@ -128,7 +128,9 @@ paths are evidence values).
 
 `observed_file_access` takes part in drift like any attribute. When it
 changes, the drift view lists the paths by what changed (newly written, run
-or read; no longer written, run or read) instead of two raw lists.
+or read; no longer written, run or read) instead of two raw lists. A
+reading that declares a `window` (see evidence bundle v2 below) lists only
+what is newly seen, since a quieter window is not something stopped.
 
 For a bundle without a complete deployment or host-scoped Compose identity,
 pass `--agent-key NAME` to `asp load` (HTTP: `?agent_key=NAME` or an
@@ -236,6 +238,21 @@ agent the change happened in. Three change types are new:
 | --- | --- |
 | `AGENT_CHANGED` `["discovery_status"]` | A declared agent's discovery moved, e.g. `available` → `not_found` when its process is gone. Its attribute and source changes follow, scoped to it. |
 | `AGENT_ADDED` / `AGENT_REMOVED` | The collection gained or lost an agent scope. This happens only under a deployment identity (`RAIL_DEPLOYMENT`/`RAIL_NAMESPACE` or the compose labels). With no deployment identity, the sorted agent keys *are* the identity. A manifest that declares a different set of agents is then a new subject with no alignment of its own, offered for locking, and the old subject's card receives no new ASPs. Set a deployment identity to see a manifest change as drift. |
+
+An attribute whose reading declares RailMon's optional `window` member
+(the v2 schema's `$defs.attribute.properties.window`) holds only
+what the collector's observation window saw, so its list is compared as a
+window: an item the current window did not see is not a removal, the
+`ignore` keys (traffic counts such as a destination's `count`) are not part
+of an item, and a `union` key (such as a file's `write`) is drift only when
+it turns true. A new item or a newly-true `union` key is the usual
+`ATTRIBUTE_CHANGED` with `value` in its `fields`; a window that saw less is
+no change at all, and the member itself is never drift. The current
+reading's declaration is used, else the baseline's, so a baseline locked
+before RailMon emitted it compares the same way. Status and the other
+qualifiers are still compared exactly, and a reading without a window on
+either side is compared exactly as before. The emitted shape is unchanged,
+so this stays `drift_contract_version: 2`.
 
 A v1 bundle compared with a v2 baseline (or the reverse) is
 `CONTRACT_MISMATCH`. v1 comparisons still emit contract v1 unchanged.
