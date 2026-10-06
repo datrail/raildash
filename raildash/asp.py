@@ -55,6 +55,7 @@ DRIFT_CONTRACT_VERSION = 1
 # DR-109: comparing two evidence-bundle v2 collections. Contract v1 stays
 # exactly what a v1 comparison emits; v2 adds the `agent_key` scope every
 # change carries (null for the shared sandbox scope) and the AGENT_* changes.
+# DR-169's window lists change when `value` counts as changed, not the shape.
 DRIFT_CONTRACT_VERSION_V2 = 2
 # The shipped redacted RailMon sample is about 5 KiB.  The contract suite's
 # valid 1,000-attribute high-cardinality bundle is about 432 KiB, so 1 MiB gives
@@ -596,8 +597,10 @@ def _scope_changes(
     """One v2 scope's attribute and source changes, each tagged with the
     scope's `agent_key` (null for the shared sandbox scope)."""
     changes = _map_changes(
-        _comparison_attributes(baseline["attributes"]),
-        _comparison_attributes(current["attributes"]),
+        *_window_attributes(
+            _comparison_attributes(baseline["attributes"]),
+            _comparison_attributes(current["attributes"]),
+        ),
         "ATTRIBUTE",
         ATTRIBUTE_FIELD_ORDER,
     )
@@ -665,6 +668,60 @@ def _comparison_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
             if key != "value"
         }
     return projected
+
+
+def _window_attributes(
+    baseline: dict[str, Any], current: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Project v2 attributes that declare a `window` (DR-169) for comparison.
+
+    Such a list holds only what the collector's window saw, so its value is
+    drift only when the current window saw something the baseline did not:
+    a new item, or a `union` key newly true. A quieter window is not. One
+    declaration covers both sides, the current reading's if it has one, so
+    items are keyed the same way; the member itself is never drift. A
+    reading without a `window` on either side is compared exactly.
+    """
+    baseline, current = dict(baseline), dict(current)
+    for name in baseline.keys() & current.keys():
+        before, after = baseline[name], current[name]
+        window = after.get("window", before.get("window"))
+        if window is None:
+            continue
+        before = {key: value for key, value in before.items() if key != "window"}
+        after = {key: value for key, value in after.items() if key != "window"}
+        if not _window_value_drift(before.get("value"), after.get("value"), window):
+            before.pop("value", None)
+            after.pop("value", None)
+        baseline[name], current[name] = before, after
+    return baseline, current
+
+
+def _window_value_drift(before: Any, after: Any, window: dict[str, Any]) -> bool:
+    # A window that saw nothing is ABSENT with a null value: an empty list.
+    before = [] if before is None else before
+    after = [] if after is None else after
+    if not isinstance(before, list) or not isinstance(after, list):
+        return before != after
+    ignore = set(window.get("ignore", ()))
+    union = set(window.get("union", ()))
+
+    def seen(items: list[Any]) -> dict[str, set[str]]:
+        # Item identity without its counts and union flags -> flags seen true.
+        found: dict[str, set[str]] = {}
+        for item in items:
+            flags: set[str] = set()
+            if isinstance(item, dict):
+                flags = {key for key in union if item.get(key) is True}
+                item = {key: value for key, value in item.items() if key not in ignore | union}
+            found.setdefault(json.dumps(item, sort_keys=True), set()).update(flags)
+        return found
+
+    previous = seen(before)
+    return any(
+        key not in previous or not flags <= previous[key]
+        for key, flags in seen(after).items()
+    )
 
 
 def _map_changes(
