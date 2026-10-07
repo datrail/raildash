@@ -576,3 +576,121 @@ def test_kernel_observed_files_sit_beside_the_asked_ones_and_a_new_write_is_drif
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_a_demo_like_capture_says_why_its_profile_is_mostly_empty(tmp_path):
+    """DR-180 (datrail-project#11): an agent that calls no model API, scanned
+    without a file probe, shows one note saying why the model-derived groups
+    are empty, and its kernel-observed files read as not collected rather
+    than as a fault."""
+    from raildash.ingest import normalise
+    from raildash.store import Store
+    from test_kernel_file_access import bundle, encode
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    store.upsert_session("demo", agent="demo", source="test")
+    store.add_interactions("demo", [normalise({
+        "interaction_id": "d1",
+        "request": {"method": "POST", "path": "/v1/demo",
+                    "headers": {"host": "127.0.0.1:8443"},
+                    "body": {"hello": "railmon"}},
+        "response": {"status_code": 200, "body": {"ok": True}},
+    })])
+    store.load_asp(encode(bundle("bnd-browser-blind", status="BLIND")))
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database), "serve",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1400, "height": 1000})
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on(
+                "console",
+                lambda message: errors.append(message.text) if message.type == "error" else None,
+            )
+            page.goto(url, wait_until="networkidle")
+
+            note = page.locator("#profile-grid .profile-no-model-calls")
+            note.wait_for()
+            assert note.count() == 1
+            assert "No captured call names a model" in note.inner_text()
+            assert "demo agent" in note.inner_text()
+
+            kernel = page.locator(".profile-group").filter(
+                has=page.get_by_role("heading", name="Files · kernel-observed", exact=True)
+            )
+            explained = kernel.locator(".kernel-file-not-collected")
+            explained.wait_for()
+            assert explained.inner_text().startswith("Not collected:")
+            assert "not an error" in explained.inner_text()
+            # The code stays available beside the words, and the empty list
+            # is not repeated as a second "nothing" line.
+            assert "BLIND" in kernel.locator(".pill").inner_text()
+            assert "No files listed" not in kernel.inner_text()
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_a_capture_with_model_calls_has_no_empty_profile_note(tmp_path):
+    """DR-180: the note is only for captures with no model API traffic."""
+    from raildash.ingest import normalise
+    from raildash.store import Store
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    store.upsert_session("work", agent="agent", source="test")
+    store.add_interactions("work", [normalise({
+        "interaction_id": "w1",
+        "request": {"method": "POST", "path": "/v1/messages",
+                    "headers": {"host": "api.anthropic.com"},
+                    "body": {"model": "claude-sonnet-5", "messages": []}},
+        "response": {"status_code": 200, "body": {"content": []}},
+    })])
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database), "serve",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="networkidle")
+            page.locator(".profile-chip", has_text="claude-sonnet-5").wait_for()
+            assert page.locator(".profile-no-model-calls").count() == 0
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

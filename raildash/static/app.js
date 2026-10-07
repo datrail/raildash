@@ -1291,6 +1291,14 @@ function kernelFileSource(source) {
       `This ASP (rule pack ${source.contract.rule_pack_version}) does not carry kernel-observed files.`));
     return block;
   }
+  // DR-180: a scan that ran no file probe is not a fault. Say so in words
+  // first, so BLIND and its reason code read as "not collected".
+  const notCollected = evidence.status === "BLIND" && evidence.reason === "NOT_COLLECTED_BY_PACK";
+  if (notCollected) {
+    block.append(el("p", "kernel-file-not-collected",
+      "Not collected: RailMon ran no file probe for this scan, so there are no files to show. " +
+      "That is expected unless RailMon is given filesnoop's events; it is not an error."));
+  }
   const [glyph, tone] = EVIDENCE_STATUS[evidence.status] || ["?", "pill-none"];
   const qualifiers = el("div", "kernel-file-qualifiers");
   qualifiers.append(el("span", `pill ${tone}`, `${glyph} ${evidence.status}`));
@@ -1302,7 +1310,7 @@ function kernelFileSource(source) {
   }
   const files = evidence.files || [];
   const values = el("div", "profile-values");
-  if (!files.length) {
+  if (!files.length && !notCollected) {
     values.append(el("span", "muted", evidence.status === "ABSENT"
       ? "No regular file opened in the window"
       : "No files listed"));
@@ -1409,6 +1417,16 @@ async function loadProfile() {
     summary.append(el("dd", null, value));
   });
   facts.append(summary);
+  // DR-180: an agent that calls no model API, like the demo agent, leaves
+  // every group read from model requests empty. Say why once, rather than
+  // let a column of "None observed" read as a failure.
+  if (observed.interaction_count && !(observed.models || []).length &&
+      !(observed.tool_names || []).length) {
+    grid.append(el("p", "note profile-no-model-calls",
+      "No captured call names a model, so Tools, Models, Uploaded content and the files " +
+      "asked of tools have nothing to show. That is expected for an agent that makes no " +
+      "model API calls, such as the demo agent; Hosts and Methods still describe its traffic."));
+  }
   grid.append(facts);
   grid.append(profileValues("Hosts", observed.hosts || []));
   grid.append(profileValues("Methods", observed.methods || []));
