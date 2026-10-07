@@ -492,6 +492,8 @@ code { font-family: var(--mono); }
   padding: 13px;
 }
 .profile-group { min-width: 0; }
+.profile-no-model-calls { grid-column: 1 / -1; }
+.kernel-file-not-collected { margin-bottom: 6px; font-size: 12px; color: var(--ink-soft); }
 .profile-group h3 {
   margin-bottom: 7px;
   font-size: 10.5px;
