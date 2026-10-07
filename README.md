@@ -1,5 +1,10 @@
 # RailDash
 
+> **Just want to run DatRail?** Start at
+> [datrail-project](https://github.com/datrail/datrail-project#quick-start):
+> one `docker compose up -d` runs RailMon, RailDash and a demo agent
+> together. This README covers RailDash on its own.
+
 RailDash is a local dashboard for traffic captured by
 [RailMon](https://github.com/datrail/railmon). It shows destinations, requests,
 responses, failures, tool calls, and `x-rail` presence without requiring a
