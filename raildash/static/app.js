@@ -1421,7 +1421,7 @@ async function loadProfile() {
   // every group read from model requests empty. Say why once, rather than
   // let a column of "None observed" read as a failure.
   if (observed.interaction_count && !(observed.models || []).length &&
-      !(observed.tool_names || []).length) {
+      !(observed.tool_names || []).length && !(observed.content_kinds || []).length) {
     grid.append(el("p", "note profile-no-model-calls",
       "No captured call names a model, so Tools, Models, Uploaded content and the files " +
       "asked of tools have nothing to show. That is expected for an agent that makes no " +
