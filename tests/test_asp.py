@@ -102,7 +102,9 @@ def _running_in_ci() -> bool:
     return os.environ.get("CI", "").strip().lower() in {"1", "true", "yes"}
 
 
-@pytest.mark.parametrize("name", ["evidence-bundle-v1.schema.json", "evidence-bundle-v2.schema.json"])
+@pytest.mark.parametrize(
+    "name", ["evidence-bundle-v1.schema.json", "evidence-bundle-v2.schema.json", "attribute-groups.json"]
+)
 def test_vendored_schema_is_byte_for_byte_identical_to_railmon(name: str):
     railmon_schema = _railmon_schema(name)
     if railmon_schema is None:

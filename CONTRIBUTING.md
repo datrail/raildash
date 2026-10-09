@@ -41,7 +41,8 @@ pip install -r requirements-dev.txt
 make test
 ```
 
-`raildash/schemas/evidence-bundle-v*.schema.json` are byte-for-byte copies of
+`raildash/schemas/evidence-bundle-v*.schema.json` and
+`raildash/schemas/attribute-groups.json` are byte-for-byte copies of
 [RailMon's](https://github.com/datrail/railmon/tree/master/schemas), and a test
 compares them. Point it at a RailMon checkout with
 `RAILMON_SCHEMAS_DIR=<railmon>/schemas` (a sibling `../railmon` checkout is
