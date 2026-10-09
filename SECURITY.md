@@ -41,8 +41,8 @@ POST /webhook/http-interactions   parsed HTTP interactions
 ```
 
 Its Agent Security Profile routes (evidence-bundle ingest, lock, baseline,
-switch, accept drift, retention, prune, and the four reads that return exact
-evidence)
+switch, accept drift, retention change, prune, and the four reads that return
+exact evidence)
 require the local write token in an `X-RailDash-Token` header. The README's
 "local write safety" section describes it.
 

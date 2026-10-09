@@ -59,8 +59,8 @@ jobs:
 
       # `make test` builds its own virtualenv and installs requirements-dev,
       # so this needs no separate pip step and the local and CI runs are the
-      # same command. RailDash does have dependencies — FastAPI and uvicorn —
-      # unlike the stdlib-only scanner.
+      # same command. RailDash does have dependencies — FastAPI, uvicorn and
+      # jsonschema — unlike the stdlib-only scanner.
       - run: make test
         env:
           RAILMON_SCHEMAS_DIR: ${{ github.workspace }}/.ci/railmon/schemas

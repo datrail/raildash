@@ -97,20 +97,6 @@ NON_COMPARABLE_REASONS = frozenset(
         "NO_ACTIVE_ALIGNMENT",
     }
 )
-CHANGE_TYPES = frozenset(
-    {
-        "ATTRIBUTE_ADDED",
-        "ATTRIBUTE_REMOVED",
-        "ATTRIBUTE_CHANGED",
-        "SOURCE_ADDED",
-        "SOURCE_REMOVED",
-        "SOURCE_CHANGED",
-        "ATTESTATION_ADDED",
-        "ATTESTATION_REMOVED",
-        "ATTESTATION_CHANGED",
-    }
-)
-CHANGE_TYPES_V2 = CHANGE_TYPES | {"AGENT_ADDED", "AGENT_REMOVED", "AGENT_CHANGED"}
 AGENT_FIELD_ORDER = ("discovery_status",)
 ATTRIBUTE_FIELD_ORDER = (
     "value",
@@ -184,36 +170,25 @@ def bundle_problems(bundle: Any) -> list[str]:
         return ["bundle must be an object"]
     version = bundle.get("bundle_version")
     if version == BUNDLE_VERSION:
-        problems = [
-            f"{'.'.join(str(part) for part in error.path) or 'bundle'}: {error.message}"
-            for error in sorted(_VALIDATOR.iter_errors(bundle), key=str)
-        ]
-        problems.extend(_semantic_problems(bundle))
-        return problems
+        return _schema_problems(_VALIDATOR, bundle) + _semantic_problems(bundle)
     if version == BUNDLE_VERSION_V2:
-        problems = [
-            f"{'.'.join(str(part) for part in error.path) or 'bundle'}: {error.message}"
-            for error in sorted(_VALIDATOR_V2.iter_errors(bundle), key=str)
-        ]
-        problems.extend(_semantic_problems_v2(bundle))
-        return problems
+        return _schema_problems(_VALIDATOR_V2, bundle) + _semantic_problems_v2(bundle)
     return [
         f"bundle_version: this RailDash only accepts evidence bundle v{BUNDLE_VERSION} "
         f"or v{BUNDLE_VERSION_V2}, got {version!r}"
     ]
 
 
-def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
-    """The rules the published schema cannot express, or deliberately
-    doesn't: every attestation_ref names a real attestation; two attestations
-    never share an id (`uniqueItems` checks whole-item equality, not one
-    field); a deployment value's byte length is measured in UTF-8 bytes,
-    which `maxLength` cannot — it counts Unicode code points;
-    `collected_at` must be UTC, which RailDash requires but the shared
-    schema's `format: date-time` (any offset, per RFC 3339) does not — this
-    predates the shared schema and is kept for the same reason `_date_time`
-    still enforces it on `locked_at`; and an `observed_file_access` value's
-    byte bound (its shape is the schema's own `file_access_value`)."""
+def _schema_problems(validator: Draft202012Validator, bundle: Any) -> list[str]:
+    return [
+        f"{'.'.join(str(part) for part in error.path) or 'bundle'}: {error.message}"
+        for error in sorted(validator.iter_errors(bundle), key=str)
+    ]
+
+
+def _common_semantic_problems(bundle: dict[str, Any]) -> tuple[list[str], set[str]]:
+    """The checks v1 and v2 share: `collected_at` is UTC, and no two
+    attestations share an id. Returns the problems and the attestation ids."""
     problems: list[str] = []
     collected_at = bundle.get("collected_at")
     if isinstance(collected_at, str):
@@ -235,16 +210,41 @@ def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
             problems.append(f"attestations[{index}].id: duplicate attestation id")
         else:
             attestation_ids.add(identifier)
+    return problems, attestation_ids
+
+
+def _deployment_byte_problems(value: Any, where: str) -> list[str]:
+    """A deployment value's strings, measured in UTF-8 bytes (`maxLength`
+    counts code points)."""
+    if not isinstance(value, dict):
+        return []
+    return [
+        f"{where}.{key}: exceeds byte bound"
+        for key, item in value.items()
+        if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES
+    ]
+
+
+def _semantic_problems(bundle: dict[str, Any]) -> list[str]:
+    """The rules the published schema cannot express, or deliberately
+    doesn't: every attestation_ref names a real attestation; two attestations
+    never share an id (`uniqueItems` checks whole-item equality, not one
+    field); a deployment value's byte length is measured in UTF-8 bytes,
+    which `maxLength` cannot — it counts Unicode code points;
+    `collected_at` must be UTC, which RailDash requires but the shared
+    schema's `format: date-time` (any offset, per RFC 3339) does not — this
+    predates the shared schema and is kept for the same reason `_date_time`
+    still enforces it on `locked_at`; and an `observed_file_access` value's
+    byte bound (its shape is the schema's own `file_access_value`)."""
+    problems, attestation_ids = _common_semantic_problems(bundle)
     attributes = bundle.get("attributes")
     attributes = attributes if isinstance(attributes, dict) else {}
     problems.extend(_attestation_ref_problems("attributes", attributes, attestation_ids))
     deployment = attributes.get("deployment")
     if isinstance(deployment, dict) and deployment.get("status") == "ANSWERED":
-        value = deployment.get("value")
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
-                    problems.append(f"attributes.deployment.value.{key}: exceeds byte bound")
+        problems.extend(
+            _deployment_byte_problems(deployment.get("value"), "attributes.deployment.value")
+        )
     problems.extend(
         _file_access_byte_problems(attributes.get(FILE_ACCESS_ATTRIBUTE), "attributes")
     )
@@ -287,27 +287,7 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
     v1's shape and byte bound, since it resolves to the same identity; and
     an ANSWERED or PARTIAL sandbox `observed_file_access` value has v1's
     `file_access_value` shape and its byte bound (DR-154)."""
-    problems: list[str] = []
-    collected_at = bundle.get("collected_at")
-    if isinstance(collected_at, str):
-        try:
-            parsed = datetime.fromisoformat(collected_at.replace("Z", "+00:00"))
-        except ValueError:
-            parsed = None
-        if parsed is not None and (parsed.tzinfo is None or parsed.utcoffset() != timedelta(0)):
-            problems.append("collected_at: date-time must be UTC")
-    attestations = bundle.get("attestations")
-    attestation_ids: set[str] = set()
-    for index, entry in enumerate(attestations if isinstance(attestations, list) else []):
-        if not isinstance(entry, dict):
-            continue
-        identifier = entry.get("id")
-        if not isinstance(identifier, str):
-            continue
-        if identifier in attestation_ids:
-            problems.append(f"attestations[{index}].id: duplicate attestation id")
-        else:
-            attestation_ids.add(identifier)
+    problems, attestation_ids = _common_semantic_problems(bundle)
 
     sandbox = bundle.get("sandbox")
     sandbox_attributes = sandbox.get("attributes") if isinstance(sandbox, dict) else None
@@ -317,10 +297,7 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
         value = deployment.get("value")
         for error in _DEPLOYMENT_VALUE_VALIDATOR.iter_errors(value):
             problems.append(f"sandbox.attributes.deployment.value: {error.message}")
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if isinstance(item, str) and len(item.encode("utf-8")) > DEPLOYMENT_VALUE_MAX_BYTES:
-                    problems.append(f"sandbox.attributes.deployment.value.{key}: exceeds byte bound")
+        problems.extend(_deployment_byte_problems(value, "sandbox.attributes.deployment.value"))
     file_access = (
         sandbox_attributes.get(FILE_ACCESS_ATTRIBUTE)
         if isinstance(sandbox_attributes, dict)
@@ -440,7 +417,7 @@ def alignment_problems(alignment: Any) -> list[str]:
     if alignment.get("alignment_contract_version") != ALIGNMENT_CONTRACT_VERSION:
         problems.append("alignment_contract_version: must be 1")
     for key in ("alignment_version_id", "version"):
-        _bounded_string(alignment.get(key), key, 1, None, problems)
+        _non_empty_string(alignment.get(key), key, problems)
     _date_time(alignment.get("locked_at"), "locked_at", problems)
     problems.extend(identity_problems(alignment.get("agent_identity")))
     contract = alignment.get("contract")
@@ -460,7 +437,7 @@ def alignment_problems(alignment: Any) -> list[str]:
     if not isinstance(asp, dict) or set(asp) != {"asp_id", "digest"}:
         problems.append("asp: must contain only asp_id and digest")
     else:
-        _bounded_string(asp.get("asp_id"), "asp.asp_id", 1, None, problems)
+        _non_empty_string(asp.get("asp_id"), "asp.asp_id", problems)
         if not isinstance(asp.get("digest"), str) or not _DIGEST.fullmatch(
             asp["digest"]
         ):
@@ -544,9 +521,7 @@ def _serialized_size(value: dict[str, Any]) -> int:
     )
 
 
-def _not_comparable(
-    reason: str, contract_version: int = DRIFT_CONTRACT_VERSION
-) -> dict[str, Any]:
+def _not_comparable(reason: str, contract_version: int) -> dict[str, Any]:
     if reason not in NON_COMPARABLE_REASONS:
         raise ValueError(f"unknown non-comparable reason: {reason}")
     return {
@@ -586,18 +561,21 @@ def _bundle_changes(
             SOURCE_FIELD_ORDER,
         )
     )
-    baseline_attestations = {entry["id"]: entry for entry in baseline.get("attestations", [])}
-    current_attestations = {entry["id"]: entry for entry in current.get("attestations", [])}
-    changes.extend(
-        _map_changes(
-            baseline_attestations,
-            current_attestations,
-            "ATTESTATION",
-            ATTESTATION_FIELD_ORDER,
-            ignored_fields={"id"},
-        )
-    )
+    changes.extend(_attestation_changes(baseline, current))
     return changes
+
+
+def _attestation_changes(
+    baseline: dict[str, Any], current: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Changes to the bundle's attestations, matched by id."""
+    return _map_changes(
+        {entry["id"]: entry for entry in baseline.get("attestations", [])},
+        {entry["id"]: entry for entry in current.get("attestations", [])},
+        "ATTESTATION",
+        ATTESTATION_FIELD_ORDER,
+        ignored_fields={"id"},
+    )
 
 
 def _scope_changes(
@@ -652,17 +630,8 @@ def _bundle_changes_v2(
                 {"agent_key": key, "type": "AGENT_CHANGED", "name": key, "fields": fields}
             )
         changes.extend(_scope_changes({"agent_key": key}, before, after))
-    baseline_attestations = {entry["id"]: entry for entry in baseline.get("attestations", [])}
-    current_attestations = {entry["id"]: entry for entry in current.get("attestations", [])}
     changes.extend(
-        {"agent_key": None, **change}
-        for change in _map_changes(
-            baseline_attestations,
-            current_attestations,
-            "ATTESTATION",
-            ATTESTATION_FIELD_ORDER,
-            ignored_fields={"id"},
-        )
+        {"agent_key": None, **change} for change in _attestation_changes(baseline, current)
     )
     return changes
 
@@ -799,17 +768,9 @@ def identity_problems(identity: Any) -> list[str]:
     return []
 
 
-def _bounded_string(
-    value: Any,
-    where: str,
-    minimum: int,
-    maximum: int | None,
-    problems: list[str],
-) -> None:
-    if not isinstance(value, str) or len(value) < minimum:
-        problems.append(f"{where}: must be a string of at least {minimum} characters")
-    elif maximum is not None and len(value) > maximum:
-        problems.append(f"{where}: exceeds {maximum} characters")
+def _non_empty_string(value: Any, where: str, problems: list[str]) -> None:
+    if not isinstance(value, str) or not value:
+        problems.append(f"{where}: must be a string of at least 1 characters")
 
 
 def _date_time(value: Any, where: str, problems: list[str]) -> None:

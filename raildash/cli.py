@@ -16,6 +16,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Callable
 
 from .ingest import normalise, read_jsonl
 from .store import Store
@@ -97,6 +98,28 @@ def _open_store(args: argparse.Namespace) -> Store:
         raise SystemExit(2) from exc
 
 
+def _print_json(value: object) -> None:
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def _run_store_call(
+    args: argparse.Namespace,
+    what: str,
+    errors: type[Exception] | tuple[type[Exception], ...],
+    call: Callable[[Store], object],
+) -> int:
+    """Run one `asp` store call and print its JSON result, or say what failed."""
+    try:
+        store = _open_store(args)
+        result = call(store)
+        store.close()
+    except errors as exc:
+        print(f"raildash: {what} failed: {exc}", file=sys.stderr)
+        return 1
+    _print_json(result)
+    return 0
+
+
 def cmd_asp_load(args: argparse.Namespace) -> int:
     path = Path(args.file)
     if not path.is_file():
@@ -110,7 +133,7 @@ def cmd_asp_load(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as exc:
         print(f"raildash: ASP load failed: {exc}", file=sys.stderr)
         return 1
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    _print_json(result)
     return 0
 
 
@@ -122,74 +145,46 @@ def cmd_asp_list(args: argparse.Namespace) -> int:
         "retention": store.get_asp_retention(),
     }
     store.close()
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    _print_json(result)
     return 0
 
 
 def cmd_asp_lock(args: argparse.Namespace) -> int:
-    try:
-        store = _open_store(args)
-        result = store.lock_alignment(args.asp_id, args.version)
-        store.close()
-    except (KeyError, ValueError) as exc:
-        print(f"raildash: ASP lock failed: {exc}", file=sys.stderr)
-        return 1
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0
+    return _run_store_call(
+        args,
+        "ASP lock",
+        (KeyError, ValueError),
+        lambda store: store.lock_alignment(args.asp_id, args.version),
+    )
 
 
 def cmd_asp_switch(args: argparse.Namespace) -> int:
-    try:
-        store = _open_store(args)
-        result = store.switch_alignment(args.alignment_version_id)
-        store.close()
-    except KeyError as exc:
-        print(f"raildash: ASP switch failed: {exc}", file=sys.stderr)
-        return 1
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0
+    return _run_store_call(
+        args,
+        "ASP switch",
+        KeyError,
+        lambda store: store.switch_alignment(args.alignment_version_id),
+    )
 
 
 def cmd_asp_baseline(args: argparse.Namespace) -> int:
     """Lock (if needed) and activate one ASP -- the UI's "use as baseline"."""
-    try:
-        store = _open_store(args)
-        result = store.make_baseline(args.asp_id, args.version)
-        store.close()
-    except (KeyError, ValueError) as exc:
-        print(f"raildash: ASP baseline failed: {exc}", file=sys.stderr)
-        return 1
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0
+    return _run_store_call(
+        args,
+        "ASP baseline",
+        (KeyError, ValueError),
+        lambda store: store.make_baseline(args.asp_id, args.version),
+    )
 
 
-def cmd_asp_export(args: argparse.Namespace) -> int:
-    output = Path(args.output)
-    try:
-        if output.exists():
-            print(f"raildash: refusing to overwrite: {output}", file=sys.stderr)
-            return 1
-        parent_mode = output.resolve().parent.stat().st_mode
-        if parent_mode & 0o022:
-            print("raildash: export parent must not be group/other writable", file=sys.stderr)
-            return 1
-        store = _open_store(args)
-        raw = store.asp_exact_bytes(args.asp_id)
-        store.close()
-        if raw is None:
-            print("raildash: no such ASP", file=sys.stderr)
-            return 1
-        fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(raw)
-    except OSError as exc:
-        print(f"raildash: ASP export failed: {exc}", file=sys.stderr)
-        return 1
-    print(f"exported {args.asp_id} to {output}")
-    return 0
-
-
-def cmd_asp_drift_export(args: argparse.Namespace) -> int:
+def _export_private_file(
+    args: argparse.Namespace,
+    what: str,
+    missing: str,
+    read: Callable[[Store], bytes | None],
+) -> int:
+    """Write what `read` returns to a new owner-only file, refusing to
+    overwrite one or to write into a group/other-writable directory."""
     output = Path(args.output)
     try:
         if output.exists():
@@ -199,20 +194,43 @@ def cmd_asp_drift_export(args: argparse.Namespace) -> int:
             print("raildash: export parent must not be group/other writable", file=sys.stderr)
             return 1
         store = _open_store(args)
-        detail = store.drift_detail(args.asp_id)
+        payload = read(store)
         store.close()
-        if detail is None:
-            print("raildash: no drift result for ASP", file=sys.stderr)
+        if payload is None:
+            print(f"raildash: {missing}", file=sys.stderr)
             return 1
-        payload = json.dumps(detail, indent=2, ensure_ascii=False).encode()
         fd = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as handle:
             handle.write(payload)
     except OSError as exc:
-        print(f"raildash: drift export failed: {exc}", file=sys.stderr)
+        print(f"raildash: {what} failed: {exc}", file=sys.stderr)
         return 1
-    print(f"exported full drift evidence for {args.asp_id} to {output}")
     return 0
+
+
+def cmd_asp_export(args: argparse.Namespace) -> int:
+    status = _export_private_file(
+        args,
+        "ASP export",
+        "no such ASP",
+        lambda store: store.asp_exact_bytes(args.asp_id),
+    )
+    if status == 0:
+        print(f"exported {args.asp_id} to {Path(args.output)}")
+    return status
+
+
+def cmd_asp_drift_export(args: argparse.Namespace) -> int:
+    def read(store: Store) -> bytes | None:
+        detail = store.drift_detail(args.asp_id)
+        if detail is None:
+            return None
+        return json.dumps(detail, indent=2, ensure_ascii=False).encode()
+
+    status = _export_private_file(args, "drift export", "no drift result for ASP", read)
+    if status == 0:
+        print(f"exported full drift evidence for {args.asp_id} to {Path(args.output)}")
+    return status
 
 
 def cmd_asp_retention_set(args: argparse.Namespace) -> int:
@@ -221,17 +239,14 @@ def cmd_asp_retention_set(args: argparse.Namespace) -> int:
     Unlike the `RAILDASH_ASP_RETENTION_COUNT`/`_DAYS` env vars, this is stored in
     the database so it survives a restart without re-exporting anything.
     """
-    try:
-        store = _open_store(args)
-        result = store.set_asp_retention(
+    return _run_store_call(
+        args,
+        "ASP retention-set",
+        ValueError,
+        lambda store: store.set_asp_retention(
             keep_count=args.keep_count, max_age_days=args.max_age_days
-        )
-        store.close()
-    except ValueError as exc:
-        print(f"raildash: ASP retention-set failed: {exc}", file=sys.stderr)
-        return 1
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-    return 0
+        ),
+    )
 
 
 def cmd_asp_prune(args: argparse.Namespace) -> int:

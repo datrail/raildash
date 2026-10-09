@@ -330,32 +330,13 @@ async def _json_body(request: Request, *, max_bytes: int | None = None) -> Any:
     if media_type != "application/json" and not media_type.endswith("+json"):
         raise HTTPException(415, "content-type must be application/json")
 
-    declared = request.headers.get("content-length")
-    if declared is not None:
-        try:
-            declared_size = int(declared)
-        except ValueError as exc:
-            raise HTTPException(400, "invalid content-length") from exc
-        if declared_size < 0:
-            raise HTTPException(400, "invalid content-length")
-        if declared_size > max_bytes:
-            raise HTTPException(413, f"body exceeds {max_bytes} bytes")
-
-    body = bytearray()
+    body = await _read_bounded(request, max_bytes)
     try:
-        # Count the actual stream as well as Content-Length: a chunked request,
-        # or a client lying about its length, must not bypass the bound.
-        async for chunk in request.stream():
-            body.extend(chunk)
-            if len(body) > max_bytes:
-                raise HTTPException(413, f"body exceeds {max_bytes} bytes")
         # UTF-8 is the interoperable JSON encoding for the webhook.  Requiring
         # it also keeps UTF-16/32 NUL bytes from confusing a byte-level quote
         # scanner.  The scan and decode are CPU work, so keep them off the
         # async event loop that serves dashboard reads and health checks.
         return await run_in_threadpool(_decode_json, body)
-    except HTTPException:
-        raise
     except JSONStructureTooComplex as exc:
         raise HTTPException(413, str(exc)) from exc
     except (ValueError, UnicodeDecodeError, RecursionError) as exc:
@@ -370,6 +351,14 @@ async def _bounded_raw_body(request: Request, max_bytes: int) -> bytes:
     reparse or reserialize them (see `asp.py`'s module docstring on exact
     bytes as the dedup key).
     """
+    body = await _read_bounded(request, max_bytes)
+    if not body:
+        raise HTTPException(422, "empty body")
+    return bytes(body)
+
+
+async def _read_bounded(request: Request, max_bytes: int) -> bytearray:
+    """The request body, refused with 413 once it exceeds `max_bytes`."""
     declared = request.headers.get("content-length")
     if declared is not None:
         try:
@@ -382,13 +371,13 @@ async def _bounded_raw_body(request: Request, max_bytes: int) -> bytes:
             raise HTTPException(413, f"body exceeds {max_bytes} bytes")
 
     body = bytearray()
+    # Count the actual stream as well as Content-Length: a chunked request,
+    # or a client lying about its length, must not bypass the bound.
     async for chunk in request.stream():
         body.extend(chunk)
         if len(body) > max_bytes:
             raise HTTPException(413, f"body exceeds {max_bytes} bytes")
-    if not body:
-        raise HTTPException(422, "empty body")
-    return bytes(body)
+    return body
 
 
 def _decode_json(body: bytearray) -> Any:
@@ -559,6 +548,22 @@ def api_asp_drift(
 # evidence values that the summary routes above deliberately redact.
 
 
+async def _control_object(request: Request) -> dict[str, Any]:
+    """A lock/switch/accept/retention control body: one small JSON object."""
+    body = await _json_body(request, max_bytes=MAX_CONTROL_BODY_BYTES)
+    if not isinstance(body, dict):
+        raise HTTPException(422, "expected an object")
+    return body
+
+
+async def _control_version(request: Request, *, required: bool) -> str | None:
+    """The control body's `version` label, which may be omitted unless required."""
+    version = (await _control_object(request)).get("version")
+    if (required or version is not None) and not isinstance(version, str):
+        raise HTTPException(422, "version must be a string")
+    return version
+
+
 @app.get("/api/asps/{asp_id}/bundle", dependencies=[Depends(require_local_token)])
 def api_asp_bundle(asp_id: str) -> dict[str, Any]:
     """The full parsed evidence bundle for one ASP -- the UI's inspect view.
@@ -650,12 +655,7 @@ async def api_lock_asp(asp_id: str, request: Request) -> dict[str, Any]:
     Body: `{"version": "v1.0"}`. Equivalent to
     `raildash asp lock <asp_id> --version <version>`.
     """
-    body = await _json_body(request, max_bytes=MAX_CONTROL_BODY_BYTES)
-    if not isinstance(body, dict):
-        raise HTTPException(422, "expected an object")
-    version = body.get("version")
-    if not isinstance(version, str):
-        raise HTTPException(422, "version must be a string")
+    version = await _control_version(request, required=True)
     try:
         return get_store().lock_alignment(asp_id, version)
     except KeyError as exc:
@@ -677,16 +677,6 @@ def api_switch_alignment(alignment_version_id: str) -> dict[str, Any]:
         return get_store().switch_alignment(alignment_version_id)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
-
-
-async def _optional_version(request: Request) -> str | None:
-    body = await _json_body(request, max_bytes=MAX_CONTROL_BODY_BYTES)
-    if not isinstance(body, dict):
-        raise HTTPException(422, "expected an object")
-    version = body.get("version")
-    if version is not None and not isinstance(version, str):
-        raise HTTPException(422, "version must be a string")
-    return version
 
 
 def _make_baseline(asp_id: str, version: str | None) -> JSONResponse:
@@ -713,7 +703,7 @@ async def api_make_baseline(asp_id: str, request: Request) -> JSONResponse:
     201 when this call locked the ASP, 200 when it reused its existing
     alignment version. Equivalent to `raildash asp baseline <asp_id>`.
     """
-    return _make_baseline(asp_id, await _optional_version(request))
+    return _make_baseline(asp_id, await _control_version(request, required=False))
 
 
 @app.post(
@@ -729,7 +719,7 @@ async def api_accept_drift(asp_id: str, request: Request) -> JSONResponse:
     the alignment version the first accept created instead of locking the
     same evidence a second time.
     """
-    return _make_baseline(asp_id, await _optional_version(request))
+    return _make_baseline(asp_id, await _control_version(request, required=False))
 
 
 @app.get("/api/settings/asp-retention")
@@ -750,9 +740,7 @@ async def api_set_asp_retention(request: Request) -> dict[str, int]:
     database (a `settings` row) so it survives a restart without re-exporting
     anything -- the CLI equivalent is `raildash asp retention-set`.
     """
-    body = await _json_body(request, max_bytes=MAX_CONTROL_BODY_BYTES)
-    if not isinstance(body, dict):
-        raise HTTPException(422, "expected an object")
+    body = await _control_object(request)
     keep_count = body.get("keep_count")
     max_age_days = body.get("max_age_days")
     if not isinstance(keep_count, int) or isinstance(keep_count, bool):
@@ -844,9 +832,7 @@ async def ingest_evidence_bundle(
     db = get_store()
     try:
         result = db.load_asp(raw, agent_key=resolved_agent_key)
-    except BundleValidationError as exc:
-        raise HTTPException(422, str(exc)) from exc
-    except IdentityRequiredError as exc:
+    except (BundleValidationError, IdentityRequiredError) as exc:
         raise HTTPException(422, str(exc)) from exc
     except ValueError as exc:
         # bundle_id collision with different bytes, or an exact-digest replay

@@ -30,9 +30,9 @@ accept a drifted state as a new baseline. None of it needs the server
 stopped or the CLI (`raildash asp load`/`list`/`lock`/`switch` remain
 equivalent CLI commands over the same calls). The panel shows the same
 aligned, drifted, or comparison-unavailable outcomes, now with the
-per-attribute old/new detail behind "drift explained"; exact evidence needs
-either the CLI/file access or the dashboard's local write token, never an
-unauthenticated read.
+per-attribute old/new detail under a drifted ASP's change list; exact
+evidence needs either the CLI/file access or the dashboard's local write
+token, never an unauthenticated read.
 
 ## Published-install gate
 
@@ -115,8 +115,8 @@ docker run -d --name railmon --network raildash-handoff \
 ```
 
 Watch the next delivered ASP show **DRIFT_DETECTED** with the per-attribute
-"drift explained" detail. Accept it as a new baseline
-version, switch back to the original, and confirm the drift result is
+old/new detail under its change list. Accept it as a new baseline version,
+switch back to the original, and confirm the drift result is
 restored rather than recomputed differently.
 
 **5. Teardown:** `docker rm -f raildash railmon && docker network rm raildash-handoff`
