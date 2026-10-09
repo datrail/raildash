@@ -507,17 +507,15 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
             state = candidate_state
             candidate_method = attribution.get("method")
             method_name = candidate_method if isinstance(candidate_method, str) else None
-            ref = interaction.get("agent_ref")
-            if state == "attributed" and isinstance(ref, dict):
+            if state == "attributed":
+                ref = interaction.get("agent_ref")
+                ref = ref if isinstance(ref, dict) else {}
                 values = [ref.get(k) for k in ("host_id", "sandbox_name", "agent_key")]
                 if all(isinstance(value, str) and value for value in values):
                     agent_host_id, sandbox_name, agent_key = values
                 else:
                     state, method_name = "unknown", None
                     reason = "INCOMPLETE_AGENT_REF"
-            elif state == "attributed":
-                state, method_name = "unknown", None
-                reason = "INCOMPLETE_AGENT_REF"
             else:
                 # The producer's reason (e.g. TICKET_CLAIM_CONFLICT) is what the
                 # unattributed queue shows; bounded, since it is only a label.

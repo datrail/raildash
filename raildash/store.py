@@ -7,8 +7,8 @@ happened to still have the process running, and RailMon's own output is a file
 that outlives any process. So the dashboard persists, and `raildash load` can
 replay a capture from last week.
 
-Stdlib `sqlite3` only. RailDash's whole dependency list is FastAPI and uvicorn
-and it is worth keeping it that way — this is the component an OSS user runs
+Stdlib `sqlite3` only. RailDash's whole dependency list is FastAPI, uvicorn
+and jsonschema, and it is worth keeping it that way — this is the component an OSS user runs
 locally with no control plane behind it.
 """
 
@@ -247,19 +247,38 @@ BEGIN SELECT RAISE(ABORT, 'alignment versions are immutable'); END;
 SCHEMA_TABLES = frozenset(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA))
 # Columns `_ensure_multi_agent_columns`/`_ensure_content_columns` add to a
 # database created before them.
-UPGRADE_INTERACTION_COLUMNS = frozenset(
-    (
-        "agent_host_id",
-        "sandbox_name",
-        "agent_key",
-        "attribution_state",
-        "attribution_method",
-        "attribution_reason",
-        "attribution_target",
-        "request_media_type",
-        "content_kinds",
-    )
+MULTI_AGENT_COLUMNS = (
+    "agent_host_id",
+    "sandbox_name",
+    "agent_key",
+    "attribution_state",
+    "attribution_method",
+    "attribution_reason",
+    "attribution_target",
 )
+CONTENT_COLUMNS = ("request_media_type", "content_kinds")
+UPGRADE_INTERACTION_COLUMNS = frozenset((*MULTI_AGENT_COLUMNS, *CONTENT_COLUMNS))
+
+
+def _comparison_state(comparable: Any, has_drift: Any) -> str:
+    """A stored drift result's outcome, as the API and the dashboard name it."""
+    if not comparable:
+        return "COMPARISON_UNAVAILABLE"
+    return "DRIFT_DETECTED" if has_drift else "ALIGNED"
+
+
+def _check_drift_page(limit: int, offset: int) -> None:
+    if limit < 1 or limit > MAX_DRIFT_PAGE_SIZE or offset < 0:
+        raise ValueError("invalid drift page")
+
+
+def _session_scope(session_id: str, agent_key: str | None) -> tuple[str, list[str]]:
+    """The `interactions` filter for one capture, optionally one agent in it."""
+    scope, params = "session_id = ?", [session_id]
+    if agent_key:
+        scope += " AND agent_key = ?"
+        params.append(agent_key)
+    return scope, params
 
 
 class Store:
@@ -350,10 +369,7 @@ class Store:
         }
         if not SCHEMA_TABLES <= tables:
             return True
-        columns = {
-            row["name"] for row in self._db.execute("PRAGMA table_info(interactions)")
-        }
-        if not UPGRADE_INTERACTION_COLUMNS <= columns:
+        if not UPGRADE_INTERACTION_COLUMNS <= self._interaction_columns():
             return True
         return (
             self._db.execute(
@@ -362,22 +378,19 @@ class Store:
             is not None
         )
 
-    def _ensure_multi_agent_columns(self) -> None:
-        """Add DR-109 read columns without rewriting existing capture rows."""
-        existing = {
-            row["name"] for row in self._db.execute("PRAGMA table_info(interactions)")
-        }
-        for name in (
-            "agent_host_id",
-            "sandbox_name",
-            "agent_key",
-            "attribution_state",
-            "attribution_method",
-            "attribution_reason",
-            "attribution_target",
-        ):
+    def _interaction_columns(self) -> set[str]:
+        return {row["name"] for row in self._db.execute("PRAGMA table_info(interactions)")}
+
+    def _add_interaction_columns(self, names: tuple[str, ...]) -> None:
+        """Add each missing TEXT column; existing rows keep NULL in it."""
+        existing = self._interaction_columns()
+        for name in names:
             if name not in existing:
                 self._db.execute(f"ALTER TABLE interactions ADD COLUMN {name} TEXT")
+
+    def _ensure_multi_agent_columns(self) -> None:
+        """Add DR-109 read columns without rewriting existing capture rows."""
+        self._add_interaction_columns(MULTI_AGENT_COLUMNS)
         self._db.execute(
             "CREATE INDEX IF NOT EXISTS interactions_agent_ref "
             "ON interactions(agent_host_id, sandbox_name, agent_key)"
@@ -397,12 +410,7 @@ class Store:
         bounded pages like `_migrate`; one too large or malformed to parse
         gets an empty value rather than a guess.
         """
-        existing = {
-            row["name"] for row in self._db.execute("PRAGMA table_info(interactions)")
-        }
-        for name in ("request_media_type", "content_kinds"):
-            if name not in existing:
-                self._db.execute(f"ALTER TABLE interactions ADD COLUMN {name} TEXT")
+        self._add_interaction_columns(CONTENT_COLUMNS)
         # Holds only rows still to derive, so once filled it is empty and the
         # check on every later open costs nothing.
         self._db.execute(
@@ -1011,13 +1019,7 @@ class Store:
             if compared is not None:
                 comparison = {
                     "against_version": compared["version"],
-                    "state": (
-                        "COMPARISON_UNAVAILABLE"
-                        if not compared["comparable"]
-                        else "DRIFT_DETECTED"
-                        if compared["has_drift"]
-                        else "ALIGNED"
-                    ),
+                    "state": _comparison_state(compared["comparable"], compared["has_drift"]),
                     "change_count": compared["change_count"],
                 }
             items.append(
@@ -1107,13 +1109,7 @@ class Store:
             state, result = "ALIGNMENT_ACTIVE", None
         else:
             result = json.loads(latest["result_json"])
-            state = (
-                "COMPARISON_UNAVAILABLE"
-                if not result["comparable"]
-                else "DRIFT_DETECTED"
-                if result["has_drift"]
-                else "ALIGNED"
-            )
+            state = _comparison_state(result["comparable"], result["has_drift"])
         return {
             "asp": self._asp_summary(asp, replayed=False, include_digest=False),
             "state": state,
@@ -1130,8 +1126,7 @@ class Store:
         )
 
     def drift_page(self, asp_id: str, *, limit: int = DEFAULT_DRIFT_PAGE_SIZE, offset: int = 0) -> dict[str, Any] | None:
-        if limit < 1 or limit > MAX_DRIFT_PAGE_SIZE or offset < 0:
-            raise ValueError("invalid drift page")
+        _check_drift_page(limit, offset)
         row = self._db.execute(
             """SELECT d.result_json FROM drift_results d
                JOIN asps a ON a.asp_id = d.current_asp_id
@@ -1219,10 +1214,7 @@ class Store:
             "SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)
         ).fetchone() is None:
             return None
-        scope, params = "session_id = ?", [session_id]
-        if agent_key:
-            scope += " AND agent_key = ?"
-            params.append(agent_key)
+        scope, params = _session_scope(session_id, agent_key)
         subjects = self._db.execute(
             f"""SELECT DISTINCT agent_host_id, sandbox_name FROM interactions
                 WHERE {scope} AND agent_host_id IS NOT NULL AND sandbox_name IS NOT NULL
@@ -1301,8 +1293,7 @@ class Store:
         on top of `drift_detail`'s full baseline/current evidence, which is
         already owner-only (CLI: `asp drift-export`; HTTP: token-gated).
         """
-        if limit < 1 or limit > MAX_DRIFT_PAGE_SIZE or offset < 0:
-            raise ValueError("invalid drift page")
+        _check_drift_page(limit, offset)
         detail = self.drift_detail(asp_id)
         if detail is None:
             return None
@@ -1640,10 +1631,7 @@ class Store:
         ``agent_key`` (see ``ingest``), so they stay in the unattributed queue
         and cannot shape any one agent's observed profile (design doc §4.6).
         """
-        scope, scope_params = "session_id = ?", [session_id]
-        if agent_key:
-            scope += " AND agent_key = ?"
-            scope_params.append(agent_key)
+        scope, scope_params = _session_scope(session_id, agent_key)
         session = self._db.execute(
             "SELECT session_id, agent, capture_start FROM sessions WHERE session_id = ?",
             (session_id,),
