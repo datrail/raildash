@@ -53,6 +53,13 @@ function el(tag, className, text) {
   return node;
 }
 
+// An error line inside a panel, toned as one.
+function errorMessage(text) {
+  const message = el("p", "asp-status-msg", text);
+  message.dataset.tone = "err";
+  return message;
+}
+
 function fmtInt(n) {
   return typeof n === "number" ? n.toLocaleString() : "—";
 }
@@ -97,39 +104,47 @@ function statusPill(code) {
     return p;
   }
   let cls = "pill-ok";
-  if (code >= 500) cls = "pill-fail";
-  else if (code >= 400) cls = "pill-fail";
+  if (code >= 400) cls = "pill-fail";
   else if (code >= 300) cls = "pill-warn";
   return el("span", `pill ${cls}`, code);
 }
 
-async function getJSON(path, params) {
-  if (staticDemo) return getStaticJSON(path, params || {});
+// A same-origin URL for `path`, with every set param as a query parameter.
+function apiUrl(path, params) {
   const url = new URL(path, window.location.origin);
   Object.entries(params || {}).forEach(([k, v]) => {
     if (v !== null && v !== undefined && v !== "" && v !== false) {
       url.searchParams.set(k, v);
     }
   });
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
+  return url;
+}
+
+async function getJSON(path, params) {
+  if (staticDemo) return getStaticJSON(path, params || {});
+  const res = await fetch(apiUrl(path, params), { headers: { Accept: "application/json" } });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
+}
+
+// A request carrying the local write token, for every write and for the
+// token-gated reads; a non-2xx answer throws the server's own `detail`.
+async function tokenFetch(url, init = {}) {
+  const res = await fetch(url, {
+    ...init,
+    headers: { ...init.headers, "X-RailDash-Token": LOCAL_TOKEN },
+  });
+  if (!res.ok) throw await _apiError(res);
+  return res;
 }
 
 // Same as getJSON, but for the token-gated reads that carry exact evidence
 // (ASP bundle inspect, drift-explained, kernel-observed files) rather than
 // redacted summaries.
 async function getJSONWithToken(path, params) {
-  const url = new URL(path, window.location.origin);
-  Object.entries(params || {}).forEach(([k, v]) => {
-    if (v !== null && v !== undefined && v !== "" && v !== false) {
-      url.searchParams.set(k, v);
-    }
+  const res = await tokenFetch(apiUrl(path, params), {
+    headers: { Accept: "application/json" },
   });
-  const res = await fetch(url, {
-    headers: { Accept: "application/json", "X-RailDash-Token": LOCAL_TOKEN },
-  });
-  if (!res.ok) throw await _apiError(res);
   return res.json();
 }
 
@@ -144,31 +159,17 @@ async function _apiError(res) {
   return new Error(detail);
 }
 
-async function postJSON(path, body, params) {
-  const url = new URL(path, window.location.origin);
-  Object.entries(params || {}).forEach(([k, v]) => {
-    if (v !== null && v !== undefined && v !== "") url.searchParams.set(k, v);
-  });
-  const res = await fetch(url, {
+async function postJSON(path, body) {
+  const res = await tokenFetch(apiUrl(path), {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-RailDash-Token": LOCAL_TOKEN },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {}),
   });
-  if (!res.ok) throw await _apiError(res);
   return res.status === 204 ? null : res.json();
 }
 
-async function postRawBody(path, rawBytes, params) {
-  const url = new URL(path, window.location.origin);
-  Object.entries(params || {}).forEach(([k, v]) => {
-    if (v !== null && v !== undefined && v !== "") url.searchParams.set(k, v);
-  });
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "X-RailDash-Token": LOCAL_TOKEN },
-    body: rawBytes,
-  });
-  if (!res.ok) throw await _apiError(res);
+async function postRawBody(path, rawBytes) {
+  const res = await tokenFetch(apiUrl(path), { method: "POST", body: rawBytes });
   return res.json();
 }
 
@@ -373,10 +374,7 @@ function makeBaseline(aspId, version) {
 // The ASP exactly as RailMon delivered it. The route needs the write token,
 // so fetch it and hand the browser a blob rather than a bare link.
 async function downloadAspRaw(aspId) {
-  const res = await fetch(`/api/asps/${encodeURIComponent(aspId)}/raw`, {
-    headers: { "X-RailDash-Token": LOCAL_TOKEN },
-  });
-  if (!res.ok) throw await _apiError(res);
+  const res = await tokenFetch(`/api/asps/${encodeURIComponent(aspId)}/raw`);
   const href = URL.createObjectURL(await res.blob());
   const link = el("a");
   link.href = href;
@@ -387,12 +385,12 @@ async function downloadAspRaw(aspId) {
   setTimeout(() => URL.revokeObjectURL(href), 30_000);
 }
 
-async function fetchAllPages(path, extraParams) {
+async function fetchAllPages(path) {
   const items = [];
   let offset = 0;
   let total = 0;
   do {
-    const page = await getJSON(path, { ...(extraParams || {}), limit: 500, offset });
+    const page = await getJSON(path, { limit: 500, offset });
     items.push(...page.items);
     total = page.total;
     if (!page.items.length) break;
@@ -407,7 +405,7 @@ function renderLockForm({ suggestedVersion, buttonLabel, onLock }) {
   input.type = "text";
   input.value = suggestedVersion;
   input.setAttribute("aria-label", "Alignment version label");
-  const button = el("button", "btn", buttonLabel || "Lock as baseline");
+  const button = el("button", "btn", buttonLabel);
   button.type = "button";
   const status = el("span", "asp-status-msg");
   status.setAttribute("aria-live", "polite");
@@ -614,9 +612,7 @@ async function renderDriftExplained(aspId) {
       wrapper.append(el("p", "muted", "No per-attribute detail available for this page."));
     }
   } catch (error) {
-    const msg = el("p", "asp-status-msg", `Could not load per-attribute detail: ${error.message}`);
-    msg.dataset.tone = "err";
-    wrapper.append(msg);
+    wrapper.append(errorMessage(`Could not load per-attribute detail: ${error.message}`));
   }
   return wrapper;
 }
@@ -641,9 +637,7 @@ function renderInspectToggle(aspId) {
       wrap.append(view);
       button.textContent = "Hide evidence";
     } catch (error) {
-      const msg = el("p", "asp-status-msg", error.message);
-      msg.dataset.tone = "err";
-      wrap.append(msg);
+      wrap.append(errorMessage(error.message));
     } finally {
       button.disabled = false;
     }
@@ -880,6 +874,14 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
       await postJSON(`/api/asps/${encodeURIComponent(asp.asp_id)}/accept-drift`, { version });
       refresh();
     };
+    const versionPicker = () => renderVersionPicker(
+      versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
+    );
+    const nextVersionForm = (buttonLabel, onLock) => renderLockForm({
+      suggestedVersion: suggestNextVersion(versions),
+      buttonLabel,
+      onLock,
+    });
 
     if (alignment.state === "NO_ACTIVE_ALIGNMENT" && versions.length === 0) {
       // The first ASP ever loaded for this identity: auto-offer locking it as
@@ -900,47 +902,27 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
     } else if (alignment.state === "NO_ACTIVE_ALIGNMENT") {
       card.append(el("p", "muted", "No alignment version is active yet for this agent identity."));
       card.append(renderVersionPicker(versions, null, doSwitch));
-      card.append(renderLockForm({
-        suggestedVersion: suggestNextVersion(versions),
-        buttonLabel: "Use this ASP as the baseline",
-        onLock: doMakeBaseline,
-      }));
+      card.append(nextVersionForm("Use this ASP as the baseline", doMakeBaseline));
       card.append(baselineCommand(suggestNextVersion(versions)));
     } else if (alignment.state === "COMPARISON_UNAVAILABLE") {
       card.append(el("p", "asp-reason", `Reason: ${alignment.drift.reason}`));
       card.append(el("p", "muted",
         "This ASP cannot be compared with the active alignment. Use it as the new baseline to compare later ones with it."));
-      card.append(renderVersionPicker(
-        versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
-      ));
-      card.append(renderLockForm({
-        suggestedVersion: suggestNextVersion(versions),
-        buttonLabel: "Lock as new baseline",
-        onLock: doMakeBaseline,
-      }));
+      card.append(versionPicker());
+      card.append(nextVersionForm("Lock as new baseline", doMakeBaseline));
       card.append(baselineCommand(suggestNextVersion(versions)));
     } else if (alignment.state === "ALIGNMENT_ACTIVE") {
       card.append(el("p", "muted", "Load a later ASP for this agent to run the first comparison."));
-      card.append(renderVersionPicker(
-        versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
-      ));
+      card.append(versionPicker());
       card.append(aspCommand(raildashCommand("asp load evidence-bundle.json")));
     } else if (alignment.state === "ALIGNED") {
-      card.append(renderVersionPicker(
-        versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
-      ));
+      card.append(versionPicker());
     }
 
     if (alignment.state === "DRIFT_DETECTED") {
-      card.append(renderVersionPicker(
-        versions, activeVersion ? activeVersion.alignment_version_id : null, doSwitch
-      ));
+      card.append(versionPicker());
       const acceptWrap = el("div", "asp-actions");
-      acceptWrap.append(renderLockForm({
-        suggestedVersion: suggestNextVersion(versions),
-        buttonLabel: "Accept new state as new baseline",
-        onLock: doAccept,
-      }));
+      acceptWrap.append(nextVersionForm("Accept new state as new baseline", doAccept));
       card.append(acceptWrap);
       card.append(baselineCommand(suggestNextVersion(versions)));
     }
@@ -1192,41 +1174,36 @@ async function loadOverview() {
   renderHosts(data.hosts || []);
 }
 
-function profileValues(title, items) {
-  const group = el("section", "profile-group");
+// One profile dimension: a heading, an optional note, and a chip per value
+// with its count, or "None observed".
+function profileGroup(title, items, { className, note, chipClass = "profile-chip", count }) {
+  const group = el("section", className ? `profile-group ${className}` : "profile-group");
   group.append(el("h3", null, title));
+  if (note) group.append(el("p", "note", note));
   const values = el("div", "profile-values");
   if (!items.length) {
     values.append(el("span", "muted", "None observed"));
   }
   items.forEach((item) => {
-    const chip = el("span", "profile-chip");
+    const chip = el("span", chipClass);
     chip.append(el("span", "profile-value", item.value));
-    chip.append(el("span", "profile-count", item.count));
+    chip.append(el("span", "profile-count", count(item)));
     values.append(chip);
   });
   group.append(values);
   return group;
 }
 
+function profileValues(title, items) {
+  return profileGroup(title, items, { count: (item) => item.count });
+}
+
 function profileUploads(title, items) {
-  const group = el("section", "profile-group");
-  group.append(el("h3", null, title));
-  const values = el("div", "profile-values");
-  if (!items.length) {
-    values.append(el("span", "muted", "None observed"));
-  }
-  items.forEach((item) => {
-    const chip = el("span", "profile-chip profile-chip-stacked");
-    chip.append(el("span", "profile-value", item.value));
-    chip.append(el(
-      "span", "profile-count",
-      `${fmtInt(item.count)} calls · ${fmtBytes(item.total_bytes)} · largest ${fmtBytes(item.max_bytes)}`
-    ));
-    values.append(chip);
+  return profileGroup(title, items, {
+    chipClass: "profile-chip profile-chip-stacked",
+    count: (item) =>
+      `${fmtInt(item.count)} calls · ${fmtBytes(item.total_bytes)} · largest ${fmtBytes(item.max_bytes)}`,
   });
-  group.append(values);
-  return group;
 }
 
 function fileOps(item) {
@@ -1237,21 +1214,11 @@ function fileOps(item) {
 }
 
 function profileFiles(title, items, className) {
-  const group = el("section", className ? `profile-group ${className}` : "profile-group");
-  group.append(el("h3", null, title));
-  group.append(el("p", "note", "Asked of file tools in the captured conversation; not a filesystem trace."));
-  const values = el("div", "profile-values");
-  if (!items.length) {
-    values.append(el("span", "muted", "None observed"));
-  }
-  items.forEach((item) => {
-    const chip = el("span", "profile-chip");
-    chip.append(el("span", "profile-value", item.value));
-    chip.append(el("span", "profile-count", fileOps(item)));
-    values.append(chip);
+  return profileGroup(title, items, {
+    className,
+    note: "Asked of file tools in the captured conversation; not a filesystem trace.",
+    count: fileOps,
   });
-  group.append(values);
-  return group;
 }
 
 // DR-154: what the kernel saw the sandbox open, beside what the model asked
@@ -1281,9 +1248,7 @@ function kernelFileSource(source) {
     `collected ${fmtDateTime(source.collected_at)} · ${source.asp_id}`));
   const evidence = source.evidence;
   if (source.error) {
-    const message = el("p", "asp-status-msg", `Cannot show this ASP: ${source.error}.`);
-    message.dataset.tone = "err";
-    block.append(message);
+    block.append(errorMessage(`Cannot show this ASP: ${source.error}.`));
     return block;
   }
   if (!evidence) {
@@ -1345,9 +1310,7 @@ function profileKernelFiles(data, error) {
     return group;
   }
   if (error) {
-    const message = el("p", "asp-status-msg", `Could not load kernel-observed files: ${error.message}`);
-    message.dataset.tone = "err";
-    group.append(message);
+    group.append(errorMessage(`Could not load kernel-observed files: ${error.message}`));
     return group;
   }
   const sources = data.sources || [];
@@ -1449,13 +1412,20 @@ function changedValues(before, after) {
   };
 }
 
-function driftLabels(title, change, incomplete) {
+// A drift dimension's section; when `incomplete`, it says so, and callers
+// add nothing else, since a truncated side cannot be compared.
+function driftSection(title, incomplete) {
   const section = el("section", "drift-group");
   section.append(el("h3", null, title));
   if (incomplete) {
     section.append(el("p", "note", "Comparison incomplete because one or both profiles truncated this dimension."));
-    return section;
   }
+  return section;
+}
+
+function driftLabels(title, change, incomplete) {
+  const section = driftSection(title, incomplete);
+  if (incomplete) return section;
   [["Added", change.added], ["Removed", change.removed]].forEach(
     ([label, items]) => {
       const row = el("div", "drift-change");
@@ -1470,9 +1440,8 @@ function driftLabels(title, change, incomplete) {
 
 // A kind both sessions carry can still drift: a burst of image uploads to a
 // host the agent already used changes only how many calls carry images.
-function driftCounts(title, before, after, incomplete) {
-  const section = driftLabels(title, changedValues(before, after), incomplete);
-  if (incomplete) return section;
+function driftCounts(title, before, after) {
+  const section = driftLabels(title, changedValues(before, after), false);
   const previous = new Map((before || []).map((item) => [item.value, item.count]));
   const changed = (after || [])
     .filter((item) => previous.has(item.value) && previous.get(item.value) !== item.count)
@@ -1493,12 +1462,8 @@ function driftCounts(title, before, after, incomplete) {
 const UPLOAD_GROWTH_FACTOR = 2;
 
 function driftUploads(title, before, after, incomplete) {
-  const section = el("section", "drift-group");
-  section.append(el("h3", null, title));
-  if (incomplete) {
-    section.append(el("p", "note", "Comparison incomplete because one or both profiles truncated this dimension."));
-    return section;
-  }
+  const section = driftSection(title, incomplete);
+  if (incomplete) return section;
   const previous = new Map((before || []).map((item) => [item.value, item.max_bytes]));
   const grown = (after || [])
     .filter((item) => previous.has(item.value) &&
@@ -1570,7 +1535,7 @@ async function loadDrift() {
     labels.append(driftLabels("Hosts", changedValues(before.hosts, after.hosts), incomplete("hosts")));
     labels.append(driftLabels("Tools", changedValues(before.tool_names, after.tool_names), incomplete("tool_names")));
     labels.append(driftLabels("Models", changedValues(before.models, after.models), incomplete("models")));
-    labels.append(driftCounts("Uploaded content", before.content_kinds, after.content_kinds, false));
+    labels.append(driftCounts("Uploaded content", before.content_kinds, after.content_kinds));
     labels.append(driftLabels("Request content types", changedValues(before.request_media_types, after.request_media_types), incomplete("request_media_types")));
     labels.append(driftUploads("Bytes sent per host", before.upload_bytes, after.upload_bytes, incomplete("upload_bytes")));
     labels.append(driftLabels("Files asked to write", changedValues(withOperation(before.file_access, "write"), withOperation(after.file_access, "write")), incomplete("file_writes")));
