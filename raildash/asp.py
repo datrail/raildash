@@ -28,6 +28,14 @@ SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "evidence-bundle-v1.
 SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text())
 _VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
 
+# RailMon's grouping of attributes into static and dynamic agent data
+# (DR-193), vendored the same way. A dynamic attribute says where this copy
+# runs now, so its value is left out of every comparison: a restart, move or
+# recreate is not drift (`_comparison_attributes`). The producer sends it;
+# leaving it out is ours.
+ATTRIBUTE_GROUPS_PATH = Path(__file__).resolve().parent / "schemas" / "attribute-groups.json"
+DYNAMIC_ATTRIBUTES = frozenset(json.loads(ATTRIBUTE_GROUPS_PATH.read_text())["dynamic"])
+
 SCHEMA_V2_PATH = Path(__file__).resolve().parent / "schemas" / "evidence-bundle-v2.schema.json"
 SCHEMA_V2: dict[str, Any] = json.loads(SCHEMA_V2_PATH.read_text())
 _VALIDATOR_V2 = Draft202012Validator(SCHEMA_V2, format_checker=FormatChecker())
@@ -556,9 +564,10 @@ def _bundle_changes(
     baseline: dict[str, Any], current: dict[str, Any]
 ) -> list[dict[str, Any]]:
     changes: list[dict[str, Any]] = []
-    # The producer repeats copy identity in this attribute's value. Preserve
-    # its evidence qualifiers as drift, but omit only that copy-specific value
-    # after the explicit logical-identity gate.
+    # The producer repeats copy identity in container_identity's value, and a
+    # dynamic attribute's value is where this copy runs. Preserve their
+    # evidence qualifiers as drift, but omit only those copy-specific values
+    # after the explicit logical-identity gate (`_comparison_attributes`).
     baseline_attributes = _comparison_attributes(baseline["attributes"])
     current_attributes = _comparison_attributes(current["attributes"])
     changes.extend(
@@ -659,14 +668,13 @@ def _bundle_changes_v2(
 
 
 def _comparison_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
+    # A copy-specific value is never drift; its evidence qualifiers still are
+    # (DR-118), so a probe that stops answering is reported.
     projected = dict(attributes)
-    container_identity = projected.get("container_identity")
-    if isinstance(container_identity, dict):
-        projected["container_identity"] = {
-            key: value
-            for key, value in container_identity.items()
-            if key != "value"
-        }
+    for name in ("container_identity", *sorted(DYNAMIC_ATTRIBUTES)):
+        attribute = projected.get(name)
+        if isinstance(attribute, dict):
+            projected[name] = {key: value for key, value in attribute.items() if key != "value"}
     return projected
 
 

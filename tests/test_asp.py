@@ -12,6 +12,7 @@ from jsonschema.exceptions import ValidationError
 from raildash.asp import (
     DEFAULT_DRIFT_PAGE_SIZE,
     DEPLOYMENT_KEYS,
+    DYNAMIC_ATTRIBUTES,
     MAX_ASP_BUNDLE_BYTES,
     MAX_DRIFT_CHANGES,
     MAX_DRIFT_PAGE_SIZE,
@@ -911,4 +912,51 @@ def test_a_window_that_saw_nothing_is_an_empty_list_not_a_value_change():
     ]
     assert _window_drift(current, baseline) == [
         ("executor", "ATTRIBUTE_CHANGED", "observed_destinations", ["value", *fields]),
+    ]
+
+
+# DR-193: RailMon carries dynamic agent data and publishes which attributes
+# hold it; RailDash leaves their values out of every comparison.
+def _instance(hostname: str, pid: int) -> dict:
+    return {
+        "value": {"hostname": hostname, "process": {"pid": pid, "cwd": "/work"}},
+        "status": "ANSWERED", "tier": "observed", "authored_by": "none",
+    }
+
+
+def test_the_vendored_groups_name_agent_instance_dynamic():
+    assert DYNAMIC_ATTRIBUTES == {"agent_instance"}
+
+
+def test_a_v1_dynamic_value_is_never_drift_but_its_qualifiers_are():
+    baseline = bundle()
+    baseline["attributes"]["agent_instance"] = _instance("3f2a9c", 17)
+    current = copy.deepcopy(baseline)
+    current["attributes"]["agent_instance"] = _instance("9b8d7e", 23)
+    baseline_raw = raw(baseline)
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
+    assert (result["comparable"], result["changes"]) == (True, [])
+    # As for container_identity (DR-118): a probe that stops answering is drift.
+    current["attributes"]["agent_instance"]["status"] = "PARTIAL"
+    current["attributes"]["agent_instance"]["reason"] = "NO_SOURCE_ACCESS"
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
+    assert result["changes"] == [
+        {"type": "ATTRIBUTE_CHANGED", "name": "agent_instance", "fields": ["status", "reason"]}
+    ]
+    # Present on one side only is a change, as for any attribute: RailMon
+    # always emits it, ANSWERED or ABSENT.
+    del current["attributes"]["agent_instance"]
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
+    assert [change["type"] for change in result["changes"]] == ["ATTRIBUTE_REMOVED"]
+
+
+def test_a_v2_dynamic_value_is_never_drift_and_a_static_one_still_is():
+    baseline = _windowed_v2([_destination("a.example")], [])
+    baseline["agents"][0]["attributes"]["agent_instance"] = _instance("3f2a9c", 17)
+    current = copy.deepcopy(baseline)
+    current["agents"][0]["attributes"]["agent_instance"] = _instance("9b8d7e", 23)
+    assert _window_drift(baseline, current) == []
+    current["agents"][0]["attributes"]["tool_names"]["value"] = ["shell.run"]
+    assert _window_drift(baseline, current) == [
+        ("executor", "ATTRIBUTE_CHANGED", "tool_names", ["value"]),
     ]

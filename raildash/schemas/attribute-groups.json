@@ -1,0 +1,6 @@
+{
+  "$comment": "DR-193. Rail Center's principles for agent data (2026-10-08): the producer sends one set of agent data, grouped as static (survives the agent rebooting, moving or being reallocated) and dynamic (may change then), and a consumer leaves out what a report has no use for. This file is that grouping for evidence bundles v1 and v2. An attribute named under dynamic describes where this copy of the agent runs now, so its value changing is not drift. Every attribute not named here is static.",
+  "dynamic": [
+    "agent_instance"
+  ]
+}
