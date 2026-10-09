@@ -137,6 +137,14 @@ or read; no longer written, run or read) instead of two raw lists. A
 reading that declares a `window` (see evidence bundle v2 below) lists only
 what is newly seen, since a quieter window is not something stopped.
 
+The value of an attribute RailMon publishes as *dynamic*
+(`raildash/schemas/attribute-groups.json`, vendored from RailMon) never takes
+part in drift. Today that is `agent_instance`, where this copy runs: the
+agent container's hostname, id and host pid, and the scan's own fqdn, pid and
+working directory. A restart, move or recreate changes them. Everything but
+its value still counts, as for `container_identity`, so a probe that stops
+answering is drift. The ASP keeps the value; "Inspect evidence" shows it.
+
 For a bundle without a complete deployment or host-scoped Compose identity,
 pass `--agent-key NAME` to `asp load` (HTTP: `?agent_key=NAME` or an
 `X-RailDash-Agent-Key` header, see below). Replaying identical bytes is
