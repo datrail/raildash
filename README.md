@@ -99,10 +99,13 @@ make test
 ## ASP v1 local custody
 
 RailDash retains validated RailMon evidence bundles as immutable ASPs and can
-lock any stored ASP as an alignment version. Every one of these steps works
-from either the CLI or the live dashboard, and neither needs the server
-stopped: the CLI is an optional thin wrapper over the same underlying calls
-and can run against the database while `raildash serve` is using it:
+lock any stored ASP as an alignment version. Every workflow except locking
+without activating works from either the CLI or the live dashboard, and
+neither needs the server stopped: the CLI is an optional thin wrapper over
+the same underlying calls and can run against the database while `raildash
+serve` is using it. The dashboard's lock buttons lock and activate in one
+step (`asp baseline`); locking without activating (`asp lock`) is a CLI and
+HTTP operation:
 
 ```bash
 raildash asp load evidence-bundle.json
@@ -132,10 +135,11 @@ requested, the other what the kernel observed. The list comes from
 paths are evidence values).
 
 `observed_file_access` takes part in drift like any attribute. When it
-changes, the drift view lists the paths by what changed (newly written, run
-or read; no longer written, run or read) instead of two raw lists. A
-reading that declares a `window` (see evidence bundle v2 below) lists only
-what is newly seen, since a quieter window is not something stopped.
+changes, the drift view lists the paths by what changed (newly written, run,
+read or opened; no longer written, run, read or opened) instead of two raw
+lists. A reading that declares a `window` (see evidence bundle v2 below)
+lists only what is newly seen, since a quieter window is not something
+stopped.
 
 The value of an attribute RailMon publishes as *dynamic*
 (`raildash/schemas/attribute-groups.json`, vendored from RailMon) never takes
@@ -185,14 +189,15 @@ malformed or unresolvable bundle.
 
 ### HTTP: the rest of custody, and local write safety
 
-`GET /api/asps`, `/api/asps/history`, `/api/alignments`, and per-ASP
-`state`/`drift` stay unauthenticated, redacted metadata (change names and field names, never
-evidence values or digests) — unchanged from before. Everything that mutates
+`GET /api/asps`, `/api/asps/history`, `/api/alignments`, per-ASP
+`state`/`drift`, and `GET /api/settings/asp-retention` are unauthenticated,
+redacted metadata (counts, change names and field names, never evidence
+values or digests). Everything that mutates
 custody state, plus the four reads that carry exact evidence
 (`GET /api/asps/{asp_id}/bundle`, `GET /api/asps/{asp_id}/raw`,
 `GET /api/asps/{asp_id}/drift/explained`,
-which is the per-attribute old/new/tier detail behind the dashboard's "drift
-explained" view, and `GET /api/profile/kernel-file-access`, described under
+which is the per-attribute old/new/tier detail the dashboard shows under a
+drifted ASP's change list, and `GET /api/profile/kernel-file-access`, described under
 "Files: asked and kernel-observed" above), requires a local write token as
 an `X-RailDash-Token` header:
 
@@ -203,7 +208,7 @@ an `X-RailDash-Token` header:
 | `POST /api/alignments/{id}/switch` | `asp switch` |
 | `POST /api/asps/{asp_id}/baseline` `{"version": "..."}` | `asp baseline` (lock if needed, then switch) |
 | `POST /api/asps/{asp_id}/accept-drift` `{"version": "..."}` | `asp baseline` |
-| `GET`/`POST /api/settings/asp-retention` | `asp retention-set` |
+| `POST /api/settings/asp-retention` | `asp retention-set` |
 | `POST /api/asps/prune` | `asp prune` |
 | `GET /api/asps/{asp_id}/bundle` | `asp export` |
 | `GET /api/asps/{asp_id}/raw` (exact received bytes) | `asp export` |
