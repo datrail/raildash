@@ -260,6 +260,32 @@ opt-in to reach RailDash from another host, and the token requirement still
 applies unchanged — exposing the port does not by itself expose the write
 routes.
 
+### HTTP: the Data Guardrail
+
+DR-184's guardrail checks every ASP and every authenticated capture of an
+agent against four rules the user adopted: allowed uploads, saved-file
+kinds, no service ports, and no out-of-spec calls (design:
+railxia/docs `design/2026-10-07-data-guardrail`). The store checks them as
+evidence arrives, whichever way it arrives. `GET /api/guardrails` lists each
+agent's state (`held`, `violated`, `unverified`, `no_guardrail`) without item
+values. Everything else needs the token:
+
+| Route | What it does |
+| --- | --- |
+| `GET /api/guardrails/{agent_ref}` | state, rows, *declared since gN* offers, versions, history, and the proposal before one is adopted |
+| `POST /api/alignments/{id}/guardrail` `{}` or `{"rules": {...}}` | Adopt the proposal, or the proposal as edited |
+| `POST /api/guardrail-versions/{id}/edit` `{"rules": {...}}` | Edit: a new version from the active one |
+| `POST /api/guardrail-versions/{id}/switch` | Switch to an earlier version |
+| `POST /api/guardrails/{agent_ref}/turn-off` | Turn off (No guardrail) |
+| `POST /api/guardrail-rows/{row_id}/acknowledge` | Acknowledge a row; a later hit re-opens it |
+| `POST /api/guardrail-rows/{row_id}/allow` | Allow this: a new version that allows the row's item |
+| `POST /api/guardrails/{agent_ref}/offers/allow` or `.../dismiss` `{"kind": "host", "value": "..."}` | Allow or dismiss a newly declared host or MCP server |
+
+`RAILDASH_GUARDRAIL_MAX_OPEN_ROWS` (default 1000) caps the unacknowledged
+rows per agent before further items count in one overflow row, and
+`RAILDASH_GUARDRAIL_ACK_RETENTION_DAYS` (default 30) is how long an
+acknowledged row is kept after its last hit.
+
 ### Multi-agent collections (evidence bundle v2)
 
 RailMon run with `--target-manifest` delivers one evidence-bundle v2

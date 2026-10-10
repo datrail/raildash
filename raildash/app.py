@@ -38,6 +38,7 @@ from .json_safety import (
     JSONStructureGuard,
     JSONStructureTooComplex,
 )
+from .guardrail import GuardrailValidationError
 from .store import Store
 from .asp import (
     DEFAULT_DRIFT_PAGE_SIZE,
@@ -63,6 +64,9 @@ MAX_CAPTURE_START_CHARS = 128
 # webhook bound so one of these routes cannot be used to smuggle a large body
 # past a reviewer skimming "it's bounded like the others".
 MAX_CONTROL_BODY_BYTES = 4_096
+# A guardrail version's rules (adopt, edit): its saved-file and host lists
+# are the user's own, so larger than a control body, still bounded.
+MAX_GUARDRAIL_BODY_BYTES = 256 * 1024
 # DR-120: RailDash's own ingest bound for `POST /v1/evidence-bundles`, mirroring
 # Rail Center's MAX_EVIDENCE_BUNDLE_BYTES default (config.py there). Separately
 # configurable from the fixed MAX_ASP_BUNDLE_BYTES that `asp.parse_bundle`
@@ -1011,6 +1015,149 @@ async def ingest_evidence_bundle(
         },
         status_code=202,
     )
+
+
+# ------------------------------------------------------------- guardrails
+#
+# DR-184 M2: the Data Guardrail (railxia/docs design/2026-10-07-data-guardrail,
+# §4.5). Thin wrappers over the `Store` methods in `raildash.guardrail_store`,
+# which the store's own ingest hooks feed. The list carries states and
+# identities only; hosts, paths and ports come from the token-gated detail,
+# matching drift-explained. Every write (adopt, edit, switch, turn off,
+# acknowledge, allow, dismiss) needs the local write token, like lock and
+# switch.
+
+
+async def _guardrail_rules(request: Request, *, required: bool) -> dict[str, Any] | None:
+    """A guardrail write body's `rules` object (a whole version's rules)."""
+    body = await _json_body(request, max_bytes=MAX_GUARDRAIL_BODY_BYTES)
+    if not isinstance(body, dict):
+        raise HTTPException(422, "expected an object")
+    rules = body.get("rules")
+    if rules is None and not required:
+        return None
+    if not isinstance(rules, dict):
+        raise HTTPException(422, "rules must be an object")
+    return rules
+
+
+def _guardrail_call(action: Any, *args: Any, **kwargs: Any) -> Any:
+    """404 for an unknown id, 422 for rules the contract rejects, 409 for an
+    action the agent's current state refuses."""
+    try:
+        return action(*args, **kwargs)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc.args[0] if exc.args else exc)) from exc
+    except GuardrailValidationError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.get("/api/guardrails")
+def api_guardrails() -> list[dict[str, Any]]:
+    """Every agent with a baseline or a guardrail: its state (`held`,
+    `violated`, `unverified`, `no_guardrail`), each rule's state and reason,
+    the active version's label and how many rows count. No item values."""
+    return get_store().guardrail_agents()
+
+
+@app.get("/api/guardrails/{agent_ref}", dependencies=[Depends(require_local_token)])
+def api_guardrail_detail(agent_ref: str) -> dict[str, Any]:
+    """One agent's guardrail: the state, the rows with their items and
+    whether each counts, the *declared since gN* offers, every version, the
+    action history, and the proposal while it has a baseline and no
+    guardrail. Token-gated: the rows name hosts, paths and ports."""
+    return _guardrail_call(get_store().guardrail_detail, agent_ref)
+
+
+@app.post(
+    "/api/alignments/{alignment_version_id}/guardrail",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_adopt_guardrail(alignment_version_id: str, request: Request) -> dict[str, Any]:
+    """**Adopt**: make this baseline's proposal -- or `{"rules": {...}}`, the
+    proposal as edited -- the agent's first active guardrail version.
+    Body `{}` adopts the proposal unedited."""
+    rules = await _guardrail_rules(request, required=False)
+    return _guardrail_call(get_store().adopt_guardrail, alignment_version_id, rules)
+
+
+@app.post(
+    "/api/guardrail-versions/{guardrail_version_id}/edit",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_edit_guardrail(guardrail_version_id: str, request: Request) -> dict[str, Any]:
+    """**Edit**: a new version from the active one. Body `{"rules": {...}}`."""
+    rules = await _guardrail_rules(request, required=True)
+    return _guardrail_call(get_store().edit_guardrail, guardrail_version_id, rules)
+
+
+@app.post(
+    "/api/guardrail-versions/{guardrail_version_id}/switch",
+    dependencies=[Depends(require_local_token)],
+)
+def api_switch_guardrail(guardrail_version_id: str) -> dict[str, Any]:
+    """**Switch**: make an existing version the active one."""
+    return _guardrail_call(get_store().switch_guardrail, guardrail_version_id)
+
+
+@app.post("/api/guardrails/{agent_ref}/turn-off", dependencies=[Depends(require_local_token)])
+def api_turn_off_guardrail(agent_ref: str) -> dict[str, Any]:
+    """**Turn off**: the agent has *No guardrail*; versions and rows stay."""
+    return _guardrail_call(get_store().turn_off_guardrail, agent_ref)
+
+
+@app.post(
+    "/api/guardrail-rows/{row_id}/acknowledge", dependencies=[Depends(require_local_token)]
+)
+def api_acknowledge_guardrail_row(row_id: int) -> dict[str, Any]:
+    """**Acknowledge** one row: seen up to now; a later hit re-opens it."""
+    return _guardrail_call(get_store().acknowledge_guardrail_row, row_id)
+
+
+@app.post(
+    "/api/guardrail-rows/{row_id}/allow",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+def api_allow_guardrail_row(row_id: int) -> dict[str, Any]:
+    """**Allow this** on one row: a new version with its item allowed."""
+    return _guardrail_call(get_store().allow_guardrail_row, row_id)
+
+
+async def _offer(request: Request) -> tuple[str, str]:
+    body = await _control_object(request)
+    kind, value = body.get("kind"), body.get("value")
+    if not isinstance(kind, str) or not isinstance(value, str):
+        raise HTTPException(422, "kind and value must be strings")
+    return kind, value
+
+
+@app.post(
+    "/api/guardrails/{agent_ref}/offers/allow",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_allow_offer(agent_ref: str, request: Request) -> dict[str, Any]:
+    """**Allow this** on a *declared since gN* offer. Body `{"kind": "host"
+    | "mcp_server", "value": ...}`; it must be a current offer."""
+    kind, value = await _offer(request)
+    return _guardrail_call(get_store().choose_declared, agent_ref, kind, value, allow=True)
+
+
+@app.post(
+    "/api/guardrails/{agent_ref}/offers/dismiss",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_dismiss_offer(agent_ref: str, request: Request) -> dict[str, Any]:
+    """**Dismiss** a *declared since gN* offer: recorded as shown, not
+    allowed, and not offered again."""
+    kind, value = await _offer(request)
+    return _guardrail_call(get_store().choose_declared, agent_ref, kind, value, allow=False)
 
 
 # --------------------------------------------------------- legacy JSON routes
