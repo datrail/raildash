@@ -143,6 +143,7 @@ CREATE TABLE IF NOT EXISTS interactions (
     attribution_reason TEXT,
     attribution_target TEXT,
     raw            TEXT NOT NULL,
+    authenticated  INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
 
@@ -162,9 +163,22 @@ CREATE TABLE IF NOT EXISTS raw_events (
     function   TEXT,
     pid        INTEGER,
     len        INTEGER,
-    raw        TEXT NOT NULL
+    raw        TEXT NOT NULL,
+    authenticated INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS raw_events_session ON raw_events(session_id);
+
+-- DR-184 M0: the last heartbeat each `railmon collect` sent with the local
+-- write token, so the guardrail can tell an idle agent from a dead collector
+-- (design §4.1). One row per collector, upserted. `last_heartbeat_at` is
+-- RailDash's own receive time; `sent_at` is kept as received, for display
+-- and debugging only, since a collector's clock is not ours to trust.
+CREATE TABLE IF NOT EXISTS collector_heartbeats (
+    collector_id      TEXT PRIMARY KEY,
+    last_heartbeat_at TEXT NOT NULL,
+    taps_attached     INTEGER NOT NULL,
+    sent_at           TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS asps (
     asp_id            TEXT PRIMARY KEY,
@@ -258,6 +272,39 @@ MULTI_AGENT_COLUMNS = (
 )
 CONTENT_COLUMNS = ("request_media_type", "content_kinds")
 UPGRADE_INTERACTION_COLUMNS = frozenset((*MULTI_AGENT_COLUMNS, *CONTENT_COLUMNS))
+# DR-184 M0: whether a capture arrived with the local write token. Added to
+# both capture tables by `_ensure_authenticated_columns`; see there.
+AUTHENTICATED_COLUMN = "authenticated"
+CAPTURE_TABLES = ("interactions", "raw_events")
+_INTERACTION_INSERT_COLUMNS = (
+    "session_id", "interaction_id", "timestamp", "timestamp_ns",
+    "pid", "tid", "method", "host", "path", "status_code", "latency_ms",
+    "request_size", "response_size", "model", "tool_calls",
+    "has_ticket", "request_media_type", "content_kinds",
+    "agent_host_id", "sandbox_name", "agent_key",
+    "attribution_state", "attribution_method",
+    "attribution_reason", "attribution_target", "raw", AUTHENTICATED_COLUMN,
+)
+# A duplicate is a conflict on `interactions_dedup`: `DO NOTHING` for an
+# unauthenticated batch, exactly as `INSERT OR IGNORE` alone behaved, and the
+# in-place upgrade below for an authenticated one (see `add_interactions`).
+# `OR IGNORE` stays for every other constraint, as before.
+_INSERT_INTERACTION = (
+    f"INSERT OR IGNORE INTO interactions ({', '.join(_INTERACTION_INSERT_COLUMNS)}) "
+    f"VALUES ({', '.join(':' + name for name in _INTERACTION_INSERT_COLUMNS)}) "
+    "ON CONFLICT(session_id, interaction_id) WHERE interaction_id IS NOT NULL "
+)
+_UPGRADE_UNAUTHENTICATED_INTERACTION = (
+    "DO UPDATE SET "
+    + ", ".join(
+        f"{name} = excluded.{name}"
+        for name in _INTERACTION_INSERT_COLUMNS
+        if name not in ("session_id", "interaction_id")
+    )
+    # Only ever upgrades: an authenticated row is never overwritten, not even
+    # by another authenticated copy, so a redelivery stays a no-op.
+    + " WHERE interactions.authenticated = 0"
+)
 
 
 def _comparison_state(comparable: Any, has_drift: Any) -> str:
@@ -346,6 +393,7 @@ class Store:
         self._db.executescript(SCHEMA)
         self._ensure_multi_agent_columns()
         self._ensure_content_columns()
+        self._ensure_authenticated_columns()
         self._migrate()
         self._db.commit()
         if upgrading:
@@ -371,6 +419,11 @@ class Store:
             return True
         if not UPGRADE_INTERACTION_COLUMNS <= self._interaction_columns():
             return True
+        if any(
+            AUTHENTICATED_COLUMN not in self._table_columns(table)
+            for table in CAPTURE_TABLES
+        ):
+            return True
         return (
             self._db.execute(
                 "SELECT 1 FROM interactions WHERE content_kinds IS NULL LIMIT 1"
@@ -379,7 +432,10 @@ class Store:
         )
 
     def _interaction_columns(self) -> set[str]:
-        return {row["name"] for row in self._db.execute("PRAGMA table_info(interactions)")}
+        return self._table_columns("interactions")
+
+    def _table_columns(self, table: str) -> set[str]:
+        return {row["name"] for row in self._db.execute(f"PRAGMA table_info({table})")}
 
     def _add_interaction_columns(self, names: tuple[str, ...]) -> None:
         """Add each missing TEXT column; existing rows keep NULL in it."""
@@ -399,6 +455,23 @@ class Store:
             "CREATE INDEX IF NOT EXISTS interactions_attribution "
             "ON interactions(attribution_state)"
         )
+
+    def _ensure_authenticated_columns(self) -> None:
+        """Add DR-184's `authenticated` flag to both capture tables.
+
+        `NOT NULL DEFAULT 0`, so every row captured before this column existed
+        reads as unauthenticated -- which is what it was: the webhook took no
+        token then. The same default is why an older RailDash can keep writing
+        to an upgraded database: its INSERTs do not name the column, and what
+        they store is correctly marked unauthenticated. Nothing is rewritten,
+        so this costs one ALTER per table and no backfill.
+        """
+        for table in CAPTURE_TABLES:
+            if AUTHENTICATED_COLUMN not in self._table_columns(table):
+                self._db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {AUTHENTICATED_COLUMN} "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
 
     def _ensure_content_columns(self) -> None:
         """Add DR-132's request media columns and fill them for older rows.
@@ -1456,35 +1529,51 @@ class Store:
             )
             self._db.commit()
 
-    def add_interactions(self, session_id: str, rows: Iterable[dict[str, Any]]) -> int:
+    def add_interactions(
+        self,
+        session_id: str,
+        rows: Iterable[dict[str, Any]],
+        *,
+        authenticated: bool = False,
+    ) -> int:
         """Insert normalised rows. Returns how many were new.
 
         Duplicates are ignored rather than rejected: replaying a file is a
         normal thing to do and should be idempotent, not an error.
+
+        `authenticated` (DR-184 M0) records that the batch came with the local
+        write token. It defaults to False, so every caller that does not
+        positively know -- `raildash load`, a script, the demo builder -- stores
+        a capture the guardrail will ignore (design §4.1/§5). One exception to
+        "duplicates are ignored": an authenticated delivery of an interaction
+        that is already stored *unauthenticated* replaces that row in place
+        and marks it authenticated. Otherwise anyone who can reach the open
+        webhook could pre-post a harmless body under the dedup key of a request
+        the collector is about to deliver, and the real one -- the one a
+        guardrail should judge -- would be dropped as a duplicate. The reverse
+        never happens: an unauthenticated copy never touches an authenticated
+        row. An upgrade counts in the returned number, since what is stored
+        changed, and it recomputes the session's `first_seen` from the rows
+        now stored, so the forged copy's timestamp does not outlive it.
         """
         inserted = 0
+        replaced = False
+        statement = _INSERT_INTERACTION + (
+            _UPGRADE_UNAUTHENTICATED_INTERACTION if authenticated else "DO NOTHING"
+        )
         with self._lock:
             for row in rows:
-                cur = self._db.execute(
-                    """
-                    INSERT OR IGNORE INTO interactions (
-                        session_id, interaction_id, timestamp, timestamp_ns,
-                        pid, tid, method, host, path, status_code, latency_ms,
-                        request_size, response_size, model, tool_calls,
-                        has_ticket, request_media_type, content_kinds,
-                        agent_host_id, sandbox_name, agent_key,
-                        attribution_state, attribution_method,
-                        attribution_reason, attribution_target, raw
-                    ) VALUES (
-                        :session_id, :interaction_id, :timestamp, :timestamp_ns,
-                        :pid, :tid, :method, :host, :path, :status_code, :latency_ms,
-                        :request_size, :response_size, :model, :tool_calls,
-                        :has_ticket, :request_media_type, :content_kinds,
-                        :agent_host_id, :sandbox_name, :agent_key,
-                        :attribution_state, :attribution_method,
-                        :attribution_reason, :attribution_target, :raw
+                if authenticated and not replaced and row.get("interaction_id"):
+                    replaced = (
+                        self._db.execute(
+                            "SELECT 1 FROM interactions WHERE session_id = ? "
+                            "AND interaction_id = ? AND authenticated = 0",
+                            (session_id, row["interaction_id"]),
+                        ).fetchone()
+                        is not None
                     )
-                    """,
+                cur = self._db.execute(
+                    statement,
                     {
                         "attribution_reason": None,
                         "attribution_target": None,
@@ -1492,6 +1581,7 @@ class Store:
                         "content_kinds": "",
                         **row,
                         "session_id": session_id,
+                        "authenticated": 1 if authenticated else 0,
                     },
                 )
                 inserted += cur.rowcount
@@ -1513,29 +1603,123 @@ class Store:
                     """,
                     (session_id, session_id, session_id),
                 )
+            if replaced:
+                # `first_seen` is otherwise set once; a replaced forged row
+                # may have been the one that set it.
+                self._db.execute(
+                    """UPDATE sessions SET first_seen = COALESCE((
+                           SELECT MIN(timestamp) FROM interactions
+                           WHERE session_id = ? AND timestamp IS NOT NULL), '')
+                       WHERE session_id = ?""",
+                    (session_id, session_id),
+                )
             self._db.commit()
         return inserted
 
-    def add_raw_events(self, session_id: str, events: Iterable[dict[str, Any]]) -> int:
+    def add_raw_events(
+        self,
+        session_id: str,
+        events: Iterable[dict[str, Any]],
+        *,
+        authenticated: bool = False,
+    ) -> int:
+        """Insert raw SSL events; `authenticated` as for `add_interactions`.
+
+        Raw events have no dedup key, so there is nothing to upgrade in place.
+        """
         count = 0
         with self._lock:
             for evt in events:
                 self._db.execute(
-                    "INSERT INTO raw_events (session_id, function, pid, len, raw)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO raw_events"
+                    " (session_id, function, pid, len, raw, authenticated)"
+                    " VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         session_id,
                         evt.get("function"),
                         evt.get("pid"),
                         evt.get("len"),
                         json.dumps(evt),
+                        1 if authenticated else 0,
                     ),
                 )
                 count += 1
             self._db.commit()
         return count
 
+    @staticmethod
+    def _receive_time(at: datetime | None = None) -> str:
+        """A UTC instant as fixed-width RFC 3339, so MAX() over the text is
+        MAX() over time. (`_now`'s `isoformat()` drops the fraction when it
+        is zero, and `...:00Z` sorts after `...:00.5Z`.)"""
+        at = datetime.now(timezone.utc) if at is None else at.astimezone(timezone.utc)
+        return at.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+    def record_heartbeat(
+        self,
+        collector_id: str,
+        *,
+        taps_attached: int,
+        sent_at: str,
+        received_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Upsert one collector's heartbeat (DR-184 M0, design §4.1).
+
+        The caller has already checked the local write token and the body;
+        this only stores it. `last_heartbeat_at` is RailDash's receive time --
+        `received_at` exists for tests -- never the collector's `sent_at`: a
+        collector with a skewed or forward-set clock must not be able to keep
+        the request rules looking live.
+        """
+        row = {
+            "collector_id": collector_id,
+            "last_heartbeat_at": self._receive_time(received_at),
+            "taps_attached": taps_attached,
+            "sent_at": sent_at,
+        }
+        with self._write_transaction():
+            self._db.execute(
+                """INSERT INTO collector_heartbeats
+                       (collector_id, last_heartbeat_at, taps_attached, sent_at)
+                   VALUES (:collector_id, :last_heartbeat_at, :taps_attached, :sent_at)
+                   ON CONFLICT(collector_id) DO UPDATE SET
+                       last_heartbeat_at = excluded.last_heartbeat_at,
+                       taps_attached     = excluded.taps_attached,
+                       sent_at           = excluded.sent_at""",
+                row,
+            )
+        return row
+
     # ----------------------------------------------------------------- read
+
+    def latest_heartbeat_at(self) -> str | None:
+        """The newest authenticated heartbeat over every collector, or None.
+
+        What `guardrail.request_rules_status(last_heartbeat_at=...)` takes:
+        the request rules are verifiable while *some* collector is alive.
+        Only the token-gated route writes this table, so every row counts.
+        """
+        row = self._db.execute(
+            "SELECT MAX(last_heartbeat_at) FROM collector_heartbeats"
+        ).fetchone()
+        return row[0]
+
+    def collector_heartbeat(self, collector_id: str) -> dict[str, Any] | None:
+        """One collector's last heartbeat: `{collector_id, last_heartbeat_at,
+        taps_attached, sent_at}`, or None if it never sent one."""
+        row = self._db.execute(
+            "SELECT * FROM collector_heartbeats WHERE collector_id = ?",
+            (collector_id,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def collector_heartbeats(self) -> list[dict[str, Any]]:
+        """Every collector's last heartbeat, most recently heard first."""
+        rows = self._db.execute(
+            "SELECT * FROM collector_heartbeats "
+            "ORDER BY last_heartbeat_at DESC, collector_id"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def sessions(self) -> list[dict[str, Any]]:
         rows = self._db.execute(
@@ -1998,6 +2182,12 @@ class Store:
         return {"total": total, "items": [dict(r) for r in rows]}
 
     def interaction(self, row_id: int) -> dict[str, Any] | None:
+        """One stored row, for RailDash's own use (the guardrail, tests).
+
+        Carries `authenticated` as a bool -- `guardrail.request_owner`'s
+        input. No unauthenticated route returns this dict; the HTTP detail
+        view is `investigation`, which leaves the flag out.
+        """
         row = self._db.execute(
             "SELECT * FROM interactions WHERE id = ?", (row_id,)
         ).fetchone()
@@ -2005,6 +2195,7 @@ class Store:
             return None
         out = dict(row)
         out["raw"] = self._safe_raw(out["raw"])
+        out[AUTHENTICATED_COLUMN] = bool(out[AUTHENTICATED_COLUMN])
         return out
 
     @staticmethod
@@ -2111,6 +2302,10 @@ class Store:
 
     def _interaction_summary(self, row: sqlite3.Row) -> dict[str, Any]:
         summary = dict(row)
+        # The current row arrives as `SELECT *`; whether a capture was
+        # authenticated is guardrail input, not something the open detail
+        # route reveals (design §5: no new unauthenticated surface).
+        summary.pop(AUTHENTICATED_COLUMN, None)
         raw = self._safe_raw(summary.pop("raw"))
         summary["tool_names"] = self._tool_names(raw)
         return summary
@@ -2124,6 +2319,7 @@ class Store:
             return None
 
         current = dict(current_row)
+        current.pop(AUTHENTICATED_COLUMN, None)  # see `_interaction_summary`
         current_raw = self._safe_raw(current["raw"])
         current["raw"] = current_raw
         current["tool_names"] = self._tool_names(current_raw)

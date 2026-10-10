@@ -505,6 +505,10 @@ paths:
       description: |
         Receives a batch of raw SSL events captured by eBPF sslsniff.
         Each event contains the raw decrypted SSL data (which may be HTTP request/response).
+        Open to any caller; an optional `X-RailDash-Token` marks the batch
+        as authenticated (see `RailDashCaptureToken`).
+      parameters:
+        - {$ref: '#/components/parameters/RailDashCaptureToken'}
       requestBody:
         required: true
         content:
@@ -531,6 +535,13 @@ paths:
         Receives HTTP interactions that have been parsed from raw SSL events.
         The Python collector correlates WRITE/SEND (request) and READ/RECV (response)
         events by PID/TID and parses them into structured HTTP objects.
+        Open to any caller; an optional `X-RailDash-Token` marks the batch
+        as authenticated (see `RailDashCaptureToken`). An authenticated
+        delivery of an interaction already stored unauthenticated under the
+        same `(session_id, interaction_id)` replaces that row and counts in
+        `stored`; an unauthenticated copy never replaces an authenticated one.
+      parameters:
+        - {$ref: '#/components/parameters/RailDashCaptureToken'}
       requestBody:
         required: true
         content:
@@ -548,6 +559,41 @@ paths:
           description: Invalid request body
         '500':
           description: Server error
+
+  /webhook/heartbeat:
+    post:
+      operationId: receiveCollectorHeartbeat
+      summary: Record that a collector is alive with at least one tap attached
+      description: |
+        Token-gated (DR-184, Data Guardrail M0). `railmon collect` posts this
+        every 60 s while at least one tap is attached, so RailDash can tell
+        an idle agent from a dead collector. Stored per `collector_id`
+        (upserted) with RailDash's own receive time as the liveness time;
+        `sent_at` is kept as received and never decides liveness. The body is
+        closed: an unknown or missing field is a 422. Bounded at 4,096 bytes.
+      parameters:
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CollectorHeartbeat'
+      responses:
+        '200':
+          description: Heartbeat recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {type: string, const: ok}
+        '400': {description: Invalid JSON body}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '413': {description: Body larger than 4,096 bytes}
+        '415': {description: Content-Type is not application/json}
+        '422': {description: 'Not an object, an unknown or missing field, or a field out of range'}
 
   /webhook/sessions:
     get:
@@ -616,6 +662,18 @@ components:
         reuses across restarts. Required on every write route and on the four
         reads that carry exact evidence (`bundle`, `raw`, `drift/explained`,
         `profile/kernel-file-access`).
+      schema: {type: string}
+    RailDashCaptureToken:
+      name: X-RailDash-Token
+      in: header
+      required: false
+      description: |
+        Optional on the capture webhooks. The same local write token as
+        `RailDashToken`; with it the batch is stored as authenticated, which
+        is what the Data Guardrail's request rules judge. Without it, or with
+        a wrong one, the batch is still accepted and stored as before, marked
+        unauthenticated -- the webhook stays open for collectors that predate
+        the token. The mark is not returned by any unauthenticated read route.
       schema: {type: string}
 
   schemas:
@@ -1079,6 +1137,28 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/SslEvent'
+
+    CollectorHeartbeat:
+      type: object
+      additionalProperties: false
+      required: [collector_id, taps_attached, sent_at]
+      properties:
+        collector_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[\x20-\x7E]+$'
+          description: Stable id of one collector; printable ASCII.
+        taps_attached:
+          type: integer
+          minimum: 1
+          description: Taps attached right now. A boolean is refused.
+        sent_at:
+          type: string
+          format: date-time
+          description: |
+            The collector's own clock, RFC 3339 with a time zone. Stored as
+            received; RailDash's receive time is what counts for liveness.
 
     EventBatchResponse:
       type: object

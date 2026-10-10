@@ -40,6 +40,12 @@ POST /webhook/events              raw SSL events from RailMon
 POST /webhook/http-interactions   parsed HTTP interactions
 ```
 
+Both also take the local write token as an optional `X-RailDash-Token`; a
+batch with it is stored as authenticated, and one without it is still stored,
+marked unauthenticated. Only authenticated captures, and heartbeats posted to
+the token-gated `POST /webhook/heartbeat`, are what the Data Guardrail reads, so a
+fabricated capture is stored but never judged.
+
 Its Agent Security Profile routes (evidence-bundle ingest, lock, baseline,
 switch, accept drift, retention change, prune, and the four reads that return
 exact evidence)
@@ -48,9 +54,12 @@ require the local write token in an `X-RailDash-Token` header. The README's
 
 The dashboard, its `/api/*` query routes, the compatibility
 `/webhook/sessions*` reads, and FastAPI's OpenAPI pages can read the resulting
-SQLite database. The write routes accept UTF-8 JSON only, cap a request at 16
-MiB, a batch at 1,000 items, JSON structure at 2,200,000 tokens, a scalar at 8
-MiB, and nesting at 128 levels. RailMon splits a default batch using its actual
+SQLite database. The write routes accept UTF-8 JSON only. A request is capped
+by route: 16 MiB for the capture webhooks, 1 MiB by default for an evidence
+bundle, and 4 KiB for `POST /webhook/heartbeat` and the ASP control routes.
+The capture webhooks also cap a batch at 1,000 items, and a JSON body is
+refused past 2,200,000 tokens of structure, an 8 MiB scalar, or 128 levels
+of nesting. RailMon splits a default batch using its actual
 serialized size, including JSON escaping, before posting. The independent
 limits prevent the wire allowance from becoming an unbounded Python object
 tree. Parsing runs outside the async event loop. Credential headers — including
@@ -64,7 +73,9 @@ Known and deliberate, in the current scope:
 
 - **No authentication and no authorisation on captures.** Any caller that can
   reach the port can post interactions and read every session. The local
-  write token guards only the Agent Security Profile routes listed above.
+  write token guards the Agent Security Profile routes listed above and
+  `POST /webhook/heartbeat`; on the capture webhooks it is optional and only
+  marks a batch as authenticated, which is all the Data Guardrail reads.
 - **No tenancy.** `GET /webhook/sessions/{id}` returns any session to any
   caller.
 - **No source authentication.** A process that can reach either webhook can

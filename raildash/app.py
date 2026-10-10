@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sys
+from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
 from typing import Any
@@ -216,6 +218,19 @@ LOCAL_TOKEN, LOCAL_TOKEN_SOURCE = resolve_local_token(store.path)
 print(f"raildash: local write token {LOCAL_TOKEN_SOURCE}", file=sys.stderr)
 
 
+def has_local_token(value: str | None) -> bool:
+    """Whether `value` is the local write token, compared in constant time.
+
+    Compared as UTF-8 bytes: `compare_digest` raises on a `str` with non-ASCII
+    characters, and a header is whatever the sender put in it. A capture
+    route must never fail on a strange header (it stores the batch either
+    way), and a gated route answers it with the same 403 as any wrong token.
+    """
+    if not value:
+        return False
+    return secrets.compare_digest(value.encode("utf-8"), LOCAL_TOKEN.encode("utf-8"))
+
+
 def require_local_token(
     x_raildash_token: str | None = Header(default=None, alias="X-RailDash-Token")
 ) -> None:
@@ -224,8 +239,21 @@ def require_local_token(
     403, not 401: there is nothing to authenticate *as* here (no accounts),
     only a bearer capability a same-origin page already has by construction.
     """
-    if not x_raildash_token or not secrets.compare_digest(x_raildash_token, LOCAL_TOKEN):
+    if not has_local_token(x_raildash_token):
         raise HTTPException(403, "missing or invalid X-RailDash-Token")
+
+
+def _capture_authenticated(request: Request) -> bool:
+    """Whether a capture batch carries the local write token (DR-184 M0).
+
+    The capture webhooks stay open: a batch without the token, or with a
+    wrong one, is stored exactly as before, only marked unauthenticated, so
+    a RailMon that predates the token keeps working (design §7). What the
+    mark changes is the guardrail, which ignores unauthenticated captures
+    (§4.1, §5): anyone who can reach the port can post one, the agent
+    included, so it must neither add a violation nor hide one.
+    """
+    return has_local_token(request.headers.get("x-raildash-token"))
 
 
 # --------------------------------------------------------------------- ingest
@@ -239,7 +267,11 @@ async def receive_http_interactions(request: Request) -> dict[str, Any]:
     capture_start, interactions — and that is what this reads. A bare array is
     also accepted, because a `curl` of a capture file is the obvious thing
     somebody will try first and failing it teaches nothing.
+
+    `X-RailDash-Token` is optional here; with the right one the batch is
+    stored as authenticated (`_capture_authenticated`).
     """
+    authenticated = _capture_authenticated(request)
     body = await _json_body(request)
 
     if isinstance(body, list):
@@ -262,7 +294,7 @@ async def receive_http_interactions(request: Request) -> dict[str, Any]:
     db = get_store()
     db.upsert_session(session_id, agent, capture_start, source="webhook")
     rows = [normalise(i) for i in items if isinstance(i, dict)]
-    inserted = db.add_interactions(session_id, rows)
+    inserted = db.add_interactions(session_id, rows, authenticated=authenticated)
 
     # `received` counts what arrived and `stored` what was new. They differ on
     # a redelivery, and silently reporting only one of them is how a retrying
@@ -272,7 +304,11 @@ async def receive_http_interactions(request: Request) -> dict[str, Any]:
 
 @app.post("/webhook/events")
 async def receive_events(request: Request) -> dict[str, Any]:
-    """Receive raw SSL events — the unpaired, pre-HTTP view."""
+    """Receive raw SSL events — the unpaired, pre-HTTP view.
+
+    Takes an optional `X-RailDash-Token` like `/webhook/http-interactions`.
+    """
+    authenticated = _capture_authenticated(request)
     body = await _json_body(request)
     if not isinstance(body, dict):
         raise HTTPException(422, "expected an object")
@@ -298,8 +334,102 @@ async def receive_events(request: Request) -> dict[str, Any]:
     stored = db.add_raw_events(
         session_id,
         [redact_raw_event(e) for e in events if isinstance(e, dict)],
+        authenticated=authenticated,
     )
     return {"received": len(events), "stored": stored, "session_id": session_id}
+
+
+# DR-184 M0 (design §4.1): `railmon collect` posts this every 60 s while at
+# least one tap is attached. Without it, a quiet agent and a dead collector
+# look the same, and the request rules would read Held on silence.
+MAX_COLLECTOR_ID_CHARS = 128
+HEARTBEAT_FIELDS = frozenset({"collector_id", "taps_attached", "sent_at"})
+# RFC 3339 `date-time` (§5.6), which needs a time zone. Checked by hand, not
+# with `datetime.fromisoformat`: that also takes a bare date, a naive time and
+# ISO 8601's basic format, and on Python 3.10 refuses valid RFC 3339 (`Z`, or
+# a fraction that isn't 3 or 6 digits).
+_RFC3339 = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?"
+    r"(?:[Zz]|[+-](\d{2}):(\d{2}))",
+    re.ASCII,
+)
+# SQLite's INTEGER is a signed 64-bit value; a larger tap count is not a real
+# one, and storing it would fail with a 500 rather than a 422.
+MAX_TAPS_ATTACHED = 2**63 - 1
+
+
+def _rfc3339(value: str) -> bool:
+    match = _RFC3339.fullmatch(value)
+    if match is None:
+        return False
+    year, month, day, hour, minute, second = (int(g) for g in match.groups()[:6])
+    offset_hour, offset_minute = (int(g or 0) for g in match.groups()[6:])
+    if offset_hour > 23 or offset_minute > 59:
+        return False
+    try:
+        # RFC 3339 allows a leap second (`:60`); `datetime` does not.
+        datetime(year, month, day, hour, minute, min(second, 59))
+    except ValueError:  # month 13, 25:00, February 30th
+        return False
+    return second <= 60
+
+
+@app.post("/webhook/heartbeat", dependencies=[Depends(require_local_token)])
+async def receive_heartbeat(request: Request) -> dict[str, str]:
+    """Record that a collector is alive and capturing (DR-184 M0).
+
+    Token-gated, unlike the capture routes: a heartbeat is the one thing that
+    lets the request rules read Held, so a forged one would hide a dead
+    collector (design §5). Body, closed:
+
+        {"collector_id": "<1-128 printable ASCII>",
+         "taps_attached": <int >= 1>,
+         "sent_at": "<RFC 3339 date-time with a time zone>"}
+
+    Stored per `collector_id`, upserted, with RailDash's own receive time as
+    `last_heartbeat_at`; `sent_at` is kept as received but never decides
+    liveness. Answers 200 `{"status": "ok"}`, the shape `/webhook/health`
+    already uses -- there is no batch here to count, so the capture routes'
+    `received`/`stored` would mean nothing. RailMon reads only the status.
+    """
+    body = await _json_body(request, max_bytes=MAX_CONTROL_BODY_BYTES)
+    if not isinstance(body, dict):
+        raise HTTPException(422, "expected an object")
+    unknown = sorted(set(body) - HEARTBEAT_FIELDS)
+    if unknown:
+        raise HTTPException(422, f"unknown field(s): {', '.join(unknown)}")
+    missing = sorted(HEARTBEAT_FIELDS - set(body))
+    if missing:
+        raise HTTPException(422, f"missing field(s): {', '.join(missing)}")
+
+    collector_id = body["collector_id"]
+    if (
+        not isinstance(collector_id, str)
+        or not 1 <= len(collector_id) <= MAX_COLLECTOR_ID_CHARS
+        or not all(" " <= ch <= "~" for ch in collector_id)
+    ):
+        raise HTTPException(
+            422,
+            f"collector_id must be 1-{MAX_COLLECTOR_ID_CHARS} printable ASCII characters",
+        )
+    taps_attached = body["taps_attached"]
+    # `bool` is an `int` in Python; `true` is not a tap count.
+    if (
+        not isinstance(taps_attached, int)
+        or isinstance(taps_attached, bool)
+        or not 1 <= taps_attached <= MAX_TAPS_ATTACHED
+    ):
+        raise HTTPException(422, "taps_attached must be an integer >= 1")
+    sent_at = body["sent_at"]
+    if not isinstance(sent_at, str) or not _rfc3339(sent_at):
+        raise HTTPException(
+            422, "sent_at must be an RFC 3339 date-time with a time zone"
+        )
+
+    get_store().record_heartbeat(
+        collector_id, taps_attached=taps_attached, sent_at=sent_at
+    )
+    return {"status": "ok"}
 
 
 def _bounded_text(
