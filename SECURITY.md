@@ -54,8 +54,9 @@ require the local write token in an `X-RailDash-Token` header. The README's
 
 The dashboard, its `/api/*` query routes, the compatibility
 `/webhook/sessions*` reads, and FastAPI's OpenAPI pages can read the resulting
-SQLite database. The write routes accept UTF-8 JSON only, cap a request at 16
-MiB, a batch at 1,000 items, JSON structure at 2,200,000 tokens, a scalar at 8
+SQLite database. The write routes accept UTF-8 JSON only. The capture webhooks
+cap a request at 16 MiB (an evidence bundle at 1 MiB by default, and
+`POST /webhook/heartbeat` and the ASP control routes at 4 KiB), a batch at 1,000 items, JSON structure at 2,200,000 tokens, a scalar at 8
 MiB, and nesting at 128 levels. RailMon splits a default batch using its actual
 serialized size, including JSON escaping, before posting. The independent
 limits prevent the wire allowance from becoming an unbounded Python object
@@ -70,7 +71,9 @@ Known and deliberate, in the current scope:
 
 - **No authentication and no authorisation on captures.** Any caller that can
   reach the port can post interactions and read every session. The local
-  write token guards only the Agent Security Profile routes listed above.
+  write token guards the Agent Security Profile routes listed above and
+  `POST /webhook/heartbeat`; on the capture webhooks it is optional and only
+  marks a batch as authenticated, which is all the Data Guardrail reads.
 - **No tenancy.** `GET /webhook/sessions/{id}` returns any session to any
   caller.
 - **No source authentication.** A process that can reach either webhook can

@@ -1553,14 +1553,25 @@ class Store:
         guardrail should judge -- would be dropped as a duplicate. The reverse
         never happens: an unauthenticated copy never touches an authenticated
         row. An upgrade counts in the returned number, since what is stored
-        changed.
+        changed, and it recomputes the session's `first_seen` from the rows
+        now stored, so the forged copy's timestamp does not outlive it.
         """
         inserted = 0
+        replaced = False
         statement = _INSERT_INTERACTION + (
             _UPGRADE_UNAUTHENTICATED_INTERACTION if authenticated else "DO NOTHING"
         )
         with self._lock:
             for row in rows:
+                if authenticated and not replaced and row.get("interaction_id"):
+                    replaced = (
+                        self._db.execute(
+                            "SELECT 1 FROM interactions WHERE session_id = ? "
+                            "AND interaction_id = ? AND authenticated = 0",
+                            (session_id, row["interaction_id"]),
+                        ).fetchone()
+                        is not None
+                    )
                 cur = self._db.execute(
                     statement,
                     {
@@ -1591,6 +1602,16 @@ class Store:
                     WHERE session_id = ?
                     """,
                     (session_id, session_id, session_id),
+                )
+            if replaced:
+                # `first_seen` is otherwise set once; a replaced forged row
+                # may have been the one that set it.
+                self._db.execute(
+                    """UPDATE sessions SET first_seen = COALESCE((
+                           SELECT MIN(timestamp) FROM interactions
+                           WHERE session_id = ? AND timestamp IS NOT NULL), '')
+                       WHERE session_id = ?""",
+                    (session_id, session_id),
                 )
             self._db.commit()
         return inserted

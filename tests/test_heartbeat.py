@@ -244,6 +244,20 @@ def test_an_authenticated_delivery_replaces_a_forged_unauthenticated_copy(client
     assert [tuple(row) for row in rows] == [(1, "api.anthropic.com", 1)]
 
 
+def test_a_replaced_forged_row_does_not_keep_its_session_first_seen(client):
+    real = captures(1)[0]
+    real["interaction_id"] = "same-dedup-key"
+    real["timestamp"] = "2026-10-10T12:00:00Z"
+    forged = dict(real, timestamp="2000-01-01T00:00:00Z")
+    batch = lambda item: {"session_id": "s", "interactions": [item]}  # noqa: E731
+
+    client.post("/webhook/http-interactions", json=batch(forged))
+    assert client.get("/api/sessions").json()[0]["first_seen"] == "2000-01-01T00:00:00Z"
+    client.post("/webhook/http-interactions", json=batch(real), headers=auth())
+    session = client.get("/api/sessions").json()[0]
+    assert session["first_seen"] == session["last_seen"] == "2026-10-10T12:00:00Z"
+
+
 def test_open_read_routes_do_not_reveal_the_authenticated_mark(client):
     payload = {"session_id": "s", "interactions": captures()}
     client.post("/webhook/http-interactions", json=payload, headers=auth())
