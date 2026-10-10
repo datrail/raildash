@@ -51,6 +51,7 @@ from .asp import (
     parse_bundle,
     resolve_identity,
 )
+from .guardrail_store import GUARDRAIL_SCHEMA, GuardrailCustody
 
 CREDENTIAL_REDACTION_SCHEMA_VERSION = 1
 MIGRATION_BATCH_ROWS = 16
@@ -270,7 +271,7 @@ BEGIN SELECT RAISE(ABORT, 'alignment versions are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS alignment_versions_immutable_delete
 BEFORE DELETE ON alignment_versions
 BEGIN SELECT RAISE(ABORT, 'alignment versions are immutable'); END;
-"""
+""" + GUARDRAIL_SCHEMA
 
 SCHEMA_TABLES = frozenset(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA))
 # Columns `_ensure_multi_agent_columns`/`_ensure_content_columns` add to a
@@ -342,7 +343,7 @@ def _session_scope(session_id: str, agent_key: str | None) -> tuple[str, list[st
     return scope, params
 
 
-class Store:
+class Store(GuardrailCustody):
     """A SQLite-backed store. Safe to share across FastAPI's threadpool.
 
     `check_same_thread=False` plus one lock rather than a connection pool:
@@ -364,6 +365,9 @@ class Store:
                 "RAILDASH_ASP_RETENTION_DAYS", ASP_RETENTION_DAYS
             ),
         }
+        # Read once now so a bad guardrail setting stops startup instead of
+        # failing every ingest hook later (`guardrail_store`).
+        self._guardrail_settings()
         self._lock = threading.Lock()
         self._db = sqlite3.connect(
             self.path, timeout=BUSY_TIMEOUT_SECONDS, check_same_thread=False
@@ -823,6 +827,7 @@ class Store:
                 ),
             )
             self._compare_active_locked(asp_id, raw, identity_kind, identity_value)
+            self._guardrail_on_asp(asp_id, bundle, identity_kind, identity_value)
             self._prune_asp_history_locked(**self._retention_locked())
             row = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
         self._secure_database_files()
@@ -1576,6 +1581,9 @@ class Store:
             _UPGRADE_UNAUTHENTICATED_INTERACTION if authenticated else "DO NOTHING"
         )
         with self._lock:
+            # DR-184 M2: only an authenticated capture can affect a guardrail
+            # (design §4.1), so only such a batch reads the active ones.
+            active = self._active_guardrails() if authenticated else []
             for row in rows:
                 if authenticated and not replaced and row.get("interaction_id"):
                     replaced = (
@@ -1599,6 +1607,12 @@ class Store:
                     },
                 )
                 inserted += cur.rowcount
+                if active and cur.rowcount and row.get("interaction_id"):
+                    stored = self._db.execute(
+                        "SELECT * FROM interactions WHERE session_id = ? AND interaction_id = ?",
+                        (session_id, row["interaction_id"]),
+                    ).fetchone()
+                    self._guardrail_on_request(dict(stored), active)
             if inserted:
                 self._db.execute(
                     """

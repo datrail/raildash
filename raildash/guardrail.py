@@ -9,8 +9,8 @@ is railxia/docs `design/2026-10-07-data-guardrail/data-guardrail-design.md`;
 section numbers below are its.
 
 Like `raildash.asp`, this module has no database, HTTP or UI dependency and
-never reads the clock: every time it needs is an argument. Nothing calls it
-yet (M2 adds storage and the two store hooks), so backing it out is a revert.
+never reads the clock: every time it needs is an argument. Storage and the
+two store hooks that call it are `raildash.guardrail_store` (M2).
 
 The API, in the order a caller meets it:
 
@@ -34,6 +34,9 @@ The API, in the order a caller meets it:
   counts toward the state under the version in force.
 - `agent_state(...)`: the per-agent roll-up, Violated > Unverified > Held >
   No guardrail.
+- `declared_offers(...)`: the *declared since gN* offers of the newest ASP.
+- `with_item_allowed(rules, row)` and `with_declared_choice(...)`: the rules
+  of the version **Allow this** or **Dismiss** creates.
 
 and the pieces they are built from: `validate_guardrail`, `asp_is_stale`,
 `is_multi_agent`, `normalize_host`, `host_matches`, `host_allowed`,
@@ -130,7 +133,10 @@ from .json_safety import (
     JSONStructureTooComplex,
     check_json_structure,
 )
-from .store import UNSAFE_LEGACY_CAPTURE, Store
+# A module reference, read at call time: the store calls this module from
+# its ingest hooks (`raildash.guardrail_store`), so neither can import the
+# other's names while it is still loading.
+from . import store as _store
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "guardrail-version-v1.schema.json"
 SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text())
@@ -158,6 +164,9 @@ NOT_COLLECTED = "NOT_COLLECTED"
 MALFORMED_EVIDENCE = "MALFORMED_EVIDENCE"
 NO_HEARTBEAT = "NO_HEARTBEAT"
 UNATTRIBUTED_TRAFFIC = "UNATTRIBUTED_TRAFFIC"
+# A store hook failed since the version in force was made active, so some
+# evidence was never judged (`raildash.guardrail_store`).
+CHECK_FAILED = "CHECK_FAILED"
 TOOL_CALLS_UNREADABLE = "TOOL_CALLS_UNREADABLE"
 CAPTURE_REFUSED = "CAPTURE_REFUSED"
 # Why one request's tool calls could not be read (`requested_tool_calls`).
@@ -346,7 +355,7 @@ def glob_matches(pattern: str, path: str) -> bool:
 
 def file_kind(path: str) -> str:
     """A path's kind, exactly the value `/api/profile`'s `file_types` uses."""
-    return Store._file_type(path)
+    return _store.Store._file_type(path)
 
 
 def kernel_interface_path(path: str) -> bool:
@@ -450,8 +459,8 @@ def _exchange(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
     stored, or already parsed), or `None` when it can't be read."""
     raw = interaction.get("raw")
     if isinstance(raw, (str, bytes)):
-        raw = Store._safe_raw(raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw)
-    if not isinstance(raw, dict) or raw == UNSAFE_LEGACY_CAPTURE:
+        raw = _store.Store._safe_raw(raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw)
+    if not isinstance(raw, dict) or raw == _store.UNSAFE_LEGACY_CAPTURE:
         return None
     exchange = legacy_exchange(raw)
     return exchange if isinstance(exchange, dict) else None
@@ -498,7 +507,7 @@ def _stored_raw(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
             raw = json.loads(raw)
         except (JSONStructureTooComplex, ValueError, RecursionError):
             return None
-    if not isinstance(raw, dict) or raw == UNSAFE_LEGACY_CAPTURE:
+    if not isinstance(raw, dict) or raw == _store.UNSAFE_LEGACY_CAPTURE:
         return None
     return raw
 
@@ -737,13 +746,14 @@ def evaluate_request(
     size = size if type(size) is int else None
 
     upload_reasons: list[str] = []
-    if carries_body(interaction):
+    body = carries_body(interaction)
+    if body:
         if not host_allowed(host, uploads["allowed_hosts"]):
             upload_reasons.append("body_to_unlisted_host")
     cap = _size_cap(host, uploads["max_request_bytes"]) if host is not None else None
     if cap is not None:
         if size is None:
-            if carries_body(interaction):
+            if body:
                 upload_reasons.append("request_size_unknown")
         elif size > cap:
             upload_reasons.append("request_size_over_cap")
@@ -753,6 +763,7 @@ def evaluate_request(
             _violation(
                 "uploads", item, OBSERVED, source,
                 kind="host", reasons=upload_reasons, request_size=size, max_request_bytes=cap,
+                carries_body=body,
             )
         )
     calls = requested_tool_calls(interaction)
@@ -1120,13 +1131,18 @@ def item_allowed(guardrail: Mapping[str, Any], violation: Mapping[str, Any]) -> 
             return item not in uploads["denied_tool_calls"]
         if item == UNKNOWN_HOST:
             return False
-        reasons = detail.get("reasons") or []
-        if "body_to_unlisted_host" in reasons and not host_allowed(item, uploads["allowed_hosts"]):
+        # Re-derived from what the request was, not from the reasons the
+        # version that flagged it gave: a later version can drop the host
+        # from `allowed_hosts` or add a cap, and the row must count again.
+        body = _row_carries_body(detail)
+        if body and not host_allowed(item, uploads["allowed_hosts"]):
             return False
         cap = _size_cap(item, uploads["max_request_bytes"])
         size = detail.get("request_size")
-        if cap is not None and ("request_size_unknown" in reasons or "request_size_over_cap" in reasons):
-            return type(size) is int and size <= cap
+        if cap is not None:
+            if type(size) is int:
+                return size <= cap
+            return not body
         return True
     if rule == "out_of_spec_calls":
         out_of_spec = rules["out_of_spec_calls"]
@@ -1135,6 +1151,18 @@ def item_allowed(guardrail: Mapping[str, Any], violation: Mapping[str, Any]) -> 
             return server is not None and server in out_of_spec["allowed_mcp_servers"]
         return item != UNKNOWN_HOST and host_allowed(item, out_of_spec["allowed_hosts"])
     return False
+
+
+def _row_carries_body(detail: Mapping[str, Any]) -> bool:
+    """Whether a stored `uploads` host row's request carried a body. Rows
+    record it as `carries_body`; without it (a row written before the flag),
+    the reasons that only a body produces say so, and a size reason alone is
+    read as a body, which can only keep the row counting."""
+    flag = detail.get("carries_body")
+    if isinstance(flag, bool):
+        return flag
+    reasons = detail.get("reasons") or []
+    return bool(reasons)
 
 
 def row_counts(guardrail: Mapping[str, Any] | None, row: Mapping[str, Any]) -> bool:
@@ -1207,30 +1235,17 @@ def propose_guardrail(
         listed, _ = _listener_violations(listeners["value"], [], source)
         would_be.extend(listed)
 
-    declared = attributes.get("declared_destinations") or {}
-    declared_hosts: list[str] = []
-    if declared.get("status") == "ANSWERED" and isinstance(declared.get("value"), list):
-        declared_hosts = sorted(
-            {
-                host
-                for host in (normalize_host(value) for value in declared["value"])
-                if host is not None and _is_host_pattern(host)
-            }
+    declared_hosts, declared_servers = _declared_lists(attributes)
+    if declared_hosts is None:
+        declared_hosts = []
+        empty_because["out_of_spec_calls.allowed_hosts"] = _why_empty(
+            attributes.get("declared_destinations") or {}
         )
-    else:
-        empty_because["out_of_spec_calls.allowed_hosts"] = _why_empty(declared)
-    servers = attributes.get("mcp_servers_declared") or {}
-    declared_servers: list[str] = []
-    if servers.get("status") == "ANSWERED" and isinstance(servers.get("value"), list):
-        names = (
-            entry.get("name") if isinstance(entry, dict) else entry for entry in servers["value"]
+    if declared_servers is None:
+        declared_servers = []
+        empty_because["out_of_spec_calls.allowed_mcp_servers"] = _why_empty(
+            attributes.get("mcp_servers_declared") or {}
         )
-        # Two configured names that normalize alike are one item (§4.2).
-        declared_servers = sorted(
-            {normalize_mcp_server(name) for name in names if isinstance(name, str) and name}
-        )
-    else:
-        empty_because["out_of_spec_calls.allowed_mcp_servers"] = _why_empty(servers)
 
     guardrail = {
         "guardrail_contract_version": GUARDRAIL_CONTRACT_VERSION,
@@ -1283,6 +1298,37 @@ def propose_guardrail(
     }
 
 
+def _declared_lists(attributes: Mapping[str, Any]) -> tuple[list[str] | None, list[str] | None]:
+    """The declared hosts and normalized MCP server names of one ASP's
+    attributes, each sorted, or None where the attribute isn't `ANSWERED`
+    (so it declares nothing that can be read). The proposal seeds from these
+    and the custody offers what they add later, so both read them alike."""
+    declared = attributes.get("declared_destinations") or {}
+    hosts: list[str] | None = None
+    if declared.get("status") == "ANSWERED" and isinstance(declared.get("value"), list):
+        hosts = sorted(
+            {
+                host
+                for host in (normalize_host(value) for value in declared["value"])
+                if host is not None and _is_host_pattern(host)
+            }
+        )
+    servers_attribute = attributes.get("mcp_servers_declared") or {}
+    servers: list[str] | None = None
+    if servers_attribute.get("status") == "ANSWERED" and isinstance(
+        servers_attribute.get("value"), list
+    ):
+        names = (
+            entry.get("name") if isinstance(entry, dict) else entry
+            for entry in servers_attribute["value"]
+        )
+        # Two configured names that normalize alike are one item (§4.2).
+        servers = sorted(
+            {normalize_mcp_server(name) for name in names if isinstance(name, str) and name}
+        )
+    return hosts, servers
+
+
 def _why_empty(attribute: Mapping[str, Any]) -> dict[str, Any]:
     """Why a declared or observed list seeded nothing: the attribute's own
     status and reason (`BLIND`/`GATEWAY_MANAGED` when only a gateway URL is
@@ -1294,6 +1340,133 @@ def _why_empty(attribute: Mapping[str, Any]) -> dict[str, Any]:
         "reason": attribute.get("reason"),
         "note": attribute.get("note"),
     }
+
+
+# ----------------------------------------------------------------- custody
+
+
+OFFER_KINDS = ("host", "mcp_server")
+
+
+def declared_offers(
+    guardrail: Mapping[str, Any],
+    bundle: Mapping[str, Any],
+    seeded_over_all_versions: Mapping[str, Iterable[str]],
+) -> list[dict[str, str]]:
+    """§4.5's *declared since gN* offers: each host and MCP server the
+    newest ASP declares that the version in force doesn't allow and that no
+    version of this agent ever recorded in `seeded_from_declared`.
+
+    `seeded_over_all_versions` is `{"hosts": [...], "mcp_servers": [...]}`,
+    the union over every version, so a declared host the user removed to
+    keep it out isn't offered again, not even after a switch. A multi-agent
+    ASP offers nothing, as it is evaluated for nothing. An offer is not a
+    row and doesn't change the state: `[{"kind": "host" | "mcp_server",
+    "value": ...}]`, hosts first, each sorted."""
+    if is_multi_agent(bundle):
+        return []
+    hosts, servers = _declared_lists(_attributes(bundle))
+    out_of_spec = guardrail["rules"]["out_of_spec_calls"]
+    seen_hosts = set(seeded_over_all_versions.get("hosts") or ())
+    seen_servers = set(seeded_over_all_versions.get("mcp_servers") or ())
+    offers = [
+        {"kind": "host", "value": host}
+        for host in hosts or ()
+        if host not in seen_hosts and not host_allowed(host, out_of_spec["allowed_hosts"])
+    ]
+    offers.extend(
+        {"kind": "mcp_server", "value": server}
+        for server in servers or ()
+        if server not in seen_servers and server not in out_of_spec["allowed_mcp_servers"]
+    )
+    return offers
+
+
+def with_declared_choice(
+    rules: Mapping[str, Any], kind: str, value: str, *, allow: bool
+) -> dict[str, Any]:
+    """The rules of the version **Allow this** (`allow=True`) or **Dismiss**
+    makes from a *declared since gN* offer: the item is recorded in
+    `seeded_from_declared` either way, so it isn't offered again, and only
+    Allow adds it to the allowed list."""
+    if kind not in OFFER_KINDS:
+        raise ValueError(f"offer kind must be one of {', '.join(OFFER_KINDS)}")
+    updated = json.loads(json.dumps(rules))
+    out_of_spec = updated["out_of_spec_calls"]
+    seeded_key, allowed_key = (
+        ("hosts", "allowed_hosts") if kind == "host" else ("mcp_servers", "allowed_mcp_servers")
+    )
+    if value not in out_of_spec["seeded_from_declared"][seeded_key]:
+        out_of_spec["seeded_from_declared"][seeded_key] = sorted(
+            [*out_of_spec["seeded_from_declared"][seeded_key], value]
+        )
+    if allow and value not in out_of_spec[allowed_key]:
+        out_of_spec[allowed_key] = sorted([*out_of_spec[allowed_key], value])
+    return updated
+
+
+def _refuse_wildcard_host(item: str) -> None:
+    # A host row's item is the request's own Host header, which the agent
+    # writes: one click must not turn `*.com` into a pattern allowing a TLD.
+    if "*" in item:
+        raise ValueError("a wildcard host can't be allowed with one click; edit the guardrail")
+
+
+def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[str, Any]:
+    """The rules of the version **Allow this** makes from one stored row
+    (§4.5): the row's item added to its rule, as narrowly as the row names
+    it. A listener is allowed by its own protocol, address and port; a path
+    as a literal entry; a host by its exact name; an MCP row by its server;
+    a denied tool call by taking it off `denied_tool_calls`.
+
+    Raises `ValueError` for a row one click can't allow: the overflow row
+    (it lists no item), `(unknown host)` and a server-less MCP name (never
+    allowed), a host with a `*` in it (a pattern only an edit adds), and an
+    `uploads` row over a size cap, where the cap is the
+    user's to change with an edit, not to drop with a click."""
+    if row.get("overflow"):
+        raise ValueError("the overflow row lists no item to allow; acknowledge it instead")
+    rule, item, detail = row["rule"], row["item"], row.get("detail") or {}
+    updated = json.loads(json.dumps(rules))
+    if rule == "service_ports":
+        entry = {key: detail.get(key) for key in ("protocol", "addr", "port")}
+        if not _readable_listener(entry):
+            raise ValueError("this listener row can't be read back into a port entry")
+        updated["service_ports"]["allowed"].append(entry)
+        return updated
+    if rule == "saved_files":
+        updated["saved_files"]["allowed"].append({"path": item, "literal": True})
+        return updated
+    if item == UNKNOWN_HOST:
+        raise ValueError("a request with no host can't be allowed")
+    if rule == "uploads":
+        uploads = updated["uploads"]
+        if detail.get("kind") == "tool_call":
+            uploads["denied_tool_calls"] = [n for n in uploads["denied_tool_calls"] if n != item]
+            return updated
+        _refuse_wildcard_host(item)
+        if not host_allowed(item, uploads["allowed_hosts"]):
+            uploads["allowed_hosts"] = sorted([*uploads["allowed_hosts"], item])
+        if not item_allowed({"rules": updated}, row):
+            # Listing the host doesn't lift a size cap; changing one is an edit.
+            raise ValueError("this upload is over the host's size cap; edit the cap instead")
+        return updated
+    if rule == "out_of_spec_calls":
+        out_of_spec = updated["out_of_spec_calls"]
+        if detail.get("kind") == "mcp_server":
+            server = detail.get("server")
+            if server is None:
+                raise ValueError("this tool name names no MCP server, so it can't be allowed")
+            if server not in out_of_spec["allowed_mcp_servers"]:
+                out_of_spec["allowed_mcp_servers"] = sorted(
+                    [*out_of_spec["allowed_mcp_servers"], server]
+                )
+            return updated
+        _refuse_wildcard_host(item)
+        if not host_allowed(item, out_of_spec["allowed_hosts"]):
+            out_of_spec["allowed_hosts"] = sorted([*out_of_spec["allowed_hosts"], item])
+        return updated
+    raise ValueError(f"unknown rule {rule!r}")
 
 
 # ------------------------------------------------------------------- time

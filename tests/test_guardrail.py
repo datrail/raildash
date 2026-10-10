@@ -26,7 +26,7 @@ from jsonschema.exceptions import ValidationError
 from raildash import guardrail as g
 from raildash.asp import parse_bundle
 from raildash.ingest import normalise, read_jsonl
-from raildash.store import Store
+from raildash.store import UNSAFE_LEGACY_CAPTURE, Store
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SCHEMAS = Path(__file__).parents[1] / "raildash" / "schemas"
@@ -1238,7 +1238,7 @@ def test_a_deeply_nested_request_body_cannot_hide_the_responses_tool_calls():
     deep["request"]["body"] = _nested(130)
     row = _row(deep)
     # Shown as a row, the whole capture is past the 128-level bound...
-    assert Store._safe_raw(row["raw"]) == g.UNSAFE_LEGACY_CAPTURE
+    assert Store._safe_raw(row["raw"]) == UNSAFE_LEGACY_CAPTURE
     # ...but its response is judged on its own, and the body still counts.
     assert g.requested_tool_calls(row) == {"names": ["mcp__fs__upload_file"], "readable": True, "reason": None}
     assert g.carries_body(row) is True
@@ -1252,3 +1252,22 @@ def test_a_row_too_deep_to_parse_at_all_is_unreadable_not_empty():
     assert g.requested_tool_calls(_row(deeper)) == {
         "names": [], "readable": False, "reason": "UNREADABLE_CAPTURE",
     }
+
+
+def test_an_upload_row_counts_again_when_a_later_version_unlists_its_host():
+    """M1 review (score 50): the row's reasons came from the version that
+    flagged it. Under g1 the host was listed and only over a cap; g2 drops
+    the host and the cap, and the request still carried a body to it."""
+    row = {"rule": "uploads", "item": "api.openai.com", "detail": {
+        "kind": "host", "reasons": ["request_size_over_cap"], "request_size": 4_000_000,
+        "max_request_bytes": 2097152, "carries_body": True}}
+    g1 = guardrail()
+    assert not g.item_allowed(g1, row)
+    unlisted = guardrail(uploads={"allowed_hosts": [], "max_request_bytes": {}, "denied_tool_calls": []})
+    assert not g.item_allowed(unlisted, row)
+    lifted = guardrail(uploads={"allowed_hosts": ["api.openai.com"], "max_request_bytes": {},
+                                "denied_tool_calls": []})
+    assert g.item_allowed(lifted, row)
+    # A row stored without the flag reads its reasons as a body: fail closed.
+    legacy = {**row, "detail": {k: v for k, v in row["detail"].items() if k != "carries_body"}}
+    assert not g.item_allowed(unlisted, legacy)
