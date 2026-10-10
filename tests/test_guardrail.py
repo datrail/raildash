@@ -1160,11 +1160,22 @@ def test_an_html_error_page_is_readable_and_asks_for_nothing():
     }
 
 
-def test_railmons_own_streamed_capture_reads_as_asking_for_nothing():
-    # The fixture as RailMon stored it: a stream cut after its first line.
+def test_railmons_own_streamed_capture_cut_before_its_data_fails_closed():
+    # The fixture as RailMon stored it: a stream cut after its first line,
+    # so whatever the model asked for afterwards is unknown.
     row = _sse_row()
     assert json.loads(row["raw"])["raw"]["response"]["body"] == {"raw": "event: message_start"}
-    assert g.requested_tool_calls(row) == {"names": [], "readable": True, "reason": None}
+    assert g.requested_tool_calls(row) == {
+        "names": [], "readable": False, "reason": "RESPONSE_TRUNCATED_EVENT",
+    }
+
+
+def test_a_stream_of_complete_events_with_no_tool_call_is_readable():
+    text = (
+        'event: message_start\ndata: {"type": "message_start"}\n\n'
+        'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+    )
+    assert g.requested_tool_calls(_sse_row(text)) == {"names": [], "readable": True, "reason": None}
 
 
 def test_a_non_streamed_responses_api_output_is_read():

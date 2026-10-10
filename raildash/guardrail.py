@@ -74,8 +74,8 @@ a violation or an Unverified, never a Held:
   past the JSON safety bounds, an event whose data isn't JSON, or a last
   event cut mid-way) is flagged `tool_calls.readable: False`, and
   `request_rules_status` keeps both request rules Unverified for 10 minutes
-  after it; a response with no body, or plain text with no `data:` line,
-  asks for nothing. The response's safety is judged apart from the request
+  after it; a response with no body, or plain text with no `event:` or
+  `data:` line, asks for nothing. The response's safety is judged apart from the request
   body, so an agent can't hide the calls by nesting its own request deep.
 - An `mcp__` tool name with no `__` after its server part has no server,
   so it fails closed: it is a violation keyed by the whole tool name.
@@ -546,8 +546,10 @@ def requested_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
     JSON makes the response unreadable (`RESPONSE_UNPARSABLE_EVENT`); so
     does a last event with no blank line after it that doesn't parse
     (`RESPONSE_TRUNCATED_EVENT`), since the cut may have taken the call.
-    Either way the names already found are kept. Text with no `data:`
-    field at all (an HTML error page) is readable and asks for nothing.
+    Either way the names already found are kept, and a stream cut after an
+    event's `event:` line, before its data, is unreadable the same way.
+    Text with no `event:` or `data:` field at all (an HTML error page) is
+    readable and asks for nothing.
     """
     body, reason = _response_body(interaction)
     if reason is not None:
@@ -575,10 +577,12 @@ def requested_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
     if lines[-1] == "":
         lines.pop()
     data: list[str] | None = None  # the current event's data lines
-    saw_data = False
+    in_event = False  # the current event has an `event` or `data` field
+    saw_event = False
     unparsable = False
     for line in lines:
         if line == "":
+            in_event = False
             if data is not None:
                 outcome = _dispatch_event("\n".join(data), add)
                 if outcome == RESPONSE_UNSCANNABLE:
@@ -587,16 +591,23 @@ def requested_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
             data = None
             continue
         field, _, value = line.partition(":")
+        if field in ("event", "data"):
+            in_event = saw_event = True
         if field != "data":
             continue  # a comment (`:`), `event`, `id`, `retry`, or unknown
-        saw_data = True
         if data is None:
             data = []
         # One space after the colon is the separator, not data.
         data.append(value[1:] if value.startswith(" ") else value)
-    if not saw_data:
-        # No `data:` field at all: not an event stream (an HTML error page).
+    if not saw_event:
+        # No `event:` or `data:` field at all: not an event stream (an HTML
+        # error page).
         return {"names": [], "readable": True, "reason": None}
+    if in_event and data is None:
+        # Cut after an event's `event:` line and before its data, as
+        # RailMon's own capture of a stream's first line is: the call may
+        # have been in what was lost.
+        return {"names": names, "readable": False, "reason": RESPONSE_TRUNCATED_EVENT}
     if data is not None:
         # The stream ended with no blank line after its last event: it was
         # cut. A complete JSON event still counts; one cut mid-way may have
