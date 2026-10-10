@@ -256,7 +256,12 @@ def _refusal_recorded(route: str, authenticated: bool) -> Iterator[None]:
         yield
     except HTTPException as exc:
         if authenticated and 400 <= exc.status_code < 500:
-            get_store().record_capture_refusal(route, status=exc.status_code)
+            try:
+                get_store().record_capture_refusal(route, status=exc.status_code)
+            except Exception as error:  # noqa: BLE001 -- the refusal's own status must reach the sender
+                # A sender told 500 would retry a batch that will only be
+                # refused again, and lose why. The missed record is said here.
+                print(f"raildash: could not record a refused capture on {route}: {error!r}", file=sys.stderr)
         raise
 
 

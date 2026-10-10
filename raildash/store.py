@@ -181,8 +181,8 @@ CREATE TABLE IF NOT EXISTS collector_heartbeats (
 );
 
 -- DR-184 M0: the last time a capture batch that carried the local write
--- token was refused (over a size, item or JSON-structure bound, or not
--- valid JSON). That batch was the collector's own traffic and none of it was
+-- token was refused with any 4xx (over a size, item or JSON-structure
+-- bound, not valid JSON, or the wrong shape or content type). That batch was the collector's own traffic and none of it was
 -- stored, so for a while the request rules can't say nothing happened. One
 -- row per route, upserted. A refused batch without the token is not
 -- recorded: it never affects a guardrail, so it can't be made to keep one

@@ -307,6 +307,14 @@ def test_an_accepted_batch_is_not_a_refusal_and_refusals_count_up(client):
     assert refusals == 2
 
 
+def test_a_failed_refusal_record_still_answers_the_refusal(client, monkeypatch):
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(app_module.store, "record_capture_refusal", locked)
+    assert client.post("/webhook/http-interactions", json=DEEP, headers=auth()).status_code == 413
+
+
 def test_open_read_routes_do_not_reveal_the_authenticated_mark(client):
     payload = {"session_id": "s", "interactions": captures()}
     client.post("/webhook/http-interactions", json=payload, headers=auth())

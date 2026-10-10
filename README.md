@@ -63,9 +63,10 @@ token also posts `POST /webhook/heartbeat` (token required) every 60 s while
 at least one tap is attached, with `{"collector_id", "taps_attached",
 "sent_at"}`; RailDash keeps the last one per collector, timed by its own
 clock, so a dead collector is not mistaken for an idle agent. When a batch
-that carries the token is refused (too large, too deep, or not valid JSON),
-RailDash records the time: none of that traffic was stored, so the
-guardrail's request rules can't read Held for a while after it. A refused
+that carries the token is refused with any 4xx (too large, too deep, not
+valid JSON, the wrong shape or content type), RailDash records the time:
+none of that traffic was stored, so the guardrail's request rules can't read
+Held for a while after it. A refused
 batch without the token is not recorded. Neither the mark, the heartbeats nor
 the refusals are shown on an unauthenticated read route.
 
