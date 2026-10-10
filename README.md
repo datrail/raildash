@@ -53,6 +53,18 @@ railmon collect` on the host. A native RailMon build runs the collector binary
 directly with the same `--mode`/`--webhook` flags and no `collect` command;
 see RailMon's README.
 
+The capture webhooks (`/webhook/http-interactions`, `/webhook/events`) stay
+open. A batch that also carries the local write token in `X-RailDash-Token`
+(see "Local write safety" below) is stored as *authenticated*; one without it,
+or with a wrong one, is stored exactly as before and marked unauthenticated.
+Captures loaded with `raildash load` are unauthenticated too. The Data
+Guardrail will judge authenticated captures only. A collector that sends the
+token also posts `POST /webhook/heartbeat` (token required) every 60 s while
+at least one tap is attached, with `{"collector_id", "taps_attached",
+"sent_at"}`; RailDash keeps the last one per collector, timed by its own
+clock, so a dead collector is not mistaken for an idle agent. Neither the
+mark nor the heartbeats are shown on an unauthenticated read route.
+
 ## Running the full stack
 
 To run RailMon and RailDash together, use

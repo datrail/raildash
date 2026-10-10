@@ -40,6 +40,12 @@ POST /webhook/events              raw SSL events from RailMon
 POST /webhook/http-interactions   parsed HTTP interactions
 ```
 
+Both also take the local write token as an optional `X-RailDash-Token`; a
+batch with it is stored as authenticated, and one without it is still stored,
+marked unauthenticated. Only authenticated captures, and heartbeats posted to
+the token-gated `POST /webhook/heartbeat`, are what the Data Guardrail reads, so a
+fabricated capture is stored but never judged.
+
 Its Agent Security Profile routes (evidence-bundle ingest, lock, baseline,
 switch, accept drift, retention change, prune, and the four reads that return
 exact evidence)
