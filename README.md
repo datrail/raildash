@@ -281,6 +281,11 @@ The existing capture and `/api/profile` paths are unchanged. The pure
 validator/comparator and versioned JSON Schemas live under `raildash.asp`
 and `raildash/schemas/`.
 
+The Data Guardrail's contract (DR-184) is
+`raildash/schemas/guardrail-version-v1.schema.json`, and its pure evaluator
+is `raildash.guardrail`. Nothing calls it yet: storage, routes and the
+Guardrail panel come in later changes.
+
 Run `make asp-acceptance` for the deterministic replay, controlled-drift,
 version-switch, and incompatible-rule-pack flow. The clean-build and live demo
 handoff is documented in [`docs/asp-v1-acceptance.md`](docs/asp-v1-acceptance.md).
