@@ -413,6 +413,25 @@ def test_past_the_open_row_cap_new_items_count_in_one_overflow_row(store, monkey
     load(store, asp(files=writes))
     [overflow] = [row for row in store.guardrail_detail(ref)["rows"] if row["overflow"]]
     assert overflow["count"] == 3 and not overflow["acknowledged"]
+    # A policy change re-checks the same ASP; that is no new hit either.
+    store.acknowledge_guardrail_row(overflow["row_id"])
+    store.switch_guardrail(store.guardrail_detail(ref)["active"]["guardrail"]["guardrail_version_id"])
+    [overflow] = [row for row in store.guardrail_detail(ref)["rows"] if row["overflow"]]
+    assert overflow["acknowledged"] and overflow["count"] == 0
+    # Nor once a request has overflowed after it.
+    send(store, request("exfil.attacker.net"))
+    [overflow] = [row for row in store.guardrail_detail(ref)["rows"] if row["overflow"]]
+    assert overflow["count"] == 2  # an upload and an out-of-spec call
+    store.acknowledge_guardrail_row(overflow["row_id"])
+    store.switch_guardrail(store.guardrail_detail(ref)["active"]["guardrail"]["guardrail_version_id"])
+    [overflow] = [row for row in store.guardrail_detail(ref)["rows"] if row["overflow"]]
+    assert overflow["acknowledged"] and overflow["count"] == 0
+    # Acknowledged rows make room: a re-check lists what had only overflowed.
+    for row in store.guardrail_detail(ref)["rows"]:
+        store.acknowledge_guardrail_row(row["row_id"])
+    store.switch_guardrail(store.guardrail_detail(ref)["active"]["guardrail"]["guardrail_version_id"])
+    listed = {row["item"] for row in store.guardrail_detail(ref)["rows"] if not row["acknowledged"]}
+    assert listed and listed <= {f"/data/out-{n}.zip" for n in range(4)}
 
 
 def test_acknowledged_rows_are_deleted_after_the_retention_and_open_ones_never(store):
@@ -484,11 +503,57 @@ def test_a_failing_check_keeps_the_evidence_and_fails_closed(store, monkeypatch,
     send(store, request("exfil.attacker.net"))
     assert store._db.execute("SELECT count(*) FROM interactions").fetchone()[0] == 1  # noqa: SLF001
     assert ("uploads", "exfil.attacker.net") not in rows(store, ref)
-    assert store.guardrail_detail(ref)["rules"]["uploads"]["state"] == "unverified"
     assert "guardrail request check failed" in capsys.readouterr().err
+    # Every rule stays Unverified past every liveness window, until a
+    # version is made active again.
+    later = datetime.now(timezone.utc) + timedelta(minutes=30)
+    store.record_heartbeat("collector", taps_attached=1, sent_at=_now(), received_at=later)
+    detail = store.guardrail_detail(ref, now=later)
+    assert {rule["reason"] for rule in detail["rules"].values()} == {g.CHECK_FAILED}
+    assert detail["state"] == g.STATE_VIOLATED  # the baseline's listener still counts
+    store.acknowledge_guardrail_row(rows(store, ref)[("service_ports", "tcp/127.0.0.1/8443")]["row_id"])
+    assert store.guardrail_detail(ref, now=later)["state"] == g.STATE_UNVERIFIED
+    monkeypatch.undo()
+    store.switch_guardrail(store.guardrail_detail(ref)["active"]["guardrail"]["guardrail_version_id"])
+    live(store)
+    assert store.guardrail_detail(ref)["rules"]["uploads"]["reason"] is None
 
+    monkeypatch.setattr(g, "evaluate_request", broken)
     monkeypatch.setattr(g, "evaluate_asp", broken)
     asp_id = load(store, asp(listeners=[PORT_9000]))
     assert store.asp_state(asp_id) is not None
     with pytest.raises(RuntimeError):
         store.guardrail_detail(ref)
+
+
+def test_a_bad_guardrail_setting_stops_the_store_from_opening(tmp_path, monkeypatch):
+    monkeypatch.setenv("RAILDASH_GUARDRAIL_MAX_OPEN_ROWS", "0")
+    with pytest.raises(RuntimeError, match="RAILDASH_GUARDRAIL_MAX_OPEN_ROWS"):
+        Store(tmp_path / "bad.db")
+
+
+def test_a_policy_change_does_not_reopen_what_was_acknowledged(store):
+    """§4.5: only a hit *after* the acknowledgement re-opens a row. The
+    re-check on adopt, edit, switch or Allow this judges the same ASP again,
+    which is not a new hit."""
+    ref, g1 = _adopted(store)
+    load(store, asp(listeners=[DEMO_LISTENER, PORT_9000]))
+    found = rows(store, ref)
+    store.acknowledge_guardrail_row(found[("service_ports", "tcp/0.0.0.0/9000")]["row_id"])
+    store.allow_guardrail_row(found[("service_ports", "tcp/127.0.0.1/8443")]["row_id"])
+    store.switch_guardrail(g1["guardrail"]["guardrail_version_id"])
+    port = rows(store, ref)[("service_ports", "tcp/0.0.0.0/9000")]
+    assert port["acknowledged"] and port["count"] == 1
+    listener = rows(store, ref)[("service_ports", "tcp/127.0.0.1/8443")]
+    assert listener["count"] == 2  # the baseline's ASP, then the newer one
+    load(store, asp(listeners=[PORT_9000]))
+    assert not rows(store, ref)[("service_ports", "tcp/0.0.0.0/9000")]["acknowledged"]
+
+
+def test_allow_this_refuses_a_wildcard_host_the_agent_sent(store):
+    ref, _ = _adopted(store)
+    send(store, request("*.com"))
+    for rule in ("uploads", "out_of_spec_calls"):
+        row = rows(store, ref)[(rule, "*.com")]
+        with pytest.raises(ValueError, match="wildcard"):
+            store.allow_guardrail_row(row["row_id"])

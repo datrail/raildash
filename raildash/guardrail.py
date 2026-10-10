@@ -164,6 +164,9 @@ NOT_COLLECTED = "NOT_COLLECTED"
 MALFORMED_EVIDENCE = "MALFORMED_EVIDENCE"
 NO_HEARTBEAT = "NO_HEARTBEAT"
 UNATTRIBUTED_TRAFFIC = "UNATTRIBUTED_TRAFFIC"
+# A store hook failed since the version in force was made active, so some
+# evidence was never judged (`raildash.guardrail_store`).
+CHECK_FAILED = "CHECK_FAILED"
 TOOL_CALLS_UNREADABLE = "TOOL_CALLS_UNREADABLE"
 CAPTURE_REFUSED = "CAPTURE_REFUSED"
 # Why one request's tool calls could not be read (`requested_tool_calls`).
@@ -1402,6 +1405,13 @@ def with_declared_choice(
     return updated
 
 
+def _refuse_wildcard_host(item: str) -> None:
+    # A host row's item is the request's own Host header, which the agent
+    # writes: one click must not turn `*.com` into a pattern allowing a TLD.
+    if "*" in item:
+        raise ValueError("a wildcard host can't be allowed with one click; edit the guardrail")
+
+
 def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[str, Any]:
     """The rules of the version **Allow this** makes from one stored row
     (§4.5): the row's item added to its rule, as narrowly as the row names
@@ -1411,7 +1421,8 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
 
     Raises `ValueError` for a row one click can't allow: the overflow row
     (it lists no item), `(unknown host)` and a server-less MCP name (never
-    allowed), and an `uploads` row over a size cap, where the cap is the
+    allowed), a host with a `*` in it (a pattern only an edit adds), and an
+    `uploads` row over a size cap, where the cap is the
     user's to change with an edit, not to drop with a click."""
     if row.get("overflow"):
         raise ValueError("the overflow row lists no item to allow; acknowledge it instead")
@@ -1433,6 +1444,7 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
         if detail.get("kind") == "tool_call":
             uploads["denied_tool_calls"] = [n for n in uploads["denied_tool_calls"] if n != item]
             return updated
+        _refuse_wildcard_host(item)
         if not host_allowed(item, uploads["allowed_hosts"]):
             uploads["allowed_hosts"] = sorted([*uploads["allowed_hosts"], item])
         if not item_allowed({"rules": updated}, row):
@@ -1450,6 +1462,7 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
                     [*out_of_spec["allowed_mcp_servers"], server]
                 )
             return updated
+        _refuse_wildcard_host(item)
         if not host_allowed(item, out_of_spec["allowed_hosts"]):
             out_of_spec["allowed_hosts"] = sorted([*out_of_spec["allowed_hosts"], item])
         return updated

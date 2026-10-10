@@ -47,11 +47,19 @@ Where the design is silent this module chooses:
 - **Allow this** and **Dismiss** on a declared offer need the offer to be
   current, so a stale page can't record a choice nobody was shown.
 - A hook that fails is rolled back to a savepoint, so the evidence it was
-  judging is still stored and drift still runs. It fails closed: the request
-  rules of every agent read Unverified for the unattributed-traffic window
-  (as if a request couldn't be given to one agent), and the error goes to
-  stderr. A failing ASP check also fails when the state is read, so it
-  shows there rather than as Held.
+  judging is still stored and drift still runs. It fails closed: which agent
+  the evidence belonged to may be what failed, so every rule of every agent
+  whose version was made active before the failure reads Unverified
+  (`CHECK_FAILED`) until a version is made active again, which re-checks the
+  newest ASP. The error goes to stderr. The settings are checked when the
+  store opens, so a bad one stops startup rather than every hook.
+- A hit from the source a row already holds (the same ASP re-checked on
+  adopt, edit, switch or Allow this) is not a new hit: it neither counts
+  again nor re-opens an acknowledged row (§4.5: only a hit *after* the
+  acknowledgement does). Nor does a re-check count in the overflow row.
+  But once acknowledgements bring the open rows under the cap, a re-check
+  lists items of that ASP that had only overflowed: they are real
+  violations that were never shown one by one.
 """
 
 from __future__ import annotations
@@ -80,6 +88,7 @@ OVERFLOW_ITEM = "(overflow)"
 EVERY_AGENT = ("", "")
 MARK_UNATTRIBUTED = "unattributed"
 MARK_TOOL_CALLS_UNREADABLE = "tool_calls_unreadable"
+MARK_CHECK_FAILED = "check_failed"
 
 GUARDRAIL_SCHEMA = """
 -- DR-184 M2: guardrail custody (design §4.2/§4.5). Additive: a database
@@ -309,11 +318,13 @@ class GuardrailCustody:
 
     def _record_violations(
         self, kind: str, value: str, version_id: str, violations: Iterable[Mapping[str, Any]],
-        at: str,
+        at: str, *, recheck: bool = False,
     ) -> None:
         settings = self._guardrail_settings()
         for violation in violations:
-            self._record_violation(kind, value, version_id, violation, at, settings["max_open_rows"])
+            self._record_violation(
+                kind, value, version_id, violation, at, settings["max_open_rows"], recheck
+            )
         cutoff = (
             _instant(at) - timedelta(days=settings["ack_retention_days"])
         ).astimezone(timezone.utc)
@@ -325,7 +336,7 @@ class GuardrailCustody:
 
     def _record_violation(
         self, kind: str, value: str, version_id: str, violation: Mapping[str, Any], at: str,
-        max_open_rows: int,
+        max_open_rows: int, recheck: bool,
     ) -> None:
         source = violation["source"]
         existing = self._db.execute(
@@ -333,6 +344,12 @@ class GuardrailCustody:
             "AND rule = ? AND item = ?",
             (kind, value, violation["rule"], violation["item"]),
         ).fetchone()
+        if (
+            existing is not None
+            and existing["source_kind"] == source["kind"]
+            and existing["source_id"] == str(source["id"])
+        ):
+            return  # The same evidence judged again is not a new hit.
         if existing is None:
             open_rows = self._db.execute(
                 "SELECT count(*) FROM guardrail_rows WHERE identity_kind = ? "
@@ -340,7 +357,7 @@ class GuardrailCustody:
                 (kind, value),
             ).fetchone()[0]
             if open_rows >= max_open_rows:
-                self._record_overflow(kind, value, version_id, violation, at)
+                self._record_overflow(kind, value, version_id, violation, at, recheck)
                 return
             self._db.execute(
                 """INSERT INTO guardrail_rows (
@@ -368,12 +385,24 @@ class GuardrailCustody:
         )
 
     def _record_overflow(
-        self, kind: str, value: str, version_id: str, violation: Mapping[str, Any], at: str
+        self, kind: str, value: str, version_id: str, violation: Mapping[str, Any], at: str,
+        recheck: bool,
     ) -> None:
         """One more distinct item past the open-row cap: counted in the
         agent's one overflow row, which keeps the state Violated until it
-        is acknowledged (§4.5 "Bounds")."""
+        is acknowledged (§4.5 "Bounds").
+
+        A re-check (adopt, edit, switch, Allow this) judges evidence already
+        judged, and the overflow row mixes every source, so it can't tell
+        which items it counted before: a re-check creates the row if there
+        is none but never counts or re-opens an existing one."""
         source = violation["source"]
+        if recheck and self._db.execute(
+            "SELECT 1 FROM guardrail_rows WHERE identity_kind = ? AND identity_value = ? "
+            "AND rule = ? AND item = ?",
+            (kind, value, OVERFLOW_RULE, OVERFLOW_ITEM),
+        ).fetchone() is not None:
+            return
         self._db.execute(
             """INSERT INTO guardrail_rows (
                    identity_kind, identity_value, rule, item, overflow, evidence_class,
@@ -421,7 +450,7 @@ class GuardrailCustody:
             self._db.execute("ROLLBACK TO guardrail_hook")
             self._db.execute("RELEASE guardrail_hook")
             print(f"raildash: guardrail {where} check failed: {exc!r}", file=sys.stderr)
-            self._mark(*EVERY_AGENT, MARK_UNATTRIBUTED, self._receive_time())
+            self._mark(*EVERY_AGENT, MARK_CHECK_FAILED, self._receive_time())
             return
         self._db.execute("RELEASE guardrail_hook")
 
@@ -437,7 +466,8 @@ class GuardrailCustody:
             self._check_asp_locked(active, asp_id, bundle, kind, value)
 
     def _check_asp_locked(
-        self, active: sqlite3.Row, asp_id: str, bundle: Mapping[str, Any], kind: str, value: str
+        self, active: sqlite3.Row, asp_id: str, bundle: Mapping[str, Any], kind: str, value: str,
+        *, recheck: bool = False,
     ) -> None:
         previous = self._db.execute(
             """SELECT collected_at FROM asps
@@ -451,7 +481,9 @@ class GuardrailCustody:
             previous_collected_at=previous[0] if previous else None, now=now,
         )
         violations = [v for rule in g.ASP_RULES for v in result["rules"][rule]["violations"]]
-        self._record_violations(kind, value, active["guardrail_version_id"], violations, now)
+        self._record_violations(
+            kind, value, active["guardrail_version_id"], violations, now, recheck=recheck
+        )
 
     def _recheck_newest_asp(self, active: sqlite3.Row, kind: str, value: str) -> None:
         """§4.5 "On adopt, switch or edit": the newest ASP is re-checked.
@@ -459,7 +491,7 @@ class GuardrailCustody:
         newest = self._newest_asps(kind, value)
         if newest:
             bundle = parse_bundle(bytes(newest[0]["exact_bundle"]))
-            self._check_asp_locked(active, newest[0]["asp_id"], bundle, kind, value)
+            self._check_asp_locked(active, newest[0]["asp_id"], bundle, kind, value, recheck=True)
 
     def _guardrail_on_request(
         self, interaction: Mapping[str, Any], active: list[dict[str, Any]]
@@ -819,6 +851,12 @@ class GuardrailCustody:
             last_capture_refused_at=self.latest_capture_refusal_at(),
         )
         rules = g.rule_states(asp_result, request_status)
+        failed = self._mark_at(*EVERY_AGENT, MARK_CHECK_FAILED)
+        if failed is not None and _instant(failed) >= _instant(active["activated_at"]):
+            rules = {
+                rule: {"state": g.UNVERIFIED, "reason": g.CHECK_FAILED, "violations": []}
+                for rule in g.RULES
+            }
         state = g.agent_state(
             has_active_guardrail=True, rule_results=rules,
             counting_rows=sum(1 for row in rows if row["counts"]),

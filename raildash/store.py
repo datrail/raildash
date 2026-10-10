@@ -365,6 +365,9 @@ class Store(GuardrailCustody):
                 "RAILDASH_ASP_RETENTION_DAYS", ASP_RETENTION_DAYS
             ),
         }
+        # Read once now so a bad guardrail setting stops startup instead of
+        # failing every ingest hook later (`guardrail_store`).
+        self._guardrail_settings()
         self._lock = threading.Lock()
         self._db = sqlite3.connect(
             self.path, timeout=BUSY_TIMEOUT_SECONDS, check_same_thread=False
