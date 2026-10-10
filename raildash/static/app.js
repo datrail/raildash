@@ -1104,16 +1104,20 @@ function renderGuardrailPolicy(rules) {
 
 // The rules as JSON, editable, for Edit and for adopting an edited proposal.
 // The server checks them against the closed contract and says what's wrong.
-function renderRulesEditor(rules, buttonLabel, onSave) {
+// `basis` is the version (or baseline) the rules came from: an editor drawn
+// from another one is a different editor, so a redraw after a version change
+// closes it rather than putting back text that would undo that change.
+function renderRulesEditor(rules, buttonLabel, basis, onSave) {
   const details = el("details", "guardrail-editor");
-  details.dataset.key = `editor:${buttonLabel}`;
+  details.dataset.key = `editor:${buttonLabel}:${basis}`;
   details.append(el("summary", null, buttonLabel));
   const area = el("textarea");
   area.setAttribute("aria-label", `${buttonLabel}: rules as JSON`);
   area.rows = 14;
   area.spellcheck = false;
   area.value = JSON.stringify(rules, null, 2);
-  area.dataset.key = `editor-text:${buttonLabel}`;
+  area.dataset.drawn = area.value;
+  area.dataset.key = `editor-text:${buttonLabel}:${basis}`;
   const save = guardrailButton("Save as a new version", async () => {
     let parsed;
     try {
@@ -1122,7 +1126,7 @@ function renderRulesEditor(rules, buttonLabel, onSave) {
       throw new Error(`Not valid JSON: ${error.message}`);
     }
     await onSave(parsed, () => { details.open = false; });
-  }, { key: `editor-save:${buttonLabel}` });
+  }, { key: `editor-save:${buttonLabel}:${basis}` });
   details.append(area, save);
   return details;
 }
@@ -1244,7 +1248,7 @@ function renderGuardrailProposal(proposal, refresh) {
     refresh();
   }));
   section.append(actions);
-  section.append(renderRulesEditor(proposal.guardrail.rules, "Edit, then adopt", async (rules, close) => {
+  section.append(renderRulesEditor(proposal.guardrail.rules, "Edit, then adopt", proposal.alignment_version_id, async (rules, close) => {
     await postJSON(path, { rules });
     close();
     refresh();
@@ -1333,8 +1337,15 @@ function guardrailViewState(body) {
   return {
     focused: body.contains(document.activeElement) ? guardrailKeyOf(document.activeElement) : null,
     open: new Set(keyed("details[open]").map(([key]) => key)),
+    // The picker's choice, and only text the user typed into an editor.
     values: new Map(keyed("select[data-key], details[open] textarea[data-key]")
+      .filter(([, node]) => node.tagName === "SELECT" || node.value !== node.dataset.drawn)
       .map(([key, node]) => [key, node.value])),
+    // An action's error stays beside its button until the user acts again.
+    errors: new Map(keyed("button[data-key]")
+      .map(([key, node]) => [key, node.nextElementSibling])
+      .filter(([, status]) => status && status.dataset.tone === "err")
+      .map(([key, status]) => [key, status.textContent])),
   };
 }
 
@@ -1348,11 +1359,18 @@ function restoreGuardrailView(body, before, focusKey) {
     if (node.tagName === "SELECT" && ![...node.options].some((opt) => opt.value === value)) return;
     node.value = value;
   });
+  body.querySelectorAll("button[data-key]").forEach((node) => {
+    const message = before.errors.get(guardrailKeyOf(node));
+    if (message && node.nextElementSibling) setInlineStatus(node.nextElementSibling, message, "err");
+  });
   const focusable = [...body.querySelectorAll("button[data-key], select[data-key], summary")];
   let target = before.focused
     ? focusable.find((node) => guardrailKeyOf(node) === before.focused)
     : null;
-  if (!target && (focusKey || before.focused)) {
+  // Never take focus back from somewhere else on the page: only when it was
+  // in the panel, or was lost with the node it was on.
+  const focusLost = document.activeElement === document.body || !document.activeElement;
+  if (!target && (before.focused || (focusKey && focusLost))) {
     // What was acted on is gone (its row was allowed, say): stay in its card.
     const ref = focusKey || before.focused.split("|")[0];
     const card = body.querySelector(`[data-agent-ref="${CSS.escape(ref)}"]`);
@@ -1432,7 +1450,7 @@ async function loadGuardrails(focusKey = null) {
         refresh();
       }, { quiet: true }));
       card.append(actions);
-      card.append(renderRulesEditor(detail.active.guardrail.rules, "Edit", async (rules, close) => {
+      card.append(renderRulesEditor(detail.active.guardrail.rules, "Edit", detail.active.guardrail.guardrail_version_id, async (rules, close) => {
         await postJSON(
           `/api/guardrail-versions/${encodeURIComponent(detail.active.guardrail.guardrail_version_id)}/edit`,
           { rules }

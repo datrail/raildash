@@ -96,8 +96,11 @@ def test_the_guardrail_panel_drives_every_action(tmp_path):
             listener_row = card.locator("tr", has_text="tcp/127.0.0.1/8443")
             expect(listener_row).to_contain_text("counts")
 
-            # Allow this → allowed by g2; no heartbeat yet, so Unverified.
+            # Allow this → allowed by g2; no heartbeat yet, so Unverified. An
+            # editor left open on g1 closes, since saving it would undo this.
+            card.locator(".guardrail-editor > summary", has_text="Edit").click()
             listener_row.get_by_role("button", name="Allow this").click()
+            expect(card.locator(".guardrail-editor[open]")).to_have_count(0, timeout=TIMEOUT)
             expect(listener_row).to_contain_text("allowed by g2", timeout=TIMEOUT)
             expect(state).to_have_text("Unverified")
             expect(card.locator(".guardrail-rules")).to_contain_text("no collector heartbeat")
