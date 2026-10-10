@@ -95,7 +95,11 @@ a violation or an Unverified, never a Held:
   already be the authenticated, attributed-to-this-agent captures of the
   24 h before the lock. A seeded host that isn't a valid guardrail host (an
   undecodable `Host` header) is listed as would-be rather than seeded.
-- Writes under `/dev` include `/dev/shm`, as §4.2 says: never a violation.
+- `/dev/shm` is storage, not a kernel interface: RailMon counts it as a
+  temp directory beside `/tmp` (FILE_TEMP_DIRS), and a tmpfs file holds
+  data like any other. So a write there is judged, while the rest of
+  `/dev` is never a violation, as §4.2 says. Exempting it would let an
+  agent save anything there unseen; it fails closed instead.
 """
 
 from __future__ import annotations
@@ -144,6 +148,8 @@ UNKNOWN_HOST = "(unknown host)"
 MCP_PREFIX = "mcp__"
 # Kernel interfaces, not storage (§4.2): a write there is never a violation.
 KERNEL_INTERFACE_ROOTS = ("/proc", "/sys", "/dev")
+# Under /dev but storage (a tmpfs), so judged like any other path.
+STORAGE_UNDER_KERNEL_ROOTS = ("/dev/shm",)
 WILDCARD_ADDRESSES = frozenset({"0.0.0.0", "::"})
 
 # §4.3 "Stale": three times the gap between the two newest ASPs, never under
@@ -297,7 +303,10 @@ def file_kind(path: str) -> str:
 
 
 def kernel_interface_path(path: str) -> bool:
-    return any(path == root or path.startswith(root + "/") for root in KERNEL_INTERFACE_ROOTS)
+    def under(root: str) -> bool:
+        return path == root or path.startswith(root + "/")
+
+    return any(map(under, KERNEL_INTERFACE_ROOTS)) and not any(map(under, STORAGE_UNDER_KERNEL_ROOTS))
 
 
 def saved_file_allowed(path: str, entries: Iterable[Mapping[str, Any]]) -> bool:

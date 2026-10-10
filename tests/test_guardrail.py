@@ -344,6 +344,7 @@ def test_a_kind_is_exactly_what_the_observed_profile_reports(path):
         ("/proc/self/oom_score_adj", True),
         ("/sys/fs/cgroup/x", True),
         ("/dev/null", True),
+        ("/dev/shm/x", False),  # a tmpfs is storage, not a kernel interface
         ("/devices/x", False),
     ],
 )
@@ -509,7 +510,7 @@ def test_a_layer_item_is_matched_by_its_own_path_and_folded_temp_names_literally
         _file("/app/workdir/a.json", layer=True),
         _file("/app/workdir/a.json"),
         _file("/proc/self/attr/current"),
-        _file("/dev/shm/x"),
+        _file("/dev/null"),
     ]
     asp_id, bundle = stored(store, v1_bundle(observed_file_access=observed(files, method=FILE_METHOD)))
     result = g.evaluate_asp(guardrail(), bundle, asp_id=asp_id, previous_collected_at=PREVIOUS, now=NOW)
