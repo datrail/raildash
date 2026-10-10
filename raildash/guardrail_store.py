@@ -686,12 +686,16 @@ class GuardrailCustody:
                 raise ValueError("rules must be an object")
             rules = json.loads(json.dumps(rules))
             base_contract = json.loads(base["contract_json"])
-            seeded = (rules.get("out_of_spec_calls") or {}).get("seeded_from_declared")
+            out_of_spec = rules.get("out_of_spec_calls")
+            seeded = out_of_spec.get("seeded_from_declared") if isinstance(out_of_spec, dict) else None
             base_seeded = base_contract["rules"]["out_of_spec_calls"]["seeded_from_declared"]
             if isinstance(seeded, dict):
                 for key in ("hosts", "mcp_servers"):
-                    if isinstance(seeded.get(key), list):
-                        seeded[key] = sorted({*seeded[key], *base_seeded[key]})
+                    listed = seeded.get(key)
+                    # Only a well-formed list is merged; anything else is
+                    # left for the contract check to reject.
+                    if isinstance(listed, list) and all(isinstance(v, str) for v in listed):
+                        seeded[key] = sorted({*listed, *base_seeded[key]})
             active = self._create_version_locked(
                 kind, value, rules, derived_from=base_contract["derived_from"]["alignment_version_id"],
                 created_by="edit", detail={"from": base["version"]},

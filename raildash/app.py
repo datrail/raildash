@@ -28,7 +28,7 @@ from html import escape as html_escape
 from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Path as PathParam, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
@@ -1021,11 +1021,11 @@ async def ingest_evidence_bundle(
 #
 # DR-184 M2: the Data Guardrail (railxia/docs design/2026-10-07-data-guardrail,
 # §4.5). Thin wrappers over the `Store` methods in `raildash.guardrail_store`,
-# which the store's own ingest hooks feed. The list carries states and
-# identities only; hosts, paths and ports come from the token-gated detail,
-# matching drift-explained. Every write (adopt, edit, switch, turn off,
-# acknowledge, allow, dismiss) needs the local write token, like lock and
-# switch.
+# which the store's own ingest hooks feed. Every route needs the local write
+# token: the writes (adopt, edit, switch, turn off, acknowledge, allow,
+# dismiss) like lock and switch, and the two reads because the design adds
+# no unauthenticated route (§5) -- the list carries states and identities
+# only, and hosts, paths and ports come from the detail.
 
 
 async def _guardrail_rules(request: Request, *, required: bool) -> dict[str, Any] | None:
@@ -1054,7 +1054,11 @@ def _guardrail_call(action: Any, *args: Any, **kwargs: Any) -> Any:
         raise HTTPException(409, str(exc)) from exc
 
 
-@app.get("/api/guardrails")
+# A SQLite rowid; anything outside its range is no row (422), not a 500.
+GUARDRAIL_ROW_ID = PathParam(ge=1, le=2**63 - 1)
+
+
+@app.get("/api/guardrails", dependencies=[Depends(require_local_token)])
 def api_guardrails() -> list[dict[str, Any]]:
     """Every agent with a baseline or a guardrail: its state (`held`,
     `violated`, `unverified`, `no_guardrail`), each rule's state and reason,
@@ -1113,7 +1117,7 @@ def api_turn_off_guardrail(agent_ref: str) -> dict[str, Any]:
 @app.post(
     "/api/guardrail-rows/{row_id}/acknowledge", dependencies=[Depends(require_local_token)]
 )
-def api_acknowledge_guardrail_row(row_id: int) -> dict[str, Any]:
+def api_acknowledge_guardrail_row(row_id: int = GUARDRAIL_ROW_ID) -> dict[str, Any]:
     """**Acknowledge** one row: seen up to now; a later hit re-opens it."""
     return _guardrail_call(get_store().acknowledge_guardrail_row, row_id)
 
@@ -1123,7 +1127,7 @@ def api_acknowledge_guardrail_row(row_id: int) -> dict[str, Any]:
     status_code=201,
     dependencies=[Depends(require_local_token)],
 )
-def api_allow_guardrail_row(row_id: int) -> dict[str, Any]:
+def api_allow_guardrail_row(row_id: int = GUARDRAIL_ROW_ID) -> dict[str, Any]:
     """**Allow this** on one row: a new version with its item allowed."""
     return _guardrail_call(get_store().allow_guardrail_row, row_id)
 

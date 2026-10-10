@@ -62,7 +62,7 @@ def adopted(client) -> tuple[str, dict]:
     asp_id = post_asp(client, asp())
     res = client.post(f"/api/asps/{asp_id}/baseline", json={"version": "v1.0"}, headers=auth())
     alignment_id = res.json()["alignment_version"]["alignment_version_id"]
-    [agent] = client.get("/api/guardrails").json()
+    [agent] = client.get("/api/guardrails", headers=auth()).json()
     assert agent["state"] == "no_guardrail"
     res = client.post(f"/api/alignments/{alignment_id}/guardrail", json={}, headers=auth())
     assert res.status_code == 201, res.text
@@ -105,10 +105,11 @@ def test_an_unknown_id_is_404(client, path, body):
     assert client.post(path, json=body, headers=auth()).status_code == 404
 
 
-def test_the_detail_needs_the_token_and_the_list_names_no_items(client):
+def test_both_reads_need_the_token_and_the_list_names_no_items(client):
     ref, _ = adopted(client)
     assert client.get(f"/api/guardrails/{ref}").status_code == 403
-    [agent] = client.get("/api/guardrails").json()
+    assert client.get("/api/guardrails").status_code == 403
+    [agent] = client.get("/api/guardrails", headers=auth()).json()
     assert agent["state"] == "violated" and agent["counting_rows"] == 1
     assert "8443" not in json.dumps(agent)
     assert client.get("/api/guardrails/agt-nobody", headers=auth()).status_code == 404
@@ -167,6 +168,12 @@ def test_edit_rejects_rules_the_contract_refuses_and_only_edits_the_active_versi
     assert res.status_code == 422
     assert client.post(f"/api/guardrail-versions/{version_id}/edit", json={},
                        headers=auth()).status_code == 422
+    for broken in ("x", {"seeded_from_declared": {"hosts": [{"a": 1}], "mcp_servers": []}},
+                   {"seeded_from_declared": {"hosts": [1, "a"], "mcp_servers": []}}):
+        shaped = dict(g1["guardrail"]["rules"], out_of_spec_calls=broken)
+        res = client.post(f"/api/guardrail-versions/{version_id}/edit", json={"rules": shaped},
+                          headers=auth())
+        assert res.status_code == 422, (broken, res.text)
     del rules["uploads"]["blocked"]
     rules["service_ports"]["allowed"] = [{"protocol": "tcp", "port": 8443}]
     res = client.post(f"/api/guardrail-versions/{version_id}/edit", json={"rules": rules},
@@ -208,3 +215,9 @@ def test_a_capture_sent_through_the_webhook_is_judged_by_the_request_hook(client
     # This baseline declares no hosts and no inference endpoint, and nothing
     # was captured before the lock, so the proposal listed no host at all.
     assert {("out_of_spec_calls", "api.anthropic.com"), ("uploads", "api.anthropic.com")} <= found
+
+
+def test_a_row_id_outside_sqlites_range_is_refused_not_a_server_error(client):
+    for path in ("acknowledge", "allow"):
+        res = client.post(f"/api/guardrail-rows/{2**70}/{path}", headers=auth())
+        assert res.status_code == 422

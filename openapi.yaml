@@ -277,11 +277,15 @@ paths:
       operationId: listGuardrails
       summary: Every agent with a baseline or a guardrail, and its Data Guardrail state
       description: |
-        Unauthenticated: states (`held`, `violated`, `unverified`,
-        `no_guardrail`), each rule's state and reason, the active version's
-        label and the number of counting rows. No hosts, paths or ports.
+        Token-gated (DR-184), like every guardrail route: states (`held`,
+        `violated`, `unverified`, `no_guardrail`), each rule's state and
+        reason, the active version's label and the number of counting rows.
+        No hosts, paths or ports.
+      parameters:
+        - {$ref: '#/components/parameters/RailDashToken'}
       responses:
         '200': {description: One entry per agent, with its opaque `agent_ref`}
+        '403': {description: Missing or invalid X-RailDash-Token}
 
   /api/guardrails/{agent_ref}:
     get:
@@ -378,12 +382,13 @@ paths:
       summary: Mark one row seen up to now; a later hit re-opens it
       description: Token-gated (DR-184).
       parameters:
-        - {name: row_id, in: path, required: true, schema: {type: integer}}
+        - {name: row_id, in: path, required: true, schema: {type: integer, minimum: 1, maximum: 9223372036854775807}}
         - {$ref: '#/components/parameters/RailDashToken'}
       responses:
         '200': {description: The row}
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such id}
+        '422': {description: row_id outside 1..2^63-1}
 
   /api/guardrail-rows/{row_id}/allow:
     post:
@@ -391,13 +396,14 @@ paths:
       summary: Allow this - a new version with the row's item allowed
       description: Token-gated (DR-184).
       parameters:
-        - {name: row_id, in: path, required: true, schema: {type: integer}}
+        - {name: row_id, in: path, required: true, schema: {type: integer, minimum: 1, maximum: 9223372036854775807}}
         - {$ref: '#/components/parameters/RailDashToken'}
       responses:
         '201': {description: The new version, now active}
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such id}
         '409': {description: The row can't be allowed with one click (overflow, unknown or wildcard host, over a size cap) or no guardrail is active}
+        '422': {description: row_id outside 1..2^63-1, or the version this would create breaks the guardrail contract (e.g. an over-long host or path)}
 
   /api/guardrails/{agent_ref}/offers/allow:
     post:
@@ -422,6 +428,7 @@ paths:
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such id}
         '409': {description: Not a current declared offer}
+        '422': {description: The version this would create breaks the guardrail contract (e.g. an over-long host or path)}
 
   /api/guardrails/{agent_ref}/offers/dismiss:
     post:
@@ -446,6 +453,7 @@ paths:
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such id}
         '409': {description: Not a current declared offer}
+        '422': {description: The version this would create breaks the guardrail contract (e.g. an over-long host or path)}
 
   /api/settings/asp-retention:
     get:
@@ -834,9 +842,9 @@ components:
       description: |
         The local write token: `RAILDASH_TOKEN` if set, otherwise the contents
         of `<db path>.token` (0600), which RailDash creates on first start and
-        reuses across restarts. Required on every write route and on the five
-        reads that carry exact evidence (`bundle`, `raw`, `drift/explained`,
-        `profile/kernel-file-access`, and a guardrail's detail).
+        reuses across restarts. Required on every write route, on every
+        guardrail route, and on the four reads that carry exact evidence
+        (`bundle`, `raw`, `drift/explained`, `profile/kernel-file-access`).
       schema: {type: string}
     RailDashCaptureToken:
       name: X-RailDash-Token
