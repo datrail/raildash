@@ -159,6 +159,7 @@ MALFORMED_EVIDENCE = "MALFORMED_EVIDENCE"
 NO_HEARTBEAT = "NO_HEARTBEAT"
 UNATTRIBUTED_TRAFFIC = "UNATTRIBUTED_TRAFFIC"
 TOOL_CALLS_UNREADABLE = "TOOL_CALLS_UNREADABLE"
+CAPTURE_REFUSED = "CAPTURE_REFUSED"
 # Why one request's tool calls could not be read (`requested_tool_calls`).
 UNREADABLE_CAPTURE = "UNREADABLE_CAPTURE"
 RESPONSE_ENCODED = "RESPONSE_ENCODED"
@@ -195,6 +196,8 @@ UNATTRIBUTED_WINDOW = timedelta(minutes=10)
 # keeps the request rules Unverified. The unattributed window's length, for
 # the same reason: one unseen request may have held the violation.
 TOOL_CALLS_UNREADABLE_WINDOW = UNATTRIBUTED_WINDOW
+# A refused authenticated batch is the same kind of gap: requests we never saw.
+CAPTURE_REFUSED_WINDOW = UNATTRIBUTED_WINDOW
 # §4.4: hosts the agent sent a body to in this window before the lock seed
 # `uploads.allowed_hosts`. The caller selects the requests; this names it.
 PROPOSAL_LOOKBACK = timedelta(hours=24)
@@ -850,6 +853,7 @@ def request_rules_status(
     last_heartbeat_at: datetime | str | None,
     last_unattributed_at: datetime | str | None,
     last_tool_calls_unreadable_at: datetime | str | None,
+    last_capture_refused_at: datetime | str | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Whether `uploads` and `out_of_spec_calls` can be verified now.
 
@@ -858,8 +862,10 @@ def request_rules_status(
     for 10 minutes after the last authenticated request RailDash could not
     give to one agent; and for 10 minutes after the last request of this
     agent whose response's tool calls could not be read (`evaluate_request`'s
-    `tool_calls.readable`), since a denied or unlisted call may be in it.
-    Otherwise `held`: the state of the request rules is
+    `tool_calls.readable`), since a denied or unlisted call may be in it;
+    and for 10 minutes after RailDash refused an authenticated capture batch
+    (`Store.latest_capture_refusal_at`), since none of its requests was
+    stored or checked. Otherwise `held`: the state of the request rules is
     their rows, which the roll-up reads separately. Times are RailDash's
     own receive times.
     """
@@ -867,12 +873,15 @@ def request_rules_status(
     heartbeat = _instant(last_heartbeat_at)
     unattributed = _instant(last_unattributed_at)
     unreadable = _instant(last_tool_calls_unreadable_at)
+    refused = _instant(last_capture_refused_at)
     if heartbeat is None or abs(current - heartbeat) > HEARTBEAT_WINDOW:
         reason: str | None = NO_HEARTBEAT
     elif unattributed is not None and current - unattributed < UNATTRIBUTED_WINDOW:
         reason = UNATTRIBUTED_TRAFFIC
     elif unreadable is not None and current - unreadable < TOOL_CALLS_UNREADABLE_WINDOW:
         reason = TOOL_CALLS_UNREADABLE
+    elif refused is not None and current - refused < CAPTURE_REFUSED_WINDOW:
+        reason = CAPTURE_REFUSED
     else:
         reason = None
     return {

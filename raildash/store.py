@@ -180,6 +180,20 @@ CREATE TABLE IF NOT EXISTS collector_heartbeats (
     sent_at           TEXT NOT NULL
 );
 
+-- DR-184 M0: the last time a capture batch that carried the local write
+-- token was refused with any 4xx (over a size, item or JSON-structure
+-- bound, not valid JSON, or the wrong shape or content type). That batch was the collector's own traffic and none of it was
+-- stored, so for a while the request rules can't say nothing happened. One
+-- row per route, upserted. A refused batch without the token is not
+-- recorded: it never affects a guardrail, so it can't be made to keep one
+-- Unverified either.
+CREATE TABLE IF NOT EXISTS capture_refusals (
+    route           TEXT PRIMARY KEY,
+    last_refused_at TEXT NOT NULL,
+    status          INTEGER NOT NULL,
+    refusals        INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS asps (
     asp_id            TEXT PRIMARY KEY,
     bundle_id         TEXT NOT NULL UNIQUE,
@@ -1690,7 +1704,39 @@ class Store:
             )
         return row
 
+    def record_capture_refusal(
+        self, route: str, *, status: int, refused_at: datetime | None = None
+    ) -> dict[str, Any]:
+        """Record that an authenticated capture batch on `route` was refused
+        with `status` (DR-184 M0). The caller has already checked the token;
+        `refused_at` exists for tests and defaults to RailDash's receive time.
+        """
+        row = {"route": route, "last_refused_at": self._receive_time(refused_at), "status": status}
+        with self._write_transaction():
+            self._db.execute(
+                """INSERT INTO capture_refusals (route, last_refused_at, status, refusals)
+                   VALUES (:route, :last_refused_at, :status, 1)
+                   ON CONFLICT(route) DO UPDATE SET
+                       last_refused_at = excluded.last_refused_at,
+                       status          = excluded.status,
+                       refusals        = refusals + 1""",
+                row,
+            )
+        return row
+
     # ----------------------------------------------------------------- read
+
+    def latest_capture_refusal_at(self) -> str | None:
+        """The newest refusal of an authenticated capture batch, or None.
+
+        What `guardrail.request_rules_status(last_capture_refused_at=...)`
+        takes: the refused batch's requests were never checked, so the
+        request rules can't read Held for a while after it.
+        """
+        row = self._db.execute(
+            "SELECT MAX(last_refused_at) FROM capture_refusals"
+        ).fetchone()
+        return row[0]
 
     def latest_heartbeat_at(self) -> str | None:
         """The newest authenticated heartbeat over every collector, or None.

@@ -750,6 +750,22 @@ def test_request_rules_need_a_heartbeat_and_no_recent_unattributed_or_unreadable
         assert status[rule]["reason"] == reason
 
 
+@pytest.mark.parametrize(
+    ("refused", "reason"),
+    [
+        ("2026-09-23T23:52:00Z", "CAPTURE_REFUSED"),  # 8 min ago
+        ("2026-09-23T23:50:00Z", None),  # 10 min ago: past the window
+        (None, None),
+    ],
+)
+def test_a_recently_refused_authenticated_batch_keeps_the_request_rules_unverified(refused, reason):
+    status = g.request_rules_status(now=NOW, last_heartbeat_at="2026-09-24T00:00:30Z", last_unattributed_at=None,
+                                    last_tool_calls_unreadable_at=None, last_capture_refused_at=refused)
+    for rule in g.REQUEST_RULES:
+        assert status[rule]["state"] == ("unverified" if reason else "held")
+        assert status[rule]["reason"] == reason
+
+
 PLANNER = {"identity": {"kind": "local_agent_keys", "value": ["planner"]}, "sandboxes": []}
 CRITIC = {"identity": {"kind": "deployment_compose", "value": {"host_id": "acceptance-host",
                                                               "project": "p", "service": "critic"}},

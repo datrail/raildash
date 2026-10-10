@@ -21,6 +21,8 @@ import os
 import re
 import secrets
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
@@ -243,6 +245,26 @@ def require_local_token(
         raise HTTPException(403, "missing or invalid X-RailDash-Token")
 
 
+@contextmanager
+def _refusal_recorded(route: str, authenticated: bool) -> Iterator[None]:
+    """Record a refused capture batch that carried the local write token
+    (DR-184 M0): it was the collector's own traffic, none of it was stored,
+    and so none of it was checked against a guardrail. Only 4xx refusals of
+    the batch itself are recorded; a server error is not a refusal of the
+    data, and an unauthenticated batch never affects a guardrail."""
+    try:
+        yield
+    except HTTPException as exc:
+        if authenticated and 400 <= exc.status_code < 500:
+            try:
+                get_store().record_capture_refusal(route, status=exc.status_code)
+            except Exception as error:  # noqa: BLE001 -- the refusal's own status must reach the sender
+                # A sender told 500 would retry a batch that will only be
+                # refused again, and lose why. The missed record is said here.
+                print(f"raildash: could not record a refused capture on {route}: {error!r}", file=sys.stderr)
+        raise
+
+
 def _capture_authenticated(request: Request) -> bool:
     """Whether a capture batch carries the local write token (DR-184 M0).
 
@@ -272,6 +294,11 @@ async def receive_http_interactions(request: Request) -> dict[str, Any]:
     stored as authenticated (`_capture_authenticated`).
     """
     authenticated = _capture_authenticated(request)
+    with _refusal_recorded("/webhook/http-interactions", authenticated):
+        return await _receive_http_interactions(request, authenticated)
+
+
+async def _receive_http_interactions(request: Request, authenticated: bool) -> dict[str, Any]:
     body = await _json_body(request)
 
     if isinstance(body, list):
@@ -309,6 +336,11 @@ async def receive_events(request: Request) -> dict[str, Any]:
     Takes an optional `X-RailDash-Token` like `/webhook/http-interactions`.
     """
     authenticated = _capture_authenticated(request)
+    with _refusal_recorded("/webhook/events", authenticated):
+        return await _receive_events(request, authenticated)
+
+
+async def _receive_events(request: Request, authenticated: bool) -> dict[str, Any]:
     body = await _json_body(request)
     if not isinstance(body, dict):
         raise HTTPException(422, "expected an object")

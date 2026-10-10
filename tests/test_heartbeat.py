@@ -258,6 +258,63 @@ def test_a_replaced_forged_row_does_not_keep_its_session_first_seen(client):
     assert session["first_seen"] == session["last_seen"] == "2026-10-10T12:00:00Z"
 
 
+# A batch the webhook refuses is never stored, so none of its requests was
+# checked. Refused with the token, it was the collector's own traffic, and
+# the request rules must not read Held over it for a while.
+DEEP = {"session_id": "s", "interactions": [{"request": {"body": json.loads("[" * 130 + "]" * 130)}}]}
+
+
+@pytest.mark.parametrize(
+    "route, body, status",
+    [
+        ("/webhook/http-interactions", DEEP, 413),
+        ("/webhook/events", DEEP, 413),
+        ("/webhook/http-interactions", {"interactions": "not a list"}, 422),
+    ],
+)
+def test_a_refused_authenticated_batch_is_recorded(client, route, body, status):
+    response = client.post(route, json=body, headers=auth())
+    assert response.status_code == status
+    assert app_module.store.latest_capture_refusal_at() is not None
+    row = app_module.store._db.execute(  # noqa: SLF001
+        "SELECT route, status, refusals FROM capture_refusals"
+    ).fetchone()
+    assert tuple(row) == (route, status, 1)
+
+
+def test_invalid_json_with_the_token_is_a_refusal_too(client):
+    response = client.post(
+        "/webhook/events", content=b"{not json", headers={**auth(), "Content-Type": "application/json"}
+    )
+    assert response.status_code == 400
+    assert app_module.store.latest_capture_refusal_at() is not None
+
+
+@pytest.mark.parametrize("headers", [{}, {"X-RailDash-Token": "wrong-token-value-0000"}])
+def test_a_refused_batch_without_the_token_is_not_recorded(client, headers):
+    assert client.post("/webhook/http-interactions", json=DEEP, headers=headers).status_code == 413
+    assert app_module.store.latest_capture_refusal_at() is None
+
+
+def test_an_accepted_batch_is_not_a_refusal_and_refusals_count_up(client):
+    client.post("/webhook/http-interactions", json={"interactions": captures()}, headers=auth())
+    assert app_module.store.latest_capture_refusal_at() is None
+    for _ in range(2):
+        client.post("/webhook/http-interactions", json=DEEP, headers=auth())
+    refusals = app_module.store._db.execute(  # noqa: SLF001
+        "SELECT refusals FROM capture_refusals"
+    ).fetchone()[0]
+    assert refusals == 2
+
+
+def test_a_failed_refusal_record_still_answers_the_refusal(client, monkeypatch):
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(app_module.store, "record_capture_refusal", locked)
+    assert client.post("/webhook/http-interactions", json=DEEP, headers=auth()).status_code == 413
+
+
 def test_open_read_routes_do_not_reveal_the_authenticated_mark(client):
     payload = {"session_id": "s", "interactions": captures()}
     client.post("/webhook/http-interactions", json=payload, headers=auth())
