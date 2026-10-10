@@ -54,10 +54,12 @@ require the local write token in an `X-RailDash-Token` header. The README's
 
 The dashboard, its `/api/*` query routes, the compatibility
 `/webhook/sessions*` reads, and FastAPI's OpenAPI pages can read the resulting
-SQLite database. The write routes accept UTF-8 JSON only. The capture webhooks
-cap a request at 16 MiB (an evidence bundle at 1 MiB by default, and
-`POST /webhook/heartbeat` and the ASP control routes at 4 KiB), a batch at 1,000 items, JSON structure at 2,200,000 tokens, a scalar at 8
-MiB, and nesting at 128 levels. RailMon splits a default batch using its actual
+SQLite database. The write routes accept UTF-8 JSON only. A request is capped
+by route: 16 MiB for the capture webhooks, 1 MiB by default for an evidence
+bundle, and 4 KiB for `POST /webhook/heartbeat` and the ASP control routes.
+The capture webhooks also cap a batch at 1,000 items, and a JSON body is
+refused past 2,200,000 tokens of structure, an 8 MiB scalar, or 128 levels
+of nesting. RailMon splits a default batch using its actual
 serialized size, including JSON escaping, before posting. The independent
 limits prevent the wire allowance from becoming an unbounded Python object
 tree. Parsing runs outside the async event loop. Credential headers — including
