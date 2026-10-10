@@ -46,7 +46,11 @@ Every violation is a plain dict: `rule`, `item` (the §4.5 row key: a host,
 `mcp__<server>`), `evidence_class` (`observed` or `requested`), `source`
 (`{"kind": "asp" | "interaction", "id": ...}`) and a `detail` dict with what
 re-checking the item needs. A rule result is `{"state": "held" | "violated"
-| "unverified", "reason": str | None, "violations": [...]}`.
+| "unverified", "reason": str | None, "violations": [...]}`. `reason` is
+set exactly when the rule was not verified on its latest evidence: on
+`unverified`, and on a `violated` rule whose evidence was stale, `PARTIAL`
+or partly unreadable (the violations are real; the absence of others is
+not shown). `agent_state` reads a rule as verified only without a reason.
 
 Where the design is silent this module takes the reading that can only add
 a violation or an Unverified, never a Held:
@@ -61,13 +65,17 @@ a violation or an Unverified, never a Held:
   several keys match, the smallest cap applies. A request carrying a body to
   a capped host with no `request_size` is a violation: it can't be shown to
   be under the cap.
-- Model-requested tool calls are read from the response body only: an
-  Anthropic `tool_use`/`tool_call` content block's `name`, and an OpenAI
-  `choices[].message.tool_calls[].function.name`. A request body only
-  echoes an earlier turn, and the agent writes it, so it is not the model's
-  request. A response the capture could not decode yields none, which is
-  why an unreadable capture never makes the request rules Held by itself
-  (`request_rules_status` decides that from liveness).
+- Model-requested tool calls are read from the response body only, in the
+  Anthropic, OpenAI chat and OpenAI Responses shapes, non-streamed or as a
+  server-sent event stream (`requested_tool_calls` lists them). A request
+  body only echoes an earlier turn, and the agent writes it, so it is not
+  the model's request. A response that can't be read safely (the stored row
+  unparseable, a compressed body, streamed text over 4 MiB, a body or event
+  past the JSON safety bounds) is flagged `tool_calls.readable: False`, and
+  `request_rules_status` keeps both request rules Unverified for 10 minutes
+  after it; a response with no body, or plain text with no `data:` line,
+  asks for nothing. The response's safety is judged apart from the request
+  body, so an agent can't hide the calls by nesting its own request deep.
 - An `mcp__` tool name with no `__` after its server part has no server,
   so it fails closed: it is a violation keyed by the whole tool name.
 - The extracted server is compared exactly, without normalizing it first:
@@ -81,8 +89,8 @@ a violation or an Unverified, never a Held:
   holds for a heartbeat ahead of `now`.
 - An attribute missing from the ASP (an older rule pack), or `TEMPLATED`,
   is Unverified, like `BLIND`. A listener entry that can't be read makes the
-  rule Unverified (`MALFORMED_EVIDENCE`) unless a readable one is a
-  violation.
+  rule unverified (`MALFORMED_EVIDENCE`), alongside any violation a
+  readable one shows.
 - A v2 bundle counts as multi-agent when it lists two or more agents,
   whatever their `discovery_status`; a proposal from one is refused.
 - An attributed request that matches the identity of more than one active
@@ -115,6 +123,12 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 from .asp import BUNDLE_VERSION_V2, FILE_ACCESS_ATTRIBUTE, identity_problems
 from .ingest import _header, legacy_exchange
+from .json_safety import (
+    MAX_SAFE_JSON_BYTES,
+    JSONStructureGuard,
+    JSONStructureTooComplex,
+    check_json_structure,
+)
 from .store import UNSAFE_LEGACY_CAPTURE, Store
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "guardrail-version-v1.schema.json"
@@ -143,6 +157,19 @@ NOT_COLLECTED = "NOT_COLLECTED"
 MALFORMED_EVIDENCE = "MALFORMED_EVIDENCE"
 NO_HEARTBEAT = "NO_HEARTBEAT"
 UNATTRIBUTED_TRAFFIC = "UNATTRIBUTED_TRAFFIC"
+TOOL_CALLS_UNREADABLE = "TOOL_CALLS_UNREADABLE"
+# Why one request's tool calls could not be read (`requested_tool_calls`).
+UNREADABLE_CAPTURE = "UNREADABLE_CAPTURE"
+RESPONSE_ENCODED = "RESPONSE_ENCODED"
+RESPONSE_TOO_LARGE = "RESPONSE_TOO_LARGE"
+RESPONSE_UNSCANNABLE = "RESPONSE_UNSCANNABLE"
+# How deep a stored row may nest before even its response is unreadable:
+# far past the 128 levels a shown row allows, well inside what the stdlib
+# decoder parses without hitting the interpreter's recursion limit.
+MAX_STORED_ROW_DEPTH = 512
+# How much streamed text one request's check scans. A model's streamed
+# answer is far smaller; more than this is flagged, not read in part.
+MAX_SCANNED_RESPONSE_BYTES = 4 * 1024 * 1024
 
 UNKNOWN_HOST = "(unknown host)"
 MCP_PREFIX = "mcp__"
@@ -160,6 +187,10 @@ STALE_MAX = timedelta(hours=2)
 # §4.1/§4.3: `railmon collect` beats every 60 s while a tap is attached.
 HEARTBEAT_WINDOW = timedelta(minutes=3)
 UNATTRIBUTED_WINDOW = timedelta(minutes=10)
+# Not in the design: how long one response whose tool calls couldn't be read
+# keeps the request rules Unverified. The unattributed window's length, for
+# the same reason: one unseen request may have held the violation.
+TOOL_CALLS_UNREADABLE_WINDOW = UNATTRIBUTED_WINDOW
 # §4.4: hosts the agent sent a body to in this window before the lock seed
 # `uploads.allowed_hosts`. The caller selects the requests; this names it.
 PROPOSAL_LOOKBACK = timedelta(hours=24)
@@ -183,7 +214,7 @@ def guardrail_problems(version: Any) -> list[str]:
     """Validate the closed guardrail version v1 and the rules the schema
     cannot express: `created_at` is UTC (as `locked_at` is), every host is
     already in its normalized form so stored and compared values are one
-    string, and the identity follows the alignment version's own rules
+    string, a port or byte cap is a real integer (not `80.0`), and the identity follows the alignment version's own rules
     (`raildash.asp.identity_problems`, which also sorts a key list)."""
     if not isinstance(version, dict):
         return ["guardrail version must be an object"]
@@ -210,6 +241,14 @@ def guardrail_problems(version: Any) -> list[str]:
         for host in values:
             if not _is_host_pattern(host):
                 problems.append(f"{where}: {host!r} is not a normalized host or *.host")
+    # JSON Schema's `integer` accepts `80.0`; a port or a byte count here is
+    # compared with RailMon's ints and `request_size`, so it must be one.
+    for index, entry in enumerate(rules["service_ports"]["allowed"]):
+        if entry["port"] != "ephemeral" and type(entry["port"]) is not int:
+            problems.append(f"rules.service_ports.allowed.{index}.port: must be an integer")
+    for host, cap in rules["uploads"]["max_request_bytes"].items():
+        if type(cap) is not int:
+            problems.append(f"rules.uploads.max_request_bytes.{host}: must be an integer")
     return problems
 
 
@@ -429,31 +468,146 @@ def carries_body(interaction: Mapping[str, Any]) -> bool:
         return True
 
 
-def requested_tool_calls(interaction: Mapping[str, Any]) -> list[str]:
-    """Tool names the model asked for in this response, in order, deduplicated."""
-    exchange = _exchange(interaction)
-    response = exchange.get("response") if exchange else None
-    body = response.get("body") if isinstance(response, dict) else None
-    if not isinstance(body, dict):
-        return []
+def _stored_raw(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
+    """A stored row's whole `raw` event, parsed without the 128-level depth
+    bound `Store._safe_raw` applies to the row as one document.
+
+    That bound is right for showing a row, but the request body inside it is
+    the agent's own writing: an agent that nests it deeper than 128 levels
+    would make the whole row unsafe and so hide the response's tool calls.
+    Here the row keeps the size and token bounds and a looser depth that
+    the stdlib decoder still handles; the response is then held to the
+    ordinary bounds on its own (`_response_body`).
+    """
+    raw = interaction.get("raw")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    if isinstance(raw, str):
+        if len(raw.encode("utf-8", "surrogatepass")) > MAX_SAFE_JSON_BYTES:
+            return None
+        try:
+            JSONStructureGuard(max_depth=MAX_STORED_ROW_DEPTH).feed(raw)
+            raw = json.loads(raw)
+        except (JSONStructureTooComplex, ValueError, RecursionError):
+            return None
+    if not isinstance(raw, dict) or raw == UNSAFE_LEGACY_CAPTURE:
+        return None
+    return raw
+
+
+def _response_body(interaction: Mapping[str, Any]) -> tuple[Any, str | None]:
+    """The response body, or `(None, reason)` when it can't be read safely."""
+    raw = _stored_raw(interaction)
+    if raw is None:
+        return None, UNREADABLE_CAPTURE
+    exchange = legacy_exchange(raw)
+    response = exchange.get("response") if isinstance(exchange, dict) else None
+    if not isinstance(response, dict):
+        return None, None
+    encoding = _header(response.get("headers"), "content-encoding")
+    if encoding is not None and encoding.strip().lower() not in ("", "identity"):
+        # Compressed bytes are not the text the agent's SDK reads.
+        return None, RESPONSE_ENCODED
+    body = response.get("body")
+    try:
+        check_json_structure(json.dumps(body))
+    except (JSONStructureTooComplex, ValueError, RecursionError):
+        return None, RESPONSE_UNSCANNABLE
+    return body, None
+
+
+def requested_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
+    """The tool calls the model asked for in this request's response.
+
+    Returns `{"names": [...], "readable": bool, "reason": str | None}`,
+    names in order and deduplicated. `readable: False` means the response
+    could have asked for a call this can't see, so the checks drawn from
+    tool calls are not verified for this request (`evaluate_request`).
+
+    A JSON response body is read for an Anthropic `tool_use`/`tool_call`
+    content block's `name`, an OpenAI chat `choices[].message.tool_calls[]
+    .function.name`, and an OpenAI Responses `output[]` item of type
+    `function_call`'s `name`. RailMon stores any other body as `{"raw":
+    text}` (`parse_json_body`); that text is read as a server-sent event
+    stream: each `data:` line holding JSON is one event, and the names come
+    from an Anthropic `content_block_start` whose `content_block` is a
+    `tool_use`, an OpenAI chat chunk's `choices[].delta.tool_calls[]
+    .function.name` (only the first chunk of each call carries it), and an
+    OpenAI Responses `response.output_item.added`/`.done` whose `item` is a
+    `function_call`. A `data:` line that isn't JSON (`[DONE]`) is skipped,
+    and a stream cut short yields the names it reached. Text with no
+    `data:` line (an HTML error page) asks for nothing.
+    """
+    body, reason = _response_body(interaction)
+    if reason is not None:
+        return {"names": [], "readable": False, "reason": reason}
     names: list[str] = []
 
     def add(name: Any) -> None:
         if isinstance(name, str) and name and name not in names:
             names.append(name)
 
+    if not isinstance(body, dict):
+        return {"names": [], "readable": True, "reason": None}
+    text = body.get("raw") if set(body) == {"raw"} else None
+    if not isinstance(text, str):
+        _message_tool_calls(body, add)
+        return {"names": names, "readable": True, "reason": None}
+    if len(text.encode("utf-8", "surrogatepass")) > MAX_SCANNED_RESPONSE_BYTES:
+        return {"names": [], "readable": False, "reason": RESPONSE_TOO_LARGE}
+    for line in text.splitlines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].lstrip(" ")
+        try:
+            check_json_structure(data)
+        except JSONStructureTooComplex:
+            return {"names": names, "readable": False, "reason": RESPONSE_UNSCANNABLE}
+        try:
+            event = json.loads(data)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(event, dict):
+            _event_tool_calls(event, add)
+    return {"names": names, "readable": True, "reason": None}
+
+
+def _message_tool_calls(body: dict[str, Any], add: Any) -> None:
+    """Tool names in one non-streamed Anthropic, OpenAI chat or Responses body."""
     content = body.get("content")
     for block in content if isinstance(content, list) else []:
         if isinstance(block, dict) and block.get("type") in {"tool_use", "tool_call"}:
             add(block.get("name"))
-    choices = body.get("choices")
-    for choice in choices if isinstance(choices, list) else []:
-        message = choice.get("message") if isinstance(choice, dict) else None
-        calls = message.get("tool_calls") if isinstance(message, dict) else None
-        for call in calls if isinstance(calls, list) else []:
-            function = call.get("function") if isinstance(call, dict) else None
+    for choice in _dicts(body.get("choices")):
+        message = choice.get("message")
+        for call in _dicts(message.get("tool_calls") if isinstance(message, dict) else None):
+            function = call.get("function")
             add(function.get("name") if isinstance(function, dict) else None)
-    return names
+    for item in _dicts(body.get("output")):
+        if item.get("type") == "function_call":
+            add(item.get("name"))
+
+
+def _event_tool_calls(event: dict[str, Any], add: Any) -> None:
+    """Tool names in one streamed event of any of the three shapes."""
+    kind = event.get("type")
+    if kind == "content_block_start":
+        block = event.get("content_block")
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            add(block.get("name"))
+    elif kind in ("response.output_item.added", "response.output_item.done"):
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "function_call":
+            add(item.get("name"))
+    for choice in _dicts(event.get("choices")):
+        delta = choice.get("delta")
+        for call in _dicts(delta.get("tool_calls") if isinstance(delta, dict) else None):
+            function = call.get("function")
+            add(function.get("name") if isinstance(function, dict) else None)
+
+
+def _dicts(value: Any) -> list[dict[str, Any]]:
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
 def _interaction_source(interaction: Mapping[str, Any]) -> dict[str, Any]:
@@ -480,15 +634,26 @@ def _size_cap(host: str, caps: Mapping[str, int]) -> int | None:
 
 def evaluate_request(
     guardrail: Mapping[str, Any], interaction: Mapping[str, Any]
-) -> dict[str, list[dict[str, Any]]]:
+) -> dict[str, Any]:
     """`uploads` and `out_of_spec_calls` against one captured request.
 
-    `interaction` is a stored `interactions` row (`raildash.ingest.normalise`
-    output, or `Store.interaction`'s): `host`, `request_size` and `raw` are
-    read. The caller has already decided, with `request_owner`, that it
-    belongs to this guardrail. Returns each rule's violations; whether the
-    rules are verified at all is `request_rules_status`'s answer, since one
-    request never makes a rule Held. One request yields at most one
+    `interaction` is a stored `interactions` row as stored, with `raw` the
+    stored JSON text (`raildash.ingest.normalise` output, or the row read
+    straight from the table): `host`, `request_size` and `raw` are read. A
+    `raw` already passed through `Store._safe_raw` may have been blanked by
+    a deep request body, which then reads as unreadable tool calls. The
+    caller has already decided, with `request_owner`, that it belongs to
+    this guardrail.
+
+    Returns `{"uploads": [...], "out_of_spec_calls": [...], "tool_calls":
+    {"readable": bool, "reason": str | None}}`: each rule's violations, and
+    whether the response's tool calls could be read. When they could not,
+    `uploads`' `denied_tool_calls` check and `out_of_spec_calls`' MCP check
+    were not made on this request, so the caller passes its time to
+    `request_rules_status` as `last_tool_calls_unreadable_at`, which keeps
+    both rules Unverified for a while; the host checks still ran. Whether
+    the rules are verified at all is `request_rules_status`'s answer, since
+    one request never makes a rule Held. One request yields at most one
     violation per (rule, item); its `detail.reasons` lists why.
     """
     rules = guardrail["rules"]
@@ -518,7 +683,8 @@ def evaluate_request(
                 kind="host", reasons=upload_reasons, request_size=size, max_request_bytes=cap,
             )
         )
-    tools = requested_tool_calls(interaction)
+    calls = requested_tool_calls(interaction)
+    tools = calls["names"]
     denied = set(uploads["denied_tool_calls"])
     found_uploads.extend(
         _violation("uploads", name, REQUESTED, source, kind="tool_call", tool=name)
@@ -547,7 +713,11 @@ def evaluate_request(
                 kind="mcp_server", server=server, tool=name,
             )
         )
-    return {"uploads": found_uploads, "out_of_spec_calls": found_out_of_spec}
+    return {
+        "uploads": found_uploads,
+        "out_of_spec_calls": found_out_of_spec,
+        "tool_calls": {"readable": calls["readable"], "reason": calls["reason"]},
+    }
 
 
 def request_owner(
@@ -610,23 +780,30 @@ def request_rules_status(
     now: datetime | str,
     last_heartbeat_at: datetime | str | None,
     last_unattributed_at: datetime | str | None,
+    last_tool_calls_unreadable_at: datetime | str | None,
 ) -> dict[str, dict[str, Any]]:
     """Whether `uploads` and `out_of_spec_calls` can be verified now.
 
     Unverified without an authenticated collector heartbeat in the last 3
-    minutes (an idle agent and a dead collector look the same otherwise), or
+    minutes (an idle agent and a dead collector look the same otherwise);
     for 10 minutes after the last authenticated request RailDash could not
-    give to one agent. Otherwise `held`: the state of the request rules is
+    give to one agent; and for 10 minutes after the last request of this
+    agent whose response's tool calls could not be read (`evaluate_request`'s
+    `tool_calls.readable`), since a denied or unlisted call may be in it.
+    Otherwise `held`: the state of the request rules is
     their rows, which the roll-up reads separately. Times are RailDash's
     own receive times.
     """
     current = _required_instant(now, "now")
     heartbeat = _instant(last_heartbeat_at)
     unattributed = _instant(last_unattributed_at)
+    unreadable = _instant(last_tool_calls_unreadable_at)
     if heartbeat is None or abs(current - heartbeat) > HEARTBEAT_WINDOW:
         reason: str | None = NO_HEARTBEAT
     elif unattributed is not None and current - unattributed < UNATTRIBUTED_WINDOW:
         reason = UNATTRIBUTED_TRAFFIC
+    elif unreadable is not None and current - unreadable < TOOL_CALLS_UNREADABLE_WINDOW:
+        reason = TOOL_CALLS_UNREADABLE
     else:
         reason = None
     return {
@@ -692,7 +869,9 @@ def evaluate_asp(
     verified; `PARTIAL` is violated when a listed item breaks the rule (a
     capped list keeps what it lists) and Unverified otherwise; `BLIND`,
     `FAILED`, `TEMPLATED` and a missing attribute are Unverified. A stale
-    ASP is Unverified unless it shows a violation, which stays real.
+    or `PARTIAL` ASP, or one with an unreadable listener, is not verified:
+    its violations stay real (`state: violated`) and `reason` says why the
+    rule still is not verified.
     """
     if is_multi_agent(bundle):
         return {
@@ -735,8 +914,6 @@ def _attribute_rule(attribute: Any, check: Any, stale: bool) -> dict[str, Any]:
         violations, malformed = check(value)
     else:
         return {"state": UNVERIFIED, "reason": status or NOT_COLLECTED, "violations": []}
-    if violations:
-        return {"state": VIOLATED, "reason": None, "violations": violations}
     if malformed:
         reason: str | None = MALFORMED_EVIDENCE
     elif status == "PARTIAL":
@@ -747,6 +924,11 @@ def _attribute_rule(attribute: Any, check: Any, stale: bool) -> dict[str, Any]:
         reason = STALE
     else:
         reason = None
+    # Violations stay real whatever the evidence's state; the reason says
+    # the rule still wasn't verified on it, so acknowledging them can't
+    # turn the agent Held (`agent_state`).
+    if violations:
+        return {"state": VIOLATED, "reason": reason, "violations": violations}
     return {"state": UNVERIFIED if reason else HELD, "reason": reason, "violations": []}
 
 
@@ -826,16 +1008,18 @@ def agent_state(
     """§4.5's per-agent state, highest first: `violated` (a counting row),
     `unverified` (no counting row, but some rule Unverified on its latest
     evidence), `held` (every rule verified, no counting row), and
-    `no_guardrail`. A rule missing from `rule_results` is Unverified; a rule
-    whose latest evidence was violated but whose rows no longer count (they
-    were acknowledged or allowed) was still verified."""
+    `no_guardrail`. A rule is verified only when its state is `held` or
+    `violated` and it has no `reason`; one missing from `rule_results` is
+    not. So a rule whose latest evidence was violated but whose rows no
+    longer count (acknowledged or allowed) was verified, while one violated
+    on stale or `PARTIAL` evidence was not, and its agent is Unverified."""
     if not has_active_guardrail:
         return STATE_NO_GUARDRAIL
     if counting_rows > 0:
         return STATE_VIOLATED
     for rule in RULES:
         result = rule_results.get(rule)
-        if not result or result.get("state") not in (HELD, VIOLATED):
+        if not result or result.get("state") not in (HELD, VIOLATED) or result.get("reason"):
             return STATE_UNVERIFIED
     return STATE_HELD
 

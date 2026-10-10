@@ -209,6 +209,14 @@ def _mutated(mutate):
                      id="port too high"),
         pytest.param(lambda v: v["rules"]["service_ports"]["allowed"].append({"protocol": "tcp", "port": "any"}),
                      id="port word"),
+        pytest.param(lambda v: v["rules"]["service_ports"]["allowed"].append({"protocol": "tcp", "port": 80.0}),
+                     id="float port"),
+        pytest.param(lambda v: v["rules"]["service_ports"]["allowed"].append({"protocol": "tcp", "port": True}),
+                     id="bool port"),
+        pytest.param(lambda v: v["rules"]["uploads"]["max_request_bytes"].update({"a.example": 1024.0}),
+                     id="float cap"),
+        pytest.param(lambda v: v["rules"]["uploads"]["max_request_bytes"].update({"a.example": False}),
+                     id="bool cap"),
         pytest.param(lambda v: v["rules"]["service_ports"]["allowed"].append({"protocol": "tcp", "port": 1, "peer": "x"}),
                      id="unknown port field"),
         pytest.param(lambda v: v["rules"]["uploads"]["allowed_hosts"].append("API.openai.com"),
@@ -446,7 +454,8 @@ def _asp_case(store, rule: str, status: str, items: str | None, *, previous=PREV
         ("ANSWERED", "clean", "held", None, 0),
         ("ANSWERED", "violating", "violated", None, 1),
         ("ABSENT", None, "held", None, 0),
-        ("PARTIAL", "violating", "violated", None, 1),
+        # A capped list keeps what it lists, but can't show nothing else broke.
+        ("PARTIAL", "violating", "violated", "PARTIAL", 1),
         ("PARTIAL", "clean", "unverified", "PARTIAL", 0),
         ("BLIND", None, "unverified", "BLIND", 0),
         ("FAILED", None, "unverified", "FAILED", 0),
@@ -567,8 +576,8 @@ def test_a_two_agent_sandbox_is_unverified_multi_agent_and_nothing_is_evaluated(
     assert [agent["agent_key"] for agent in bundle["agents"]] == ["executor", "planner"]
     result = g.evaluate_asp(guardrail(), bundle, asp_id=asp_id, previous_collected_at=None, now=NOW)
     assert result["multi_agent"] is True
-    states = g.rule_states(result, g.request_rules_status(now=NOW, last_heartbeat_at=NOW,
-                                                          last_unattributed_at=None))
+    states = g.rule_states(result, g.request_rules_status(
+        now=NOW, last_heartbeat_at=NOW, last_unattributed_at=None, last_tool_calls_unreadable_at=None))
     assert {rule: (s["state"], s["reason"]) for rule, s in states.items()} == {
         rule: ("unverified", "MULTI_AGENT") for rule in g.RULES
     }
@@ -596,7 +605,7 @@ def _with_response_tools(interaction: dict, *names: str, openai: bool = False) -
 
 
 def _items(result: dict) -> dict:
-    return {rule: [(v["item"], v["evidence_class"]) for v in found] for rule, found in result.items()}
+    return {rule: [(v["item"], v["evidence_class"]) for v in result[rule]] for rule in g.REQUEST_RULES}
 
 
 def test_every_captured_fixture_request_against_the_request_rules(store):
@@ -606,7 +615,9 @@ def test_every_captured_fixture_request_against_the_request_rules(store):
                            "seeded_from_declared": {"hosts": ["api.anthropic.com"], "mcp_servers": []}},
     )
     rows = stored_requests(store)
-    found = [_items(g.evaluate_request(policy, row)) for row in rows]
+    results = [g.evaluate_request(policy, row) for row in rows]
+    assert all(r["tool_calls"] == {"readable": True, "reason": None} for r in results)
+    found = [_items(r) for r in results]
     openshell = ("host.openshell.internal", "observed")
     assert found == [
         {"uploads": [], "out_of_spec_calls": []},  # built-in tool call: not judged
@@ -716,19 +727,24 @@ def test_a_server_less_mcp_name_fails_closed():
 
 
 @pytest.mark.parametrize(
-    ("heartbeat", "unattributed", "reason"),
+    ("heartbeat", "unattributed", "unreadable", "reason"),
     [
-        ("2026-09-24T00:00:30Z", None, None),
-        ("2026-09-24T00:00:30Z", "2026-09-23T23:50:00Z", None),  # 11 min ago
-        ("2026-09-24T00:00:30Z", "2026-09-23T23:52:00Z", "UNATTRIBUTED_TRAFFIC"),
-        (None, None, "NO_HEARTBEAT"),
-        ("2026-09-23T23:58:00Z", None, None),  # exactly 3 min ago is still "the last 3 minutes"
-        ("2026-09-23T23:57:59Z", None, "NO_HEARTBEAT"),
-        ("2026-09-24T00:05:00Z", None, "NO_HEARTBEAT"),  # ahead of now by more than the window
+        ("2026-09-24T00:00:30Z", None, None, None),
+        ("2026-09-24T00:00:30Z", "2026-09-23T23:50:00Z", None, None),  # 11 min ago
+        ("2026-09-24T00:00:30Z", "2026-09-23T23:52:00Z", None, "UNATTRIBUTED_TRAFFIC"),
+        ("2026-09-24T00:00:30Z", None, "2026-09-23T23:52:00Z", "TOOL_CALLS_UNREADABLE"),
+        ("2026-09-24T00:00:30Z", None, "2026-09-23T23:50:00Z", None),
+        (None, None, None, "NO_HEARTBEAT"),
+        ("2026-09-23T23:58:00Z", None, None, None),  # exactly 3 min ago is still "the last 3 minutes"
+        ("2026-09-23T23:57:59Z", None, None, "NO_HEARTBEAT"),
+        ("2026-09-24T00:05:00Z", None, None, "NO_HEARTBEAT"),  # ahead of now by more than the window
     ],
 )
-def test_request_rules_need_a_heartbeat_and_no_recent_unattributed_traffic(heartbeat, unattributed, reason):
-    status = g.request_rules_status(now=NOW, last_heartbeat_at=heartbeat, last_unattributed_at=unattributed)
+def test_request_rules_need_a_heartbeat_and_no_recent_unattributed_or_unreadable_traffic(
+    heartbeat, unattributed, unreadable, reason
+):
+    status = g.request_rules_status(now=NOW, last_heartbeat_at=heartbeat, last_unattributed_at=unattributed,
+                                    last_tool_calls_unreadable_at=unreadable)
     for rule in g.REQUEST_RULES:
         assert status[rule]["state"] == ("unverified" if reason else "held")
         assert status[rule]["reason"] == reason
@@ -938,7 +954,8 @@ def test_the_state_roll_up(active, states, rows, expected):
 
 
 def test_no_asp_yet_leaves_the_asp_rules_unverified():
-    request = g.request_rules_status(now=NOW, last_heartbeat_at=NOW, last_unattributed_at=None)
+    request = g.request_rules_status(now=NOW, last_heartbeat_at=NOW, last_unattributed_at=None,
+                                     last_tool_calls_unreadable_at=None)
     states = g.rule_states(None, request)
     assert states["service_ports"]["reason"] == "NOT_COLLECTED"
     assert g.agent_state(has_active_guardrail=True, rule_results=states, counting_rows=0) == "unverified"
@@ -976,3 +993,188 @@ def test_a_row_counts_only_while_unacknowledged_and_disallowed_by_the_version_in
     assert not g.row_counts(guardrail(saved_files={"allowed": [{"path": "/data/*", "kinds": [".zip"]}]}), file_row)
     unknown = {"rule": "out_of_spec_calls", "item": "(unknown host)", "detail": {"kind": "host"}}
     assert g.row_counts(guardrail(), unknown)
+
+
+def test_a_float_port_passes_json_schema_alone_but_not_the_contract():
+    # JSON Schema's `integer` accepts 80.0; the code-side check is what refuses it.
+    value = _mutated(lambda v: v["rules"]["service_ports"]["allowed"].append({"protocol": "tcp", "port": 80.0}))
+    schema = json.loads((SCHEMAS / "guardrail-version-v1.schema.json").read_text(encoding="utf-8"))
+    Draft202012Validator(schema, format_checker=FormatChecker()).validate(value)
+    assert g.guardrail_problems(value) == ["rules.service_ports.allowed.1.port: must be an integer"]
+
+
+# ---------------------------------------- violated on evidence that isn't verified
+
+
+@pytest.mark.parametrize(
+    ("status", "now", "reason"),
+    [
+        ("ANSWERED", "2026-09-24T00:06:00Z", "STALE"),
+        ("PARTIAL", NOW, "PARTIAL"),
+    ],
+)
+def test_violations_on_unverified_evidence_leave_the_agent_unverified_once_acknowledged(
+    store, status, now, reason
+):
+    asp_id, bundle = stored(store, v1_bundle(observed_listeners=observed([DEMO_LISTENER, PORT_9000], status)))
+    result = g.evaluate_asp(guardrail(service_ports=SERVICE_PORTS_ALLOWED), bundle,
+                            asp_id=asp_id, previous_collected_at=PREVIOUS, now=now)
+    ports = result["rules"]["service_ports"]
+    assert (ports["state"], ports["reason"]) == ("violated", reason)
+    assert [v["item"] for v in ports["violations"]] == ["tcp/0.0.0.0/9000"]
+    states = dict(_states(), service_ports=ports)
+    # Rows still unacknowledged: Violated. Acknowledged: the evidence still
+    # never showed the rule held, so Unverified, never Held.
+    assert g.agent_state(has_active_guardrail=True, rule_results=states, counting_rows=1) == "violated"
+    assert g.agent_state(has_active_guardrail=True, rule_results=states, counting_rows=0) == "unverified"
+
+
+# ------------------------------------------------------- streamed tool calls
+
+
+def _sse_row(text: str | None = None, **response_headers) -> dict:
+    """RailMon's own streamed capture (copied from its
+    `tests/fixtures/runtime-interactions.jsonl`), with the event-stream text
+    it stored as `{"raw": text}` replaced when a case needs other events."""
+    [line] = (FIXTURES / "sse-capture.jsonl").read_text().splitlines()
+    interaction = json.loads(line)
+    response = interaction["raw"]["response"]
+    if text is not None:
+        response["body"] = {"raw": text}
+    response["headers"].update(response_headers)
+    return _row(interaction)
+
+
+def _stream(*events, done: bool = True) -> str:
+    lines = []
+    for event in events:
+        if isinstance(event, dict) and "type" in event:
+            lines.append(f"event: {event['type']}")
+        lines.append("data: " + (event if isinstance(event, str) else json.dumps(event)))
+        lines.append("")
+    if done:
+        lines.append("data: [DONE]")
+    return "\r\n".join(lines)
+
+
+ANTHROPIC_STREAM = [
+    {"type": "message_start", "message": {"id": "msg_1", "content": []}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_start", "index": 1,
+     "content_block": {"type": "tool_use", "id": "toolu_1", "name": "mcp__fs__upload_file", "input": {}}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{}"}},
+    {"type": "content_block_start", "index": 2,
+     "content_block": {"type": "tool_use", "id": "toolu_2", "name": "mcp__notion__search", "input": {}}},
+    {"type": "message_stop"},
+]
+OPENAI_CHAT_STREAM = [
+    {"choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [
+        {"index": 0, "id": "call_1", "type": "function",
+         "function": {"name": "mcp__fs__upload_file", "arguments": ""}}]}}]},
+    {"choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": "{}"}}]}}]},
+    {"choices": [{"index": 0, "delta": {"tool_calls": [
+        {"index": 1, "id": "call_2", "type": "function",
+         "function": {"name": "mcp__notion__search", "arguments": ""}}]}}]},
+    {"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+]
+OPENAI_RESPONSES_STREAM = [
+    {"type": "response.created", "response": {"id": "resp_1", "output": []}},
+    {"type": "response.output_item.added", "output_index": 0,
+     "item": {"type": "function_call", "id": "fc_1", "name": "mcp__fs__upload_file", "arguments": ""}},
+    {"type": "response.function_call_arguments.delta", "output_index": 0, "delta": "{}"},
+    {"type": "response.output_item.done", "output_index": 1,
+     "item": {"type": "function_call", "id": "fc_2", "name": "mcp__notion__search", "arguments": "{}"}},
+    {"type": "response.completed", "response": {"id": "resp_1"}},
+]
+
+
+@pytest.mark.parametrize(
+    "events", [ANTHROPIC_STREAM, OPENAI_CHAT_STREAM, OPENAI_RESPONSES_STREAM],
+    ids=["anthropic", "openai-chat", "openai-responses"],
+)
+def test_tool_calls_are_read_from_a_streamed_response(events):
+    row = _sse_row(_stream(*events))
+    assert g.requested_tool_calls(row) == {
+        "names": ["mcp__fs__upload_file", "mcp__notion__search"], "readable": True, "reason": None,
+    }
+    found = g.evaluate_request(guardrail(), row)
+    assert [(v["item"], v["evidence_class"]) for v in found["uploads"]] == [("mcp__fs__upload_file", "requested")]
+    assert [v["item"] for v in found["out_of_spec_calls"]] == ["api.anthropic.com", "mcp__fs", "mcp__notion"]
+    assert found["tool_calls"] == {"readable": True, "reason": None}
+
+
+@pytest.mark.parametrize(
+    "events", [ANTHROPIC_STREAM, OPENAI_CHAT_STREAM, OPENAI_RESPONSES_STREAM],
+    ids=["anthropic", "openai-chat", "openai-responses"],
+)
+def test_a_truncated_stream_yields_the_names_it_reached(events):
+    text = _stream(*events, done=False)
+    cut = text.index("mcp__notion__search") - 20  # mid-way through the second call's event
+    assert g.requested_tool_calls(_sse_row(text[:cut]))["names"] == ["mcp__fs__upload_file"]
+
+
+def test_railmons_own_streamed_capture_reads_as_asking_for_nothing():
+    # The fixture as RailMon stored it: a stream cut after its first line.
+    row = _sse_row()
+    assert json.loads(row["raw"])["raw"]["response"]["body"] == {"raw": "event: message_start"}
+    assert g.requested_tool_calls(row) == {"names": [], "readable": True, "reason": None}
+
+
+def test_a_non_streamed_responses_api_output_is_read():
+    row = _with_response_tools(capture()[0])
+    row["response"]["body"] = {"output": [
+        {"type": "message", "content": [{"type": "output_text", "text": "hi"}]},
+        {"type": "function_call", "name": "mcp__fs__upload_file", "arguments": "{}"},
+    ]}
+    assert g.requested_tool_calls(_row(row))["names"] == ["mcp__fs__upload_file"]
+
+
+@pytest.mark.parametrize(
+    ("row", "reason"),
+    [
+        pytest.param(lambda: _sse_row("data: " + "x" * g.MAX_SCANNED_RESPONSE_BYTES),
+                     "RESPONSE_TOO_LARGE", id="too large to scan"),
+        pytest.param(lambda: _sse_row(_stream({"type": "ping", "deep": "[" * 200 + "]" * 200}, "[" * 200 + "]" * 200)),
+                     "RESPONSE_UNSCANNABLE", id="an event past the depth bound"),
+        pytest.param(lambda: _sse_row(_stream(*ANTHROPIC_STREAM), **{"content-encoding": "gzip"}),
+                     "RESPONSE_ENCODED", id="compressed"),
+        pytest.param(lambda: {"host": "api.anthropic.com", "raw": "{not json"},
+                     "UNREADABLE_CAPTURE", id="row unreadable"),
+    ],
+)
+def test_a_response_that_cannot_be_scanned_is_flagged_not_held(row, reason):
+    found = g.evaluate_request(guardrail(), row())
+    assert found["tool_calls"] == {"readable": False, "reason": reason}
+    status = g.request_rules_status(now=NOW, last_heartbeat_at=NOW, last_unattributed_at=None,
+                                    last_tool_calls_unreadable_at=NOW)
+    states = g.rule_states({"multi_agent": False, "rules": {r: _states()[r] for r in g.ASP_RULES}}, status)
+    assert {r: states[r]["reason"] for r in g.REQUEST_RULES} == {r: "TOOL_CALLS_UNREADABLE" for r in g.REQUEST_RULES}
+    assert g.agent_state(has_active_guardrail=True, rule_results=states, counting_rows=0) == "unverified"
+
+
+def _nested(depth: int) -> dict:
+    value: dict = {"leaf": True}
+    for _ in range(depth - 1):
+        value = {"n": value}
+    return value
+
+
+def test_a_deeply_nested_request_body_cannot_hide_the_responses_tool_calls():
+    deep = _with_response_tools(capture()[0], "mcp__fs__upload_file")
+    deep["request"]["body"] = _nested(130)
+    row = _row(deep)
+    # Shown as a row, the whole capture is past the 128-level bound...
+    assert Store._safe_raw(row["raw"]) == g.UNSAFE_LEGACY_CAPTURE
+    # ...but its response is judged on its own, and the body still counts.
+    assert g.requested_tool_calls(row) == {"names": ["mcp__fs__upload_file"], "readable": True, "reason": None}
+    assert g.carries_body(row) is True
+    found = g.evaluate_request(guardrail(), row)
+    assert [v["item"] for v in found["uploads"]] == ["mcp__fs__upload_file"]
+
+
+def test_a_row_too_deep_to_parse_at_all_is_unreadable_not_empty():
+    deeper = _with_response_tools(capture()[0], "mcp__fs__upload_file")
+    deeper["request"]["body"] = _nested(g.MAX_STORED_ROW_DEPTH + 10)
+    assert g.requested_tool_calls(_row(deeper)) == {
+        "names": [], "readable": False, "reason": "UNREADABLE_CAPTURE",
+    }

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "urn:datrail:guardrail:guardrail-version:1",
   "title": "DatRail OSS Data Guardrail version v1",
-  "$comment": "One immutable guardrail version (DR-184 design section 4.2). Closed everywhere, with the four rule names fixed. Rules this schema cannot express are checked in code (raildash.guardrail.guardrail_problems): created_at is UTC, a host is already in its normalized form, and a local agent_key list is sorted.",
+  "$comment": "One immutable guardrail version (DR-184 design section 4.2). Closed everywhere, with the four rule names fixed. Rules this schema cannot express are checked in code (raildash.guardrail.guardrail_problems): created_at is UTC, a host is already in its normalized form, a port or max_request_bytes value is an integer and not a float such as 80.0 (which JSON Schema integer accepts), and a local agent_key list is sorted.",
   "type": "object",
   "additionalProperties": false,
   "required": ["guardrail_contract_version", "guardrail_version_id", "version", "created_at", "agent_identity", "derived_from", "rules"],
