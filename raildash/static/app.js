@@ -1363,7 +1363,9 @@ function restoreGuardrailView(body, before, focusKey) {
     const message = before.errors.get(guardrailKeyOf(node));
     if (message && node.nextElementSibling) setInlineStatus(node.nextElementSibling, message, "err");
   });
-  const focusable = [...body.querySelectorAll("button[data-key], select[data-key], summary")];
+  const focusable = [...body.querySelectorAll(
+    "button[data-key], select[data-key], textarea[data-key], summary"
+  )];
   let target = before.focused
     ? focusable.find((node) => guardrailKeyOf(node) === before.focused)
     : null;
