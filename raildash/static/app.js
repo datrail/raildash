@@ -983,6 +983,412 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
   if (focusTarget) focusTarget.focus();
 }
 
+/* ---------------------------------------------------------- Data Guardrail */
+
+// DR-184 M3: the Guardrail panel beside the alignment panel (railxia/docs
+// design/2026-10-07-data-guardrail, §4.5). Every route it calls needs the
+// local write token, the two reads included (§5), so in the static demo it
+// shows a note instead. Each action posts, then rebuilds this panel the way
+// the alignment panel's actions do.
+
+const GUARDRAIL_RULE_LABELS = {
+  service_ports: "Service ports",
+  saved_files: "Saved files",
+  uploads: "Uploads",
+  out_of_spec_calls: "Out-of-spec calls",
+};
+const GUARDRAIL_REASONS = {
+  NO_HEARTBEAT: "no collector heartbeat in the last 3 minutes",
+  UNATTRIBUTED_TRAFFIC: "a request couldn't be given to one agent in the last 10 minutes",
+  TOOL_CALLS_UNREADABLE: "a response's tool calls couldn't be read in the last 10 minutes",
+  CAPTURE_REFUSED: "a capture batch was refused in the last 10 minutes",
+  STALE: "the newest ASP is stale",
+  PARTIAL: "the evidence is partial, so a probe restart may have hidden an item",
+  NOT_COLLECTED: "not collected",
+  MALFORMED_EVIDENCE: "some evidence couldn't be read",
+  MULTI_AGENT: "a multi-agent sandbox, which isn't evaluated",
+  CHECK_FAILED: "a check failed; make a version active again to re-check",
+  BLIND: "not collected",
+  FAILED: "collection failed",
+};
+let lastGuardrailAnnouncement = "";
+
+function guardrailStatePresentation(name) {
+  const states = {
+    held: ["Held", "ok"],
+    violated: ["Violated", "fail"],
+    unverified: ["Unverified", "warn"],
+    no_guardrail: ["No guardrail", "neutral"],
+  };
+  return states[name] || ["Unverified", "warn"];
+}
+
+function guardrailReason(reason) {
+  return GUARDRAIL_REASONS[reason] || reason;
+}
+
+// One button that runs `action`, says what happened beside it, and rebuilds
+// the panel on success. `key` names it across rebuilds, so the panel's poll
+// can put keyboard focus back on the same button.
+function guardrailButton(label, action, { quiet = false, key = label } = {}) {
+  const wrap = el("span", "guardrail-action");
+  const button = el("button", quiet ? "btn btn-quiet" : "btn", label);
+  button.type = "button";
+  button.dataset.key = key;
+  const status = el("span", "asp-status-msg");
+  status.setAttribute("aria-live", "polite");
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    setInlineStatus(status, "Working…");
+    try {
+      await action();
+      setInlineStatus(status, "Done.", "ok");
+    } catch (error) {
+      setInlineStatus(status, error.message, "err");
+      button.disabled = false;
+    }
+  });
+  wrap.append(button, status);
+  return wrap;
+}
+
+function renderGuardrailRules(rules) {
+  const list = el("ul", "guardrail-rules");
+  Object.entries(GUARDRAIL_RULE_LABELS).forEach(([rule, label]) => {
+    const result = (rules || {})[rule] || {};
+    const item = el("li", `guardrail-rule guardrail-rule-${result.state || "unverified"}`);
+    item.append(el("strong", null, label), document.createTextNode(` ${result.state || "unverified"}`));
+    if (result.reason) item.append(el("span", "muted", ` — ${guardrailReason(result.reason)}`));
+    list.append(item);
+  });
+  return list;
+}
+
+function listOrNone(values, describe = (v) => v) {
+  return values && values.length ? values.map(describe).join(", ") : "none";
+}
+
+function describePort(entry) {
+  return `${entry.protocol}/${entry.addr || "any address"}/${entry.port}`;
+}
+
+function describeSavedFile(entry) {
+  const kinds = entry.kinds ? ` (${entry.kinds.join(", ")})` : "";
+  return `${entry.path}${entry.literal ? " (exact)" : ""}${kinds}`;
+}
+
+// What a version allows, rule by rule, in words.
+function renderGuardrailPolicy(rules) {
+  const dl = el("dl", "guardrail-policy");
+  const add = (term, text) => dl.append(el("dt", null, term), el("dd", null, text));
+  const caps = Object.entries(rules.uploads.max_request_bytes || {});
+  add("Uploads to", listOrNone(rules.uploads.allowed_hosts));
+  if (caps.length) add("Size caps", caps.map(([host, cap]) => `${host} ≤ ${fmtBytes(cap)}`).join(", "));
+  if (rules.uploads.denied_tool_calls.length) add("Denied tool calls", rules.uploads.denied_tool_calls.join(", "));
+  add("Saved files", listOrNone(rules.saved_files.allowed, describeSavedFile));
+  add("Service ports", listOrNone(rules.service_ports.allowed, describePort));
+  add("Hosts it may call", listOrNone(rules.out_of_spec_calls.allowed_hosts));
+  add("MCP servers", listOrNone(rules.out_of_spec_calls.allowed_mcp_servers));
+  return dl;
+}
+
+// The rules as JSON, editable, for Edit and for adopting an edited proposal.
+// The server checks them against the closed contract and says what's wrong.
+function renderRulesEditor(rules, buttonLabel, onSave) {
+  const details = el("details", "guardrail-editor");
+  details.dataset.key = `editor:${buttonLabel}`;
+  details.append(el("summary", null, buttonLabel));
+  const area = el("textarea");
+  area.setAttribute("aria-label", `${buttonLabel}: rules as JSON`);
+  area.rows = 14;
+  area.spellcheck = false;
+  area.value = JSON.stringify(rules, null, 2);
+  const save = guardrailButton("Save as a new version", async () => {
+    let parsed;
+    try {
+      parsed = JSON.parse(area.value);
+    } catch (error) {
+      throw new Error(`Not valid JSON: ${error.message}`);
+    }
+    await onSave(parsed);
+  });
+  details.append(area, save);
+  return details;
+}
+
+function renderGuardrailRow(row, refresh) {
+  const tr = el("tr");
+  if (row.counts) tr.dataset.counts = "true";
+  const item = el("td");
+  item.append(el("code", null, row.overflow ? `${row.count} more items` : row.item));
+  const status = row.overflow
+    ? (row.acknowledged ? "acknowledged" : "counts")
+    : row.allowed_by
+      ? `allowed by ${row.allowed_by}`
+      : row.acknowledged ? "acknowledged" : "counts";
+  const actions = el("td", "guardrail-row-actions");
+  if (!row.acknowledged && !row.allowed_by) {
+    actions.append(guardrailButton("Acknowledge", async () => {
+      await postJSON(`/api/guardrail-rows/${row.row_id}/acknowledge`, {});
+      refresh();
+    }, { quiet: true, key: `ack:${row.row_id}` }));
+  }
+  if (!row.overflow && !row.allowed_by) {
+    actions.append(guardrailButton("Allow this", async () => {
+      await postJSON(`/api/guardrail-rows/${row.row_id}/allow`, {});
+      refresh();
+    }, { quiet: true, key: `allow:${row.row_id}` }));
+  }
+  tr.append(
+    item,
+    el("td", null, row.evidence_class),
+    el("td", "num", row.overflow ? "—" : fmtInt(row.count)),
+    el("td", null, fmtDateTime(row.last_seen)),
+    el("td", "guardrail-row-status", status),
+    actions,
+  );
+  return tr;
+}
+
+function renderGuardrailRows(rows, refresh) {
+  const wrap = el("div", "guardrail-rows");
+  if (!rows.length) {
+    wrap.append(el("p", "muted", "No violations recorded."));
+    return wrap;
+  }
+  const groups = [...Object.keys(GUARDRAIL_RULE_LABELS), "(overflow)"];
+  groups.forEach((rule) => {
+    const inRule = rows.filter((row) => row.rule === rule);
+    if (!inRule.length) return;
+    const label = GUARDRAIL_RULE_LABELS[rule] || "Past the row cap";
+    wrap.append(el("h5", null, label));
+    if (rule === "(overflow)") {
+      wrap.append(el("p", "muted",
+        "Items past the open-row cap are counted here, not listed one by one, so a version " +
+        "change can't re-check them. This row keeps counting until it is acknowledged."));
+    }
+    const table = el("table", "guardrail-table");
+    const head = el("tr");
+    ["Item", "Class", "Count", "Last seen", "Status", ""].forEach((name) => head.append(el("th", null, name)));
+    const thead = el("thead");
+    thead.append(head);
+    const tbody = el("tbody");
+    inRule.forEach((row) => tbody.append(renderGuardrailRow(row, refresh)));
+    table.append(thead, tbody);
+    wrap.append(table);
+  });
+  return wrap;
+}
+
+function renderGuardrailProposal(proposal, refresh) {
+  const section = el("section", "asp-banner guardrail-proposal");
+  section.append(el("h4", null, "Adopt a guardrail for this agent?"));
+  if (!proposal.guardrail) {
+    section.append(el("p", "muted", `No guardrail can be proposed: ${guardrailReason(proposal.reason)}.`));
+    return section;
+  }
+  section.append(el("p", "muted",
+    "Proposed from the locked baseline: what it already did is allowed, and nothing is " +
+    "checked until you adopt it. Every line is shown so you can see what it approves."));
+  section.append(renderGuardrailPolicy(proposal.guardrail.rules));
+  const emptyBecause = Object.entries(proposal.empty_because || {});
+  if (emptyBecause.length) {
+    const notes = el("ul", "guardrail-notes");
+    emptyBecause.forEach(([where, why]) => {
+      const reason = why.reason || why.status;
+      notes.append(el("li", "muted",
+        `${where} is empty: ${guardrailReason(reason)}${why.note ? ` (${why.note})` : ""}`));
+    });
+    section.append(notes);
+  }
+  if (proposal.would_be_violations.length) {
+    section.append(el("p", null, "Under this proposal these would be violations; allow any you mean after adopting:"));
+    const list = el("ul", "guardrail-would-be");
+    proposal.would_be_violations.forEach((violation) => {
+      const item = el("li");
+      item.append(el("code", null, violation.item),
+        el("span", "muted", ` ${GUARDRAIL_RULE_LABELS[violation.rule] || violation.rule}, ${violation.evidence_class}`));
+      list.append(item);
+    });
+    section.append(list);
+  }
+  const path = `/api/alignments/${encodeURIComponent(proposal.alignment_version_id)}/guardrail`;
+  const actions = el("div", "asp-actions");
+  actions.append(guardrailButton("Adopt", async () => {
+    await postJSON(path, {});
+    refresh();
+  }));
+  section.append(actions);
+  section.append(renderRulesEditor(proposal.guardrail.rules, "Edit, then adopt", async (rules) => {
+    await postJSON(path, { rules });
+    refresh();
+  }));
+  return section;
+}
+
+function renderGuardrailOffers(agentRef, active, offers, refresh) {
+  const section = el("section", "guardrail-offers");
+  section.append(el("h5", null, `Declared since ${active.guardrail.version}`));
+  section.append(el("p", "muted",
+    "The agent's own configuration now declares these. They aren't allowed until you say so, " +
+    "and calls to them stay violations meanwhile."));
+  const list = el("ul");
+  offers.forEach((offer) => {
+    const item = el("li");
+    const body = { kind: offer.kind, value: offer.value };
+    const base = `/api/guardrails/${encodeURIComponent(agentRef)}/offers`;
+    item.append(el("code", null, offer.value), el("span", "muted", ` ${offer.kind === "host" ? "host" : "MCP server"} `));
+    item.append(guardrailButton("Allow this", async () => {
+      await postJSON(`${base}/allow`, body);
+      refresh();
+    }, { quiet: true, key: `offer-allow:${offer.kind}:${offer.value}` }));
+    item.append(guardrailButton("Dismiss", async () => {
+      await postJSON(`${base}/dismiss`, body);
+      refresh();
+    }, { quiet: true, key: `offer-dismiss:${offer.kind}:${offer.value}` }));
+    list.append(item);
+  });
+  section.append(list);
+  return section;
+}
+
+function renderGuardrailVersions(detail, refresh) {
+  const wrap = el("div", "asp-version-picker");
+  const select = el("select");
+  select.setAttribute("aria-label", "Guardrail version");
+  detail.versions.forEach((version) => {
+    const label = `${version.guardrail.version} (${version.created_by})${version.active ? " (active)" : ""}`;
+    const opt = el("option", null, label);
+    opt.value = version.guardrail.guardrail_version_id;
+    if (version.active) opt.selected = true;
+    select.append(opt);
+  });
+  wrap.append(select, guardrailButton("Switch", async () => {
+    await postJSON(`/api/guardrail-versions/${encodeURIComponent(select.value)}/switch`, {});
+    refresh();
+  }, { quiet: true }));
+  return wrap;
+}
+
+function renderGuardrailHistory(events) {
+  const details = el("details", "guardrail-history");
+  details.dataset.key = "history";
+  details.append(el("summary", null, `History (${events.length})`));
+  const list = el("ol");
+  events.forEach((event) => {
+    const words = [event.action.replaceAll("_", " ")];
+    if (event.detail.version) words.push(event.detail.version);
+    if (event.detail.item) words.push(event.detail.item);
+    list.append(el("li", null, `${fmtDateTime(event.at)} — ${words.join(" ")}`));
+  });
+  details.append(list);
+  return details;
+}
+
+// The panel's state changes without a click (a heartbeat lapses, a capture
+// arrives), so the poll rebuilds it even while it has focus, and puts focus
+// and open sections back by key. It holds off only while a rules editor is
+// open, so it never throws away an edit in progress.
+function guardrailViewState(body) {
+  const keyOf = (node) => {
+    const card = node.closest("[data-agent-ref]");
+    return card && node.dataset.key ? `${card.dataset.agentRef}|${node.dataset.key}` : null;
+  };
+  const focused = body.contains(document.activeElement) ? keyOf(document.activeElement) : null;
+  const open = new Set([...body.querySelectorAll("details[open]")].map(keyOf).filter(Boolean));
+  return { focused, open, keyOf };
+}
+
+async function loadGuardrails(focusKey = null) {
+  const body = $("guardrail-body");
+  if (focusKey === null && body.querySelector(".guardrail-editor[open]")) return;
+  if (staticDemo) {
+    body.replaceChildren(el("p", "muted", "The Data Guardrail is available in the live local dashboard."));
+    return;
+  }
+  const agents = await getJSONWithToken("/api/guardrails");
+  const details = await Promise.all(agents.map(
+    (agent) => getJSONWithToken(`/api/guardrails/${encodeURIComponent(agent.agent_ref)}`)
+  ));
+  const before = guardrailViewState(body);
+  body.replaceChildren();
+  if (!agents.length) {
+    body.append(el("p", "muted",
+      "Lock an alignment baseline above, and RailDash proposes a guardrail for that agent."));
+  }
+  details.forEach((detail) => {
+    const refresh = () => loadGuardrails(detail.agent_ref).catch((error) => console.error(error));
+    const card = el("article", "guardrail-card");
+    card.dataset.agentRef = detail.agent_ref;
+    const head = el("div", "asp-state-head");
+    const title = el("div");
+    title.append(el("h3", null, identityLabel(detail.agent_identity)));
+    if (detail.active) title.append(el("span", "asp-subject", `version ${detail.active.guardrail.version}`));
+    const [label, tone] = guardrailStatePresentation(detail.state);
+    head.append(title, el("span", `asp-state asp-state-${tone}`, label));
+    card.append(head);
+
+    if (detail.active) {
+      card.append(renderGuardrailRules(detail.rules));
+      card.append(el("p", "hint",
+        "Uploads and out-of-spec calls are judged on the TLS requests the collector captured; " +
+        "plain TCP, DNS or a stdio MCP server isn't seen."));
+      if (detail.offers.length) card.append(renderGuardrailOffers(detail.agent_ref, detail.active, detail.offers, refresh));
+      card.append(renderGuardrailRows(detail.rows, refresh));
+      const policy = el("details", "guardrail-active-policy");
+      policy.dataset.key = "policy";
+      policy.append(el("summary", null, `What ${detail.active.guardrail.version} allows`));
+      policy.append(renderGuardrailPolicy(detail.active.guardrail.rules));
+      card.append(policy);
+      const actions = el("div", "asp-actions");
+      actions.append(renderGuardrailVersions(detail, refresh));
+      actions.append(guardrailButton("Turn off", async () => {
+        await postJSON(`/api/guardrails/${encodeURIComponent(detail.agent_ref)}/turn-off`, {});
+        refresh();
+      }, { quiet: true }));
+      card.append(actions);
+      card.append(renderRulesEditor(detail.active.guardrail.rules, "Edit", async (rules) => {
+        await postJSON(
+          `/api/guardrail-versions/${encodeURIComponent(detail.active.guardrail.guardrail_version_id)}/edit`,
+          { rules }
+        );
+        refresh();
+      }));
+    } else {
+      if (detail.proposal) card.append(renderGuardrailProposal(detail.proposal, refresh));
+      else card.append(el("p", "muted", "Make a baseline active above to get a proposal."));
+      if (detail.versions.length) {
+        card.append(el("p", "muted", "A guardrail was turned off. Switch back to a version, or adopt a new one."));
+        card.append(renderGuardrailVersions(detail, refresh));
+      }
+      if (detail.rows.length) card.append(renderGuardrailRows(detail.rows, refresh));
+    }
+    if (detail.events.length) card.append(renderGuardrailHistory(detail.events));
+    body.append(card);
+  });
+  const announcement = details
+    .map((detail) => `${identityLabel(detail.agent_identity)}: ${guardrailStatePresentation(detail.state)[0]}`)
+    .join("; ");
+  if (announcement !== lastGuardrailAnnouncement) {
+    $("guardrail-status-announcement").textContent = announcement;
+    lastGuardrailAnnouncement = announcement;
+  }
+  body.querySelectorAll("details[data-key]").forEach((node) => {
+    if (before.open.has(before.keyOf(node)) && !node.classList.contains("guardrail-editor")) {
+      node.open = true;
+    }
+  });
+  const keyed = [...body.querySelectorAll("button[data-key]")];
+  let target = before.focused ? keyed.find((node) => before.keyOf(node) === before.focused) : null;
+  if (!target && (focusKey || before.focused)) {
+    // The button acted on is gone (its row was allowed, say): stay in its card.
+    const ref = focusKey || before.focused.split("|")[0];
+    const card = body.querySelector(`[data-agent-ref="${CSS.escape(ref)}"]`);
+    target = card && card.querySelector("button:not([disabled])");
+  }
+  if (target) target.focus();
+}
+
 function initAspUpload() {
   const zone = $("asp-upload");
   const input = $("asp-upload-input");
@@ -1882,6 +2288,7 @@ async function refresh() {
     renderActiveFilter();
     await Promise.all([
       loadOverview(), loadProfile(), loadLog(), loadUnattributed(), loadAspAlignments(),
+      loadGuardrails(),
     ]);
     await loadDrift();
     await loadFilterOptions();

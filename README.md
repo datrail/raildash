@@ -329,7 +329,10 @@ The Data Guardrail's contract (DR-184) is
 `raildash/schemas/guardrail-version-v1.schema.json`, and its pure evaluator
 is `raildash.guardrail`. Its storage and the two ingest hooks that call it
 are `raildash.guardrail_store`, served by the routes under "HTTP: the Data
-Guardrail" above; the Guardrail panel comes in a later change.
+Guardrail" above. The dashboard's Data Guardrail panel, beside the alignment
+panel, shows each agent's state and rows and offers every action: adopt the
+proposal (as is or edited), Allow this, Acknowledge, Allow or Dismiss a
+declared host, Edit, Switch and Turn off.
 
 Run `make asp-acceptance` for the deterministic replay, controlled-drift,
 version-switch, and incompatible-rule-pack flow. The clean-build and live demo

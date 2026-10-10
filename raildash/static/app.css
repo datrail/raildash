@@ -345,8 +345,8 @@ code { font-family: var(--mono); }
 
 .asp-alignment-body { display: grid; gap: 10px; padding: 13px; }
 .asp-empty { display: grid; gap: 8px; }
-.asp-empty h3, .asp-state-card h3 { font-size: 13px; }
-.asp-state-card {
+.asp-empty h3, .asp-state-card h3, .guardrail-card h3 { font-size: 13px; }
+.asp-state-card, .guardrail-card {
   display: grid; gap: 10px;
   padding: 12px;
   border: 1px solid var(--line-soft);
@@ -437,6 +437,50 @@ code { font-family: var(--mono); }
 .asp-inline-form input[type="text"] { width: 110px; }
 .asp-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .asp-version-picker { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+/* Data Guardrail (DR-184) ------------------------------------------------ */
+
+.guardrail-body { display: grid; gap: 10px; padding: 13px; }
+.guardrail-rules {
+  display: flex; flex-wrap: wrap; gap: 6px 14px;
+  margin: 0; padding: 0; list-style: none; font: 11px var(--mono);
+}
+.guardrail-rule strong { font-weight: 600; }
+.guardrail-rule-held strong { color: var(--ok); }
+.guardrail-rule-violated strong { color: var(--fail); }
+.guardrail-rule-unverified strong { color: var(--warn); }
+.guardrail-rows { display: grid; gap: 6px; }
+.guardrail-rows h5, .guardrail-offers h5 {
+  margin: 4px 0 0; color: var(--ink-faint);
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em;
+}
+.guardrail-table { width: 100%; border-collapse: collapse; font: 11px var(--mono); }
+.guardrail-table th, .guardrail-table td {
+  padding: 4px 6px; border-bottom: 1px solid var(--line-soft);
+  text-align: left; vertical-align: top; overflow-wrap: anywhere;
+}
+.guardrail-table th { color: var(--ink-faint); font-weight: 500; }
+.guardrail-table tr[data-counts="true"] .guardrail-row-status { color: var(--fail); }
+.guardrail-row-actions, .guardrail-action { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.guardrail-policy {
+  display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  gap: 3px 12px; margin: 0; font: 11px var(--mono);
+}
+.guardrail-policy dt { color: var(--ink-faint); }
+.guardrail-policy dd { margin: 0; overflow-wrap: anywhere; }
+.guardrail-offers ul, .guardrail-would-be, .guardrail-notes {
+  display: grid; gap: 4px; margin: 0; padding-left: 16px; font: 11px var(--mono);
+}
+.guardrail-editor summary, .guardrail-history summary, .guardrail-active-policy summary {
+  cursor: pointer; font-size: 12px; color: var(--ink-soft);
+}
+.guardrail-editor textarea {
+  display: block; width: 100%; margin: 6px 0; box-sizing: border-box;
+  font: 11px var(--mono); color: var(--ink); background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--r);
+}
+.guardrail-offers p, .guardrail-rows p { margin: 0; font-size: 11.5px; }
+.guardrail-history ol { margin: 6px 0 0; padding-left: 18px; font: 11px var(--mono); }
 
 .asp-diff-table { display: grid; gap: 8px; margin-top: 6px; }
 .asp-diff-row {
