@@ -126,13 +126,16 @@ def test_an_agent_with_a_baseline_and_no_guardrail_is_offered_the_proposal(store
     assert detail["rows"] == [] and store._db.execute("SELECT count(*) FROM guardrail_rows").fetchone()[0] == 0  # noqa: SLF001
 
 
-def test_a_database_with_no_guardrail_writes_nothing_on_either_ingest_path(store):
+def test_a_database_with_no_guardrail_judges_nothing_on_either_ingest_path(store):
+    """Only the ASP receipts are kept (so a guardrail adopted later knows how
+    fresh its evidence is); nothing is judged or recorded against anyone."""
     baseline(store)
     load(store, asp(listeners=[PORT_9000]))
     send(store, request("exfil.attacker.net"))
-    for table in ("guardrail_versions", "guardrail_bindings", "guardrail_rows",
-                  "guardrail_marks", "guardrail_events"):
+    for table in ("guardrail_versions", "guardrail_bindings", "guardrail_rows", "guardrail_events"):
         assert store._db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0, table  # noqa: SLF001
+    marks = {row[0] for row in store._db.execute("SELECT mark FROM guardrail_marks")}  # noqa: SLF001
+    assert marks and all(mark.startswith("asp_received") for mark in marks)
 
 
 # ---------------------------------------------------------- adopt and state
@@ -557,3 +560,60 @@ def test_allow_this_refuses_a_wildcard_host_the_agent_sent(store):
         row = rows(store, ref)[(rule, "*.com")]
         with pytest.raises(ValueError, match="wildcard"):
             store.allow_guardrail_row(row["row_id"])
+
+
+def test_a_re_sent_unchanged_asp_keeps_the_evidence_fresh(store):
+    """RailMon re-sends an unchanged agent's previous bundle, `collected_at`
+    and all (DR-157). Each delivery is fresh evidence, so the ASP rules stay
+    verified; without deliveries they go stale."""
+    value = asp()
+    alignment_asp = load(store, value)
+    made = store.make_baseline(alignment_asp, "v1.0")["alignment_version"]
+    identity = made["agent_identity"]
+    ref = agent_ref(identity["kind"], json.dumps(identity["value"], sort_keys=True, separators=(",", ":")))
+    store.adopt_guardrail(made["alignment_version_id"])
+    store.allow_guardrail_row(rows(store, ref)[("service_ports", "tcp/127.0.0.1/8443")]["row_id"])
+    old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(timespec="microseconds")
+    store._db.execute("UPDATE guardrail_marks SET at = ? WHERE mark LIKE 'asp_received%'",  # noqa: SLF001
+                      (old.replace("+00:00", "Z"),))
+    store._db.commit()  # noqa: SLF001
+    # The bundle's own collected_at is now; the last delivery is 3 h ago.
+    assert store.guardrail_detail(ref)["rules"]["service_ports"]["reason"] == g.STALE
+    # The scanner's next tick re-sends the very same bytes.
+    assert store.load_asp(raw(value))["replayed"]
+    later = datetime.now(timezone.utc) + timedelta(minutes=4)
+    assert store.guardrail_detail(ref, now=later)["rules"]["service_ports"] == {"state": "held", "reason": None}
+    # An unchanged agent whose bundle is hours old by collected_at, re-sent
+    # each minute, is still fresh.
+    value_old = dict(value, collected_at="2026-01-01T00:00:00Z", bundle_id="bnd-custody-old")
+    load(store, value_old)
+    store.load_asp(raw(value_old))
+    assert store.guardrail_detail(ref)["rules"]["service_ports"]["reason"] is None
+    # A re-sent *older* ASP isn't a receipt for the newest.
+    store._db.execute("UPDATE guardrail_marks SET at = ? WHERE mark LIKE 'asp_received%'",  # noqa: SLF001
+                      (old.replace("+00:00", "Z"),))
+    store._db.commit()  # noqa: SLF001
+    store.load_asp(raw(value))
+    assert store.guardrail_detail(ref)["rules"]["service_ports"]["reason"] == g.STALE
+
+
+def test_without_a_receipt_for_the_newest_asp_staleness_reads_collected_at(store):
+    """A database from before receipts, or one whose receipts were for an
+    ASP since pruned: the design's own rule, on `collected_at`."""
+    value = asp()
+    value["collected_at"] = "2026-01-01T00:00:00Z"
+    made = store.make_baseline(load(store, value), "v1.0")["alignment_version"]
+    identity = made["agent_identity"]
+    ref = agent_ref(identity["kind"], json.dumps(identity["value"], sort_keys=True, separators=(",", ":")))
+    store.adopt_guardrail(made["alignment_version_id"])
+    assert store.guardrail_detail(ref)["rules"]["saved_files"]["reason"] is None  # fresh by receipt
+    store._db.execute("DELETE FROM guardrail_marks")  # noqa: SLF001
+    store._db.commit()  # noqa: SLF001
+    assert store.guardrail_detail(ref)["rules"]["saved_files"]["reason"] == g.STALE
+    # A receipt left for another ASP doesn't count for the newest one.
+    store._db.execute(  # noqa: SLF001
+        "INSERT INTO guardrail_marks VALUES (?, ?, 'asp_received@asp-gone', ?)",
+        (identity["kind"], json.dumps(identity["value"], sort_keys=True, separators=(",", ":")), _now()),
+    )
+    store._db.commit()  # noqa: SLF001
+    assert store.guardrail_detail(ref)["rules"]["saved_files"]["reason"] == g.STALE

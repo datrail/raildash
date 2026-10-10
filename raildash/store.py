@@ -796,6 +796,7 @@ class Store(GuardrailCustody):
                     raise ValueError(
                         "exact bundle is already stored under a different agent identity"
                     )
+                self._guardrail_asp_received(existing["asp_id"], identity_kind, identity_value)
                 return self._asp_summary(existing, replayed=True)
             collision = self._db.execute(
                 "SELECT digest FROM asps WHERE bundle_id = ?", (bundle["bundle_id"],)
@@ -827,6 +828,7 @@ class Store(GuardrailCustody):
                 ),
             )
             self._compare_active_locked(asp_id, raw, identity_kind, identity_value)
+            self._guardrail_asp_received(asp_id, identity_kind, identity_value)
             self._guardrail_on_asp(asp_id, bundle, identity_kind, identity_value)
             self._prune_asp_history_locked(**self._retention_locked())
             row = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()

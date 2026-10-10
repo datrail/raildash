@@ -16,11 +16,13 @@ is the pure contract and evaluator (M1); this is where its results are kept:
   an acknowledged row is deleted once its last hit is older than the
   retention. Both numbers are settings (`RAILDASH_GUARDRAIL_MAX_OPEN_ROWS`,
   `RAILDASH_GUARDRAIL_ACK_RETENTION_DAYS`).
-- **Marks** (`guardrail_marks`) are the receive times the request rules'
-  liveness reads besides the heartbeat and refusal tables M0 added: the last
-  authenticated request that couldn't be given to one agent (every agent's),
-  and the last request of an agent whose response's tool calls couldn't be
-  read (that agent's).
+- **Marks** (`guardrail_marks`) are receive times. The request rules'
+  liveness reads two besides the heartbeat and refusal tables M0 added: the
+  last authenticated request that couldn't be given to one agent (every
+  agent's), and the last request of an agent whose response's tool calls
+  couldn't be read (that agent's). The ASP rules' staleness reads the last
+  two deliveries of each agent's newest ASP, which are kept for every agent
+  with or without a guardrail, so one adopted later is fresh at once.
 - **Events** (`guardrail_events`) are the visible history of every
   token-gated action, switches, turn-offs and acknowledgements included,
   which leave no version behind.
@@ -31,6 +33,19 @@ code: `_guardrail_on_asp` from `Store.load_asp`, `_guardrail_on_request` from
 `Store.add_interactions`. Neither takes the store's lock; their callers hold
 it. The state (`guardrail_detail`) is computed when read, because the
 staleness and liveness windows depend on the time of the read.
+
+**One deviation from the design.** §4.3 judges staleness on the newest
+ASP's `collected_at`. RailMon re-sends an unchanged agent's previous bundle
+with the time its content was first collected (DR-157), which RailDash
+stores once, so that rule made every unchanged agent's ASP rules Unverified
+within minutes. Here every delivery of the agent's newest ASP, a re-send
+included, is a receipt keyed by that ASP, and the bound is three times the
+gap between its last two receipts: §4.3's rule, on deliveries. A re-send is
+fresh evidence because RailMon reuses a bundle only when a fresh scan found
+the same content; a dead probe turns its attribute `PARTIAL`, which is new
+content. The cost: a token holder re-loading an old bundle by hand keeps it
+fresh. Without a receipt for the newest ASP (a database from before them),
+`collected_at` is used, as in the design.
 
 Where the design is silent this module chooses:
 
@@ -89,6 +104,11 @@ EVERY_AGENT = ("", "")
 MARK_UNATTRIBUTED = "unattributed"
 MARK_TOOL_CALLS_UNREADABLE = "tool_calls_unreadable"
 MARK_CHECK_FAILED = "check_failed"
+# Each keyed by the ASP it is a delivery of (`asp_received@<asp_id>`), so a
+# receipt never vouches for another ASP, say once the one it was for is
+# pruned.
+MARK_ASP_RECEIVED = "asp_received@{}"
+MARK_ASP_RECEIVED_BEFORE = "asp_received_before@{}"
 
 GUARDRAIL_SCHEMA = """
 -- DR-184 M2: guardrail custody (design §4.2/§4.5). Additive: a database
@@ -436,6 +456,29 @@ class GuardrailCustody:
             "acknowledged": row["acknowledged_at"] is not None,
             "acknowledged_at": row["acknowledged_at"],
         }
+
+    def _guardrail_asp_received(self, asp_id: str, kind: str, value: str) -> None:
+        """Record one delivery of an ASP, new or re-sent, if it is the
+        agent's newest: the receipt the staleness check reads. Called by
+        `Store.load_asp` inside its write transaction."""
+        newest = self._newest_asps(kind, value)
+        if not newest or newest[0]["asp_id"] != asp_id:
+            return  # a re-sent older ASP says nothing about the newest
+        last = self._mark_at(kind, value, MARK_ASP_RECEIVED.format(asp_id))
+        # Only the newest ASP's receipts are kept.
+        self._db.execute(
+            "DELETE FROM guardrail_marks WHERE identity_kind = ? AND identity_value = ? "
+            "AND mark LIKE 'asp\\_received%' ESCAPE '\\' AND mark NOT LIKE ?",
+            (kind, value, f"%@{asp_id}"),
+        )
+        if last is not None:
+            self._db.execute(
+                """INSERT INTO guardrail_marks (identity_kind, identity_value, mark, at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(identity_kind, identity_value, mark) DO UPDATE SET at = excluded.at""",
+                (kind, value, MARK_ASP_RECEIVED_BEFORE.format(asp_id), last),
+            )
+        self._mark(kind, value, MARK_ASP_RECEIVED.format(asp_id), self._receive_time())
 
     # -------------------------------------------------------------- hooks
 
@@ -841,11 +884,16 @@ class GuardrailCustody:
         newest = self._newest_asps(kind, value)
         asp_result = None
         if newest:
+            newest_id = newest[0]["asp_id"]
+            received = self._mark_at(kind, value, MARK_ASP_RECEIVED.format(newest_id))
+            if received is not None:
+                previous = self._mark_at(kind, value, MARK_ASP_RECEIVED_BEFORE.format(newest_id))
+            else:
+                previous = newest[1]["collected_at"] if len(newest) > 1 else None
             asp_result = g.evaluate_asp(
                 contract, parse_bundle(bytes(newest[0]["exact_bundle"])),
-                asp_id=newest[0]["asp_id"],
-                previous_collected_at=newest[1]["collected_at"] if len(newest) > 1 else None,
-                now=current,
+                asp_id=newest[0]["asp_id"], previous_collected_at=previous, now=current,
+                newest_received_at=received,
             )
         request_status = g.request_rules_status(
             now=current,

@@ -927,7 +927,9 @@ def asp_is_stale(
     now: datetime | str,
 ) -> bool:
     """§4.3: older than three times the gap between the two newest ASPs,
-    bounded to [5 min, 2 h]; with only one ASP, 2 h."""
+    bounded to [5 min, 2 h]; with only one ASP, 2 h. The two times may be
+    the last two deliveries of the newest ASP instead of collection times
+    (`evaluate_asp`'s `newest_received_at`); the rule is the same."""
     newest = _required_instant(newest_collected_at, "newest_collected_at")
     current = _required_instant(now, "now")
     previous = _instant(previous_collected_at)
@@ -945,8 +947,15 @@ def evaluate_asp(
     asp_id: str,
     previous_collected_at: datetime | str | None,
     now: datetime | str,
+    newest_received_at: datetime | str | None = None,
 ) -> dict[str, Any]:
     """`service_ports` and `saved_files` against the newest parsed ASP.
+
+    Staleness is judged on `newest_received_at` when the caller knows it,
+    else on the bundle's own `collected_at`; `previous_collected_at` is then
+    the delivery before it. RailMon re-sends an unchanged agent's previous
+    bundle, `collected_at` and all (DR-157), so a fresh delivery of old
+    bytes is fresh evidence that nothing changed.
 
     `bundle` is what `raildash.asp.parse_bundle` returns for the stored
     bytes; the caller has matched its identity to the guardrail's.
@@ -971,7 +980,7 @@ def evaluate_asp(
                 for rule in RULES
             },
         }
-    stale = asp_is_stale(bundle["collected_at"], previous_collected_at, now)
+    stale = asp_is_stale(newest_received_at or bundle["collected_at"], previous_collected_at, now)
     attributes = _attributes(bundle)
     source = {"kind": "asp", "id": asp_id}
     rules = guardrail["rules"]
