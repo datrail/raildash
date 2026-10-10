@@ -210,12 +210,13 @@ malformed or unresolvable bundle.
 `state`/`drift`, and `GET /api/settings/asp-retention` are unauthenticated,
 redacted metadata (counts, change names and field names, never evidence
 values or digests). Everything that mutates
-custody state, plus the four reads that carry exact evidence
+custody state, plus the five reads that carry exact evidence
 (`GET /api/asps/{asp_id}/bundle`, `GET /api/asps/{asp_id}/raw`,
 `GET /api/asps/{asp_id}/drift/explained`,
 which is the per-attribute old/new/tier detail the dashboard shows under a
 drifted ASP's change list, and `GET /api/profile/kernel-file-access`, described under
-"Files: asked and kernel-observed" above), requires a local write token as
+"Files: asked and kernel-observed" above, and a guardrail's detail, described
+under "HTTP: the Data Guardrail" below), requires a local write token as
 an `X-RailDash-Token` header:
 
 | Route | CLI equivalent |
@@ -260,6 +261,32 @@ opt-in to reach RailDash from another host, and the token requirement still
 applies unchanged — exposing the port does not by itself expose the write
 routes.
 
+### HTTP: the Data Guardrail
+
+DR-184's guardrail checks every ASP and every authenticated capture of an
+agent against four rules the user adopted: allowed uploads, saved-file
+kinds, no service ports, and no out-of-spec calls (design:
+railxia/docs `design/2026-10-07-data-guardrail`). The store checks them as
+evidence arrives, whichever way it arrives. Every guardrail route needs the
+token, including both reads:
+
+| Route | What it does |
+| --- | --- |
+| `GET /api/guardrails` | each agent's state (`held`, `violated`, `unverified`, `no_guardrail`), without item values |
+| `GET /api/guardrails/{agent_ref}` | state, rows, *declared since gN* offers, versions, history, and the proposal before one is adopted |
+| `POST /api/alignments/{id}/guardrail` `{}` or `{"rules": {...}}` | Adopt the proposal, or the proposal as edited |
+| `POST /api/guardrail-versions/{id}/edit` `{"rules": {...}}` | Edit: a new version from the active one |
+| `POST /api/guardrail-versions/{id}/switch` | Switch to an earlier version |
+| `POST /api/guardrails/{agent_ref}/turn-off` | Turn off (No guardrail) |
+| `POST /api/guardrail-rows/{row_id}/acknowledge` | Acknowledge a row; a later hit re-opens it |
+| `POST /api/guardrail-rows/{row_id}/allow` | Allow this: a new version that allows the row's item |
+| `POST /api/guardrails/{agent_ref}/offers/allow` or `.../dismiss` `{"kind": "host", "value": "..."}` | Allow or dismiss a newly declared host or MCP server |
+
+`RAILDASH_GUARDRAIL_MAX_OPEN_ROWS` (default 1000) caps the unacknowledged
+rows per agent before further items count in one overflow row, and
+`RAILDASH_GUARDRAIL_ACK_RETENTION_DAYS` (default 30) is how long an
+acknowledged row is kept after its last hit.
+
 ### Multi-agent collections (evidence bundle v2)
 
 RailMon run with `--target-manifest` delivers one evidence-bundle v2
@@ -300,8 +327,9 @@ and `raildash/schemas/`.
 
 The Data Guardrail's contract (DR-184) is
 `raildash/schemas/guardrail-version-v1.schema.json`, and its pure evaluator
-is `raildash.guardrail`. Nothing calls it yet: storage, routes and the
-Guardrail panel come in later changes.
+is `raildash.guardrail`. Its storage and the two ingest hooks that call it
+are `raildash.guardrail_store`, served by the routes under "HTTP: the Data
+Guardrail" above; the Guardrail panel comes in a later change.
 
 Run `make asp-acceptance` for the deterministic replay, controlled-drift,
 version-switch, and incompatible-rule-pack flow. The clean-build and live demo

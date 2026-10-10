@@ -272,6 +272,189 @@ paths:
         '404': {description: No such ASP}
         '409': {description: A version label is needed, or that label already exists for this agent identity}
 
+  /api/guardrails:
+    get:
+      operationId: listGuardrails
+      summary: Every agent with a baseline or a guardrail, and its Data Guardrail state
+      description: |
+        Token-gated (DR-184), like every guardrail route: states (`held`,
+        `violated`, `unverified`, `no_guardrail`), each rule's state and
+        reason, the active version's label and the number of counting rows.
+        No hosts, paths or ports.
+      parameters:
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: One entry per agent, with its opaque `agent_ref`}
+        '403': {description: Missing or invalid X-RailDash-Token}
+
+  /api/guardrails/{agent_ref}:
+    get:
+      operationId: getGuardrail
+      summary: One agent's guardrail with its rows, offers, versions and history
+      description: |
+        Token-gated (DR-184): the rows name hosts, paths and ports. Carries the
+        §4.4 proposal while the agent has a baseline and no guardrail.
+      parameters:
+        - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: The agent's guardrail}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such agent}
+
+  /api/alignments/{alignment_version_id}/guardrail:
+    post:
+      operationId: adoptGuardrail
+      summary: Adopt the proposal from this baseline, or the proposal as edited
+      description: Token-gated (DR-184).
+      parameters:
+        - {name: alignment_version_id, in: path, required: true, schema: {type: string, minLength: 1}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rules: {type: object, description: "A whole version's `rules` (raildash/schemas/guardrail-version-v1.schema.json)"}
+      responses:
+        '201': {description: The first version, now active}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such id}
+        '409': {description: The agent's current state refuses this action}
+        '422': {description: The rules break the guardrail contract}
+
+  /api/guardrail-versions/{guardrail_version_id}/edit:
+    post:
+      operationId: editGuardrail
+      summary: A new version from the active one
+      description: Token-gated (DR-184).
+      parameters:
+        - {name: guardrail_version_id, in: path, required: true, schema: {type: string, minLength: 1}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rules]
+              properties:
+                rules: {type: object, description: "A whole version's `rules` (raildash/schemas/guardrail-version-v1.schema.json)"}
+      responses:
+        '201': {description: The new version, now active}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such id}
+        '409': {description: The agent's current state refuses this action}
+        '422': {description: The rules break the guardrail contract}
+
+  /api/guardrail-versions/{guardrail_version_id}/switch:
+    post:
+      operationId: switchGuardrail
+      summary: Make an existing version the active one
+      description: Token-gated (DR-184).
+      parameters:
+        - {name: guardrail_version_id, in: path, required: true, schema: {type: string, minLength: 1}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: The version now active}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such id}
+
+  /api/guardrails/{agent_ref}/turn-off:
+    post:
+      operationId: turnOffGuardrail
+      summary: Clear the active pointer (No guardrail); versions and rows stay
+      description: Token-gated (DR-184).
+      parameters:
+        - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: The agent has no guardrail}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such id}
+        '409': {description: The agent's current state refuses this action}
+
+  /api/guardrail-rows/{row_id}/acknowledge:
+    post:
+      operationId: acknowledgeGuardrailRow
+      summary: Mark one row seen up to now; a later hit re-opens it
+      description: Token-gated (DR-184).
+      parameters:
+        - {name: row_id, in: path, required: true, schema: {type: integer, minimum: 1, maximum: 9223372036854775807}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200': {description: The row}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such id}
+        '422': {description: row_id outside 1..2^63-1}
+
+  /api/guardrail-rows/{row_id}/allow:
+    post:
+      operationId: allowGuardrailRow
+      summary: Allow this - a new version with the row's item allowed
+      description: Token-gated (DR-184).
+      parameters:
+        - {name: row_id, in: path, required: true, schema: {type: integer, minimum: 1, maximum: 9223372036854775807}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '201': {description: The new version, now active}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such id}
+        '409': {description: The row can't be allowed with one click (overflow, unknown or wildcard host, over a size cap) or no guardrail is active}
+        '422': {description: row_id outside 1..2^63-1, or the version this would create breaks the guardrail contract (e.g. an over-long host or path)}
+
+  /api/guardrails/{agent_ref}/offers/allow:
+    post:
+      operationId: allowDeclaredOffer
+      summary: Allow a host or MCP server declared since the version in force
+      description: Token-gated (DR-184).
+      parameters:
+        - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, value]
+              properties:
+                kind: {type: string, enum: [host, mcp_server]}
+                value: {type: string}
+      responses:
+        '201': {description: The new version, now active}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such id}
+        '409': {description: Not a current declared offer}
+        '422': {description: The version this would create breaks the guardrail contract (e.g. an over-long host or path)}
+
+  /api/guardrails/{agent_ref}/offers/dismiss:
+    post:
+      operationId: dismissDeclaredOffer
+      summary: Dismiss a declared offer; it isn't offered again
+      description: Token-gated (DR-184).
+      parameters:
+        - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind, value]
+              properties:
+                kind: {type: string, enum: [host, mcp_server]}
+                value: {type: string}
+      responses:
+        '201': {description: The new version, now active}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such id}
+        '409': {description: Not a current declared offer}
+        '422': {description: The version this would create breaks the guardrail contract (e.g. an over-long host or path)}
+
   /api/settings/asp-retention:
     get:
       operationId: getAspRetention
@@ -659,9 +842,9 @@ components:
       description: |
         The local write token: `RAILDASH_TOKEN` if set, otherwise the contents
         of `<db path>.token` (0600), which RailDash creates on first start and
-        reuses across restarts. Required on every write route and on the four
-        reads that carry exact evidence (`bundle`, `raw`, `drift/explained`,
-        `profile/kernel-file-access`).
+        reuses across restarts. Required on every write route, on every
+        guardrail route, and on the four reads that carry exact evidence
+        (`bundle`, `raw`, `drift/explained`, `profile/kernel-file-access`).
       schema: {type: string}
     RailDashCaptureToken:
       name: X-RailDash-Token
