@@ -29,7 +29,7 @@ let staticDataPromise = null;
 // DR-120: the local write token RailDash injects into the page it
 // serves (see app.py's `index()`/`require_local_token`). Every write route,
 // plus the reads that carry exact evidence (bundle, raw, drift-explained,
-// kernel-observed files),
+// kernel-observed files) and both Data Guardrail reads (DR-184),
 // check this header; a cross-site page cannot read it because it cannot read
 // this page's own DOM.
 const LOCAL_TOKEN = (() => {
@@ -1012,6 +1012,13 @@ const GUARDRAIL_REASONS = {
   FAILED: "collection failed",
 };
 let lastGuardrailAnnouncement = "";
+// What the panel last drew, so a poll that changes nothing leaves it alone
+// (the picker's choice, an error message and focus all survive); a counter
+// so a load that started before another finished never draws over it; and
+// how many actions are in flight, during which the poll holds off.
+let lastGuardrailRender = "";
+let guardrailGeneration = 0;
+let guardrailBusy = 0;
 
 function guardrailStatePresentation(name) {
   const states = {
@@ -1039,6 +1046,7 @@ function guardrailButton(label, action, { quiet = false, key = label } = {}) {
   status.setAttribute("aria-live", "polite");
   button.addEventListener("click", async () => {
     button.disabled = true;
+    guardrailBusy += 1;
     setInlineStatus(status, "Working…");
     try {
       await action();
@@ -1046,6 +1054,8 @@ function guardrailButton(label, action, { quiet = false, key = label } = {}) {
     } catch (error) {
       setInlineStatus(status, error.message, "err");
       button.disabled = false;
+    } finally {
+      guardrailBusy -= 1;
     }
   });
   wrap.append(button, status);
@@ -1103,6 +1113,7 @@ function renderRulesEditor(rules, buttonLabel, onSave) {
   area.rows = 14;
   area.spellcheck = false;
   area.value = JSON.stringify(rules, null, 2);
+  area.dataset.key = `editor-text:${buttonLabel}`;
   const save = guardrailButton("Save as a new version", async () => {
     let parsed;
     try {
@@ -1110,22 +1121,36 @@ function renderRulesEditor(rules, buttonLabel, onSave) {
     } catch (error) {
       throw new Error(`Not valid JSON: ${error.message}`);
     }
-    await onSave(parsed);
-  });
+    await onSave(parsed, () => { details.open = false; });
+  }, { key: `editor-save:${buttonLabel}` });
   details.append(area, save);
   return details;
 }
 
-function renderGuardrailRow(row, refresh) {
+// Whether **Allow this** can work on a row: the server refuses the overflow
+// row, a request with no host, a wildcard host (the agent's own Host header)
+// and a tool name with no MCP server, and nothing is allowed without an
+// active version. An upload over a size cap is refused too, with a reason.
+function guardrailRowAllowable(row, hasActive) {
+  if (!hasActive || row.overflow || row.allowed_by) return false;
+  if (row.item === "(unknown host)") return false;
+  const hostRow = row.detail.kind === "host"
+    || (row.rule === "out_of_spec_calls" && row.detail.kind !== "mcp_server");
+  if (hostRow && row.item.includes("*")) return false;
+  if (row.detail.kind === "mcp_server" && !row.detail.server) return false;
+  return true;
+}
+
+function renderGuardrailRow(row, refresh, hasActive) {
   const tr = el("tr");
   if (row.counts) tr.dataset.counts = "true";
   const item = el("td");
   item.append(el("code", null, row.overflow ? `${row.count} more items` : row.item));
-  const status = row.overflow
-    ? (row.acknowledged ? "acknowledged" : "counts")
-    : row.allowed_by
-      ? `allowed by ${row.allowed_by}`
-      : row.acknowledged ? "acknowledged" : "counts";
+  // The server's own verdict: a row counts only while unacknowledged and
+  // disallowed by the version in force, so none counts with no guardrail.
+  const status = row.allowed_by
+    ? `allowed by ${row.allowed_by}`
+    : row.acknowledged ? "acknowledged" : row.counts ? "counts" : "not counting";
   const actions = el("td", "guardrail-row-actions");
   if (!row.acknowledged && !row.allowed_by) {
     actions.append(guardrailButton("Acknowledge", async () => {
@@ -1133,7 +1158,7 @@ function renderGuardrailRow(row, refresh) {
       refresh();
     }, { quiet: true, key: `ack:${row.row_id}` }));
   }
-  if (!row.overflow && !row.allowed_by) {
+  if (guardrailRowAllowable(row, hasActive)) {
     actions.append(guardrailButton("Allow this", async () => {
       await postJSON(`/api/guardrail-rows/${row.row_id}/allow`, {});
       refresh();
@@ -1150,7 +1175,7 @@ function renderGuardrailRow(row, refresh) {
   return tr;
 }
 
-function renderGuardrailRows(rows, refresh) {
+function renderGuardrailRows(rows, refresh, hasActive) {
   const wrap = el("div", "guardrail-rows");
   if (!rows.length) {
     wrap.append(el("p", "muted", "No violations recorded."));
@@ -1173,7 +1198,7 @@ function renderGuardrailRows(rows, refresh) {
     const thead = el("thead");
     thead.append(head);
     const tbody = el("tbody");
-    inRule.forEach((row) => tbody.append(renderGuardrailRow(row, refresh)));
+    inRule.forEach((row) => tbody.append(renderGuardrailRow(row, refresh, hasActive)));
     table.append(thead, tbody);
     wrap.append(table);
   });
@@ -1195,7 +1220,7 @@ function renderGuardrailProposal(proposal, refresh) {
   if (emptyBecause.length) {
     const notes = el("ul", "guardrail-notes");
     emptyBecause.forEach(([where, why]) => {
-      const reason = why.reason || why.status;
+      const reason = why.reason || why.status || "NOT_COLLECTED";
       notes.append(el("li", "muted",
         `${where} is empty: ${guardrailReason(reason)}${why.note ? ` (${why.note})` : ""}`));
     });
@@ -1219,8 +1244,9 @@ function renderGuardrailProposal(proposal, refresh) {
     refresh();
   }));
   section.append(actions);
-  section.append(renderRulesEditor(proposal.guardrail.rules, "Edit, then adopt", async (rules) => {
+  section.append(renderRulesEditor(proposal.guardrail.rules, "Edit, then adopt", async (rules, close) => {
     await postJSON(path, { rules });
+    close();
     refresh();
   }));
   return section;
@@ -1256,6 +1282,7 @@ function renderGuardrailVersions(detail, refresh) {
   const wrap = el("div", "asp-version-picker");
   const select = el("select");
   select.setAttribute("aria-label", "Guardrail version");
+  select.dataset.key = "versions";
   detail.versions.forEach((version) => {
     const label = `${version.guardrail.version} (${version.created_by})${version.active ? " (active)" : ""}`;
     const opt = el("option", null, label);
@@ -1266,7 +1293,7 @@ function renderGuardrailVersions(detail, refresh) {
   wrap.append(select, guardrailButton("Switch", async () => {
     await postJSON(`/api/guardrail-versions/${encodeURIComponent(select.value)}/switch`, {});
     refresh();
-  }, { quiet: true }));
+  }, { quiet: true, key: "switch" }));
   return wrap;
 }
 
@@ -1285,34 +1312,87 @@ function renderGuardrailHistory(events) {
   return details;
 }
 
-// The panel's state changes without a click (a heartbeat lapses, a capture
-// arrives), so the poll rebuilds it even while it has focus, and puts focus
-// and open sections back by key. It holds off only while a rules editor is
-// open, so it never throws away an edit in progress.
+// The panel redraws when what it shows changes, even with focus inside,
+// since the state changes without a click (a heartbeat lapses, a capture
+// arrives). A redraw puts back, by key, focus, open sections, the version
+// picker's choice and an open editor's text. The poll holds off while an
+// editor is open (it would move the caret) and while an action runs.
+function guardrailKeyOf(node) {
+  const card = node.closest("[data-agent-ref]");
+  let key = node.dataset.key;
+  if (!key && node.tagName === "SUMMARY" && node.parentElement.dataset.key) {
+    key = `${node.parentElement.dataset.key}>summary`;
+  }
+  return card && key ? `${card.dataset.agentRef}|${key}` : null;
+}
+
 function guardrailViewState(body) {
-  const keyOf = (node) => {
-    const card = node.closest("[data-agent-ref]");
-    return card && node.dataset.key ? `${card.dataset.agentRef}|${node.dataset.key}` : null;
+  const keyed = (selector) => [...body.querySelectorAll(selector)]
+    .map((node) => [guardrailKeyOf(node), node])
+    .filter(([key]) => key);
+  return {
+    focused: body.contains(document.activeElement) ? guardrailKeyOf(document.activeElement) : null,
+    open: new Set(keyed("details[open]").map(([key]) => key)),
+    values: new Map(keyed("select[data-key], details[open] textarea[data-key]")
+      .map(([key, node]) => [key, node.value])),
   };
-  const focused = body.contains(document.activeElement) ? keyOf(document.activeElement) : null;
-  const open = new Set([...body.querySelectorAll("details[open]")].map(keyOf).filter(Boolean));
-  return { focused, open, keyOf };
+}
+
+function restoreGuardrailView(body, before, focusKey) {
+  body.querySelectorAll("details[data-key]").forEach((node) => {
+    if (before.open.has(guardrailKeyOf(node))) node.open = true;
+  });
+  body.querySelectorAll("select[data-key], textarea[data-key]").forEach((node) => {
+    const value = before.values.get(guardrailKeyOf(node));
+    if (value === undefined) return;
+    if (node.tagName === "SELECT" && ![...node.options].some((opt) => opt.value === value)) return;
+    node.value = value;
+  });
+  const focusable = [...body.querySelectorAll("button[data-key], select[data-key], summary")];
+  let target = before.focused
+    ? focusable.find((node) => guardrailKeyOf(node) === before.focused)
+    : null;
+  if (!target && (focusKey || before.focused)) {
+    // What was acted on is gone (its row was allowed, say): stay in its card.
+    const ref = focusKey || before.focused.split("|")[0];
+    const card = body.querySelector(`[data-agent-ref="${CSS.escape(ref)}"]`);
+    target = card && card.querySelector("button:not([disabled])");
+  }
+  if (target && target !== document.activeElement) target.focus();
 }
 
 async function loadGuardrails(focusKey = null) {
   const body = $("guardrail-body");
-  if (focusKey === null && body.querySelector(".guardrail-editor[open]")) return;
   if (staticDemo) {
     body.replaceChildren(el("p", "muted", "The Data Guardrail is available in the live local dashboard."));
     return;
   }
-  const agents = await getJSONWithToken("/api/guardrails");
-  const details = await Promise.all(agents.map(
-    (agent) => getJSONWithToken(`/api/guardrails/${encodeURIComponent(agent.agent_ref)}`)
-  ));
+  if (focusKey === null && (guardrailBusy > 0 || body.querySelector(".guardrail-editor[open]"))) return;
+  const generation = ++guardrailGeneration;
+  let details;
+  try {
+    const agents = await getJSONWithToken("/api/guardrails");
+    // One agent's failure is shown in its card, not as the dashboard down.
+    const settled = await Promise.allSettled(agents.map(
+      (agent) => getJSONWithToken(`/api/guardrails/${encodeURIComponent(agent.agent_ref)}`)
+    ));
+    details = settled.map((result, index) => (result.status === "fulfilled"
+      ? result.value
+      : { ...agents[index], error: result.reason.message }));
+  } catch (error) {
+    if (generation !== guardrailGeneration) return;
+    lastGuardrailRender = "";
+    body.replaceChildren(errorMessage(`Guardrail state unavailable: ${error.message}`));
+    return;
+  }
+  if (generation !== guardrailGeneration) return;  // a later load draws instead
+  const fingerprint = JSON.stringify(details);
+  if (focusKey === null && fingerprint === lastGuardrailRender) return;
+  lastGuardrailRender = fingerprint;
+
   const before = guardrailViewState(body);
   body.replaceChildren();
-  if (!agents.length) {
+  if (!details.length) {
     body.append(el("p", "muted",
       "Lock an alignment baseline above, and RailDash proposes a guardrail for that agent."));
   }
@@ -1327,6 +1407,11 @@ async function loadGuardrails(focusKey = null) {
     const [label, tone] = guardrailStatePresentation(detail.state);
     head.append(title, el("span", `asp-state asp-state-${tone}`, label));
     card.append(head);
+    if (detail.error) {
+      card.append(errorMessage(`This agent's guardrail couldn't be read: ${detail.error}`));
+      body.append(card);
+      return;
+    }
 
     if (detail.active) {
       card.append(renderGuardrailRules(detail.rules));
@@ -1334,7 +1419,7 @@ async function loadGuardrails(focusKey = null) {
         "Uploads and out-of-spec calls are judged on the TLS requests the collector captured; " +
         "plain TCP, DNS or a stdio MCP server isn't seen."));
       if (detail.offers.length) card.append(renderGuardrailOffers(detail.agent_ref, detail.active, detail.offers, refresh));
-      card.append(renderGuardrailRows(detail.rows, refresh));
+      card.append(renderGuardrailRows(detail.rows, refresh, true));
       const policy = el("details", "guardrail-active-policy");
       policy.dataset.key = "policy";
       policy.append(el("summary", null, `What ${detail.active.guardrail.version} allows`));
@@ -1347,11 +1432,12 @@ async function loadGuardrails(focusKey = null) {
         refresh();
       }, { quiet: true }));
       card.append(actions);
-      card.append(renderRulesEditor(detail.active.guardrail.rules, "Edit", async (rules) => {
+      card.append(renderRulesEditor(detail.active.guardrail.rules, "Edit", async (rules, close) => {
         await postJSON(
           `/api/guardrail-versions/${encodeURIComponent(detail.active.guardrail.guardrail_version_id)}/edit`,
           { rules }
         );
+        close();
         refresh();
       }));
     } else {
@@ -1361,11 +1447,12 @@ async function loadGuardrails(focusKey = null) {
         card.append(el("p", "muted", "A guardrail was turned off. Switch back to a version, or adopt a new one."));
         card.append(renderGuardrailVersions(detail, refresh));
       }
-      if (detail.rows.length) card.append(renderGuardrailRows(detail.rows, refresh));
+      if (detail.rows.length) card.append(renderGuardrailRows(detail.rows, refresh, false));
     }
     if (detail.events.length) card.append(renderGuardrailHistory(detail.events));
     body.append(card);
   });
+  restoreGuardrailView(body, before, focusKey);
   const announcement = details
     .map((detail) => `${identityLabel(detail.agent_identity)}: ${guardrailStatePresentation(detail.state)[0]}`)
     .join("; ");
@@ -1373,20 +1460,6 @@ async function loadGuardrails(focusKey = null) {
     $("guardrail-status-announcement").textContent = announcement;
     lastGuardrailAnnouncement = announcement;
   }
-  body.querySelectorAll("details[data-key]").forEach((node) => {
-    if (before.open.has(before.keyOf(node)) && !node.classList.contains("guardrail-editor")) {
-      node.open = true;
-    }
-  });
-  const keyed = [...body.querySelectorAll("button[data-key]")];
-  let target = before.focused ? keyed.find((node) => before.keyOf(node) === before.focused) : null;
-  if (!target && (focusKey || before.focused)) {
-    // The button acted on is gone (its row was allowed, say): stay in its card.
-    const ref = focusKey || before.focused.split("|")[0];
-    const card = body.querySelector(`[data-agent-ref="${CSS.escape(ref)}"]`);
-    target = card && card.querySelector("button:not([disabled])");
-  }
-  if (target) target.focus();
 }
 
 function initAspUpload() {

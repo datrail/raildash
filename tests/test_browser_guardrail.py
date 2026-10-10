@@ -139,7 +139,13 @@ def test_the_guardrail_panel_drives_every_action(tmp_path):
             expect(offers).to_contain_text("docs.example", timeout=TIMEOUT)
             offers.get_by_role("button", name="Dismiss").click()
             expect(offers).to_have_count(0, timeout=TIMEOUT)
-            card.get_by_label("Guardrail version").select_option(label="g1 (adopt)")
+            picker = card.get_by_label("Guardrail version")
+            picker.select_option(label="g1 (adopt)")
+            # A poll that redraws the panel (a new row arrives) keeps the
+            # choice: Switch must not post the active version.
+            _capture(url, token, "third.example", "browser-3")
+            expect(card.locator("tr", has_text="third.example").first).to_be_visible(timeout=TIMEOUT)
+            expect(picker.locator("option:checked")).to_have_text("g1 (adopt)")
             card.locator(".asp-version-picker").get_by_role("button", name="Switch").click()
             expect(card.locator(".asp-subject")).to_have_text("version g1", timeout=TIMEOUT)
             expect(listener_row).to_contain_text("counts")
@@ -156,6 +162,10 @@ def test_the_guardrail_panel_drives_every_action(tmp_path):
             card.get_by_role("button", name="Turn off").click()
             expect(state).to_have_text("No guardrail", timeout=TIMEOUT)
             expect(card.locator(".guardrail-proposal")).to_be_visible()
+            # With no guardrail no row counts, and none can be allowed.
+            expect(card.locator(".guardrail-row-status", has_text="counts")).to_have_count(0)
+            expect(card.locator(".guardrail-rows").get_by_role("button", name="Allow this")).to_have_count(0)
+            expect(card.locator(".guardrail-row-status", has_text="not counting").first).to_be_visible()
             history = card.locator(".guardrail-history")
             history.locator("summary").click()
             expect(history).to_contain_text("turn off")
