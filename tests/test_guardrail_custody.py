@@ -135,7 +135,7 @@ def test_a_database_with_no_guardrail_judges_nothing_on_either_ingest_path(store
     for table in ("guardrail_versions", "guardrail_bindings", "guardrail_rows", "guardrail_events"):
         assert store._db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0, table  # noqa: SLF001
     marks = {row[0] for row in store._db.execute("SELECT mark FROM guardrail_marks")}  # noqa: SLF001
-    assert marks <= {"asp_received", "asp_received_before"}
+    assert marks and all(mark.startswith("asp_received") for mark in marks)
 
 
 # ---------------------------------------------------------- adopt and state
@@ -595,3 +595,25 @@ def test_a_re_sent_unchanged_asp_keeps_the_evidence_fresh(store):
     store._db.commit()  # noqa: SLF001
     store.load_asp(raw(value))
     assert store.guardrail_detail(ref)["rules"]["service_ports"]["reason"] == g.STALE
+
+
+def test_without_a_receipt_for_the_newest_asp_staleness_reads_collected_at(store):
+    """A database from before receipts, or one whose receipts were for an
+    ASP since pruned: the design's own rule, on `collected_at`."""
+    value = asp()
+    value["collected_at"] = "2026-01-01T00:00:00Z"
+    made = store.make_baseline(load(store, value), "v1.0")["alignment_version"]
+    identity = made["agent_identity"]
+    ref = agent_ref(identity["kind"], json.dumps(identity["value"], sort_keys=True, separators=(",", ":")))
+    store.adopt_guardrail(made["alignment_version_id"])
+    assert store.guardrail_detail(ref)["rules"]["saved_files"]["reason"] is None  # fresh by receipt
+    store._db.execute("DELETE FROM guardrail_marks")  # noqa: SLF001
+    store._db.commit()  # noqa: SLF001
+    assert store.guardrail_detail(ref)["rules"]["saved_files"]["reason"] == g.STALE
+    # A receipt left for another ASP doesn't count for the newest one.
+    store._db.execute(  # noqa: SLF001
+        "INSERT INTO guardrail_marks VALUES (?, ?, 'asp_received@asp-gone', ?)",
+        (identity["kind"], json.dumps(identity["value"], sort_keys=True, separators=(",", ":")), _now()),
+    )
+    store._db.commit()  # noqa: SLF001
+    assert store.guardrail_detail(ref)["rules"]["saved_files"]["reason"] == g.STALE

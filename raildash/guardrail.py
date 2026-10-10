@@ -927,7 +927,9 @@ def asp_is_stale(
     now: datetime | str,
 ) -> bool:
     """§4.3: older than three times the gap between the two newest ASPs,
-    bounded to [5 min, 2 h]; with only one ASP, 2 h."""
+    bounded to [5 min, 2 h]; with only one ASP, 2 h. The two times may be
+    the last two deliveries of the newest ASP instead of collection times
+    (`evaluate_asp`'s `newest_received_at`); the rule is the same."""
     newest = _required_instant(newest_collected_at, "newest_collected_at")
     current = _required_instant(now, "now")
     previous = _instant(previous_collected_at)
