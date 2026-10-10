@@ -71,7 +71,8 @@ a violation or an Unverified, never a Held:
   body only echoes an earlier turn, and the agent writes it, so it is not
   the model's request. A response that can't be read safely (the stored row
   unparseable, a compressed body, streamed text over 4 MiB, a body or event
-  past the JSON safety bounds) is flagged `tool_calls.readable: False`, and
+  past the JSON safety bounds, an event whose data isn't JSON, or a last
+  event cut mid-way) is flagged `tool_calls.readable: False`, and
   `request_rules_status` keeps both request rules Unverified for 10 minutes
   after it; a response with no body, or plain text with no `data:` line,
   asks for nothing. The response's safety is judged apart from the request
@@ -163,6 +164,9 @@ UNREADABLE_CAPTURE = "UNREADABLE_CAPTURE"
 RESPONSE_ENCODED = "RESPONSE_ENCODED"
 RESPONSE_TOO_LARGE = "RESPONSE_TOO_LARGE"
 RESPONSE_UNSCANNABLE = "RESPONSE_UNSCANNABLE"
+RESPONSE_UNPARSABLE_EVENT = "RESPONSE_UNPARSABLE_EVENT"
+RESPONSE_TRUNCATED_EVENT = "RESPONSE_TRUNCATED_EVENT"
+_SSE_LINE_END = re.compile(r"\r\n|\r|\n")
 # How deep a stored row may nest before even its response is unreadable:
 # far past the 128 levels a shown row allows, well inside what the stdlib
 # decoder parses without hitting the interpreter's recursion limit.
@@ -214,7 +218,8 @@ def guardrail_problems(version: Any) -> list[str]:
     """Validate the closed guardrail version v1 and the rules the schema
     cannot express: `created_at` is UTC (as `locked_at` is), every host is
     already in its normalized form so stored and compared values are one
-    string, a port or byte cap is a real integer (not `80.0`), and the identity follows the alignment version's own rules
+    string, a port or byte cap is a real integer (not `80.0`), and the
+    identity follows the alignment version's own rules
     (`raildash.asp.identity_problems`, which also sorts a key list)."""
     if not isinstance(version, dict):
         return ["guardrail version must be an object"]
@@ -529,14 +534,20 @@ def requested_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
     .function.name`, and an OpenAI Responses `output[]` item of type
     `function_call`'s `name`. RailMon stores any other body as `{"raw":
     text}` (`parse_json_body`); that text is read as a server-sent event
-    stream: each `data:` line holding JSON is one event, and the names come
+    stream per the SSE rules: lines end only at CR LF, CR or LF (never at
+    U+2028, U+2029 or U+0085, which JSON allows in a string), and an
+    event's `data:` lines join with LF up to the blank line that ends it.
+    Each event's data is one JSON value, and the names come
     from an Anthropic `content_block_start` whose `content_block` is a
     `tool_use`, an OpenAI chat chunk's `choices[].delta.tool_calls[]
     .function.name` (only the first chunk of each call carries it), and an
     OpenAI Responses `response.output_item.added`/`.done` whose `item` is a
-    `function_call`. A `data:` line that isn't JSON (`[DONE]`) is skipped,
-    and a stream cut short yields the names it reached. Text with no
-    `data:` line (an HTML error page) asks for nothing.
+    `function_call`. `[DONE]` is skipped. Any other event data that isn't
+    JSON makes the response unreadable (`RESPONSE_UNPARSABLE_EVENT`); so
+    does a last event with no blank line after it that doesn't parse
+    (`RESPONSE_TRUNCATED_EVENT`), since the cut may have taken the call.
+    Either way the names already found are kept. Text with no `data:`
+    field at all (an HTML error page) is readable and asks for nothing.
     """
     body, reason = _response_body(interaction)
     if reason is not None:
@@ -555,21 +566,68 @@ def requested_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
         return {"names": names, "readable": True, "reason": None}
     if len(text.encode("utf-8", "surrogatepass")) > MAX_SCANNED_RESPONSE_BYTES:
         return {"names": [], "readable": False, "reason": RESPONSE_TOO_LARGE}
-    for line in text.splitlines():
-        if not line.startswith("data:"):
+    # Only CR LF, CR and LF end an SSE line. `str.splitlines` also splits on
+    # U+2028, U+2029 and U+0085, which JSON allows raw inside a string, and
+    # so would cut one event in two and lose its call.
+    lines = _SSE_LINE_END.split(text)
+    # What follows the last line end is not a line; `""` there means the
+    # text ended with one, not with a blank line.
+    if lines[-1] == "":
+        lines.pop()
+    data: list[str] | None = None  # the current event's data lines
+    saw_data = False
+    unparsable = False
+    for line in lines:
+        if line == "":
+            if data is not None:
+                outcome = _dispatch_event("\n".join(data), add)
+                if outcome == RESPONSE_UNSCANNABLE:
+                    return {"names": names, "readable": False, "reason": RESPONSE_UNSCANNABLE}
+                unparsable = unparsable or outcome == RESPONSE_UNPARSABLE_EVENT
+            data = None
             continue
-        data = line[5:].lstrip(" ")
-        try:
-            check_json_structure(data)
-        except JSONStructureTooComplex:
-            return {"names": names, "readable": False, "reason": RESPONSE_UNSCANNABLE}
-        try:
-            event = json.loads(data)
-        except (ValueError, RecursionError):
-            continue
-        if isinstance(event, dict):
-            _event_tool_calls(event, add)
+        field, _, value = line.partition(":")
+        if field != "data":
+            continue  # a comment (`:`), `event`, `id`, `retry`, or unknown
+        saw_data = True
+        if data is None:
+            data = []
+        # One space after the colon is the separator, not data.
+        data.append(value[1:] if value.startswith(" ") else value)
+    if not saw_data:
+        # No `data:` field at all: not an event stream (an HTML error page).
+        return {"names": [], "readable": True, "reason": None}
+    if data is not None:
+        # The stream ended with no blank line after its last event: it was
+        # cut. A complete JSON event still counts; one cut mid-way may have
+        # held the call, so the names found are kept and it fails closed.
+        outcome = _dispatch_event("\n".join(data), add)
+        if outcome is not None:
+            reason = (
+                RESPONSE_UNSCANNABLE if outcome == RESPONSE_UNSCANNABLE else RESPONSE_TRUNCATED_EVENT
+            )
+            return {"names": names, "readable": False, "reason": reason}
+    if unparsable:
+        return {"names": names, "readable": False, "reason": RESPONSE_UNPARSABLE_EVENT}
     return {"names": names, "readable": True, "reason": None}
+
+
+def _dispatch_event(data: str, add: Any) -> str | None:
+    """Read one event's assembled data. Returns `None` when it was read or
+    is the `[DONE]` sentinel, else why it couldn't be."""
+    if data.strip() == "[DONE]":
+        return None
+    try:
+        check_json_structure(data)
+    except JSONStructureTooComplex:
+        return RESPONSE_UNSCANNABLE
+    try:
+        event = json.loads(data)
+    except (ValueError, RecursionError):
+        return RESPONSE_UNPARSABLE_EVENT
+    if isinstance(event, dict):
+        _event_tool_calls(event, add)
+    return None
 
 
 def _message_tool_calls(body: dict[str, Any], add: Any) -> None:

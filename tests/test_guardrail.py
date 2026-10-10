@@ -1053,8 +1053,8 @@ def _stream(*events, done: bool = True) -> str:
         lines.append("data: " + (event if isinstance(event, str) else json.dumps(event)))
         lines.append("")
     if done:
-        lines.append("data: [DONE]")
-    return "\r\n".join(lines)
+        lines.extend(["data: [DONE]", ""])
+    return "\r\n".join(lines) + "\r\n"
 
 
 ANTHROPIC_STREAM = [
@@ -1107,10 +1107,57 @@ def test_tool_calls_are_read_from_a_streamed_response(events):
     "events", [ANTHROPIC_STREAM, OPENAI_CHAT_STREAM, OPENAI_RESPONSES_STREAM],
     ids=["anthropic", "openai-chat", "openai-responses"],
 )
-def test_a_truncated_stream_yields_the_names_it_reached(events):
+def test_a_truncated_stream_keeps_the_names_it_reached_but_fails_closed(events):
     text = _stream(*events, done=False)
     cut = text.index("mcp__notion__search") - 20  # mid-way through the second call's event
-    assert g.requested_tool_calls(_sse_row(text[:cut]))["names"] == ["mcp__fs__upload_file"]
+    assert g.requested_tool_calls(_sse_row(text[:cut])) == {
+        "names": ["mcp__fs__upload_file"], "readable": False, "reason": "RESPONSE_TRUNCATED_EVENT",
+    }
+
+
+def test_a_stream_cut_after_a_whole_event_still_reads():
+    # The last event's JSON is complete; only its blank line is missing.
+    text = _stream(*ANTHROPIC_STREAM[:3], done=False).rstrip("\r\n")
+    assert g.requested_tool_calls(_sse_row(text)) == {
+        "names": ["mcp__fs__upload_file"], "readable": True, "reason": None,
+    }
+
+
+EVIL_CHUNK = {"choices": [{"delta": {"tool_calls": [
+    {"function": {"name": "mcp__evil__y", "arguments": "a\u2028b"}}]}}]}
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\u0085"])
+def test_a_raw_unicode_line_separator_inside_json_does_not_split_the_event(separator):
+    data = json.dumps(EVIL_CHUNK, ensure_ascii=False).replace("\u2028", separator)
+    assert separator in data  # raw, as JSON allows inside a string
+    row = _sse_row(f"data: {data}\n\ndata: [DONE]\n\n")
+    assert g.requested_tool_calls(row) == {"names": ["mcp__evil__y"], "readable": True, "reason": None}
+    assert [v["item"] for v in g.evaluate_request(guardrail(), row)["out_of_spec_calls"]][1:] == ["mcp__evil"]
+
+
+def test_an_events_data_lines_join_before_parsing():
+    data = json.dumps(EVIL_CHUNK)
+    half = len(data) // 2
+    for ending in ("\n", "\r\n", "\r"):
+        text = ending.join([f"data: {data[:half]}", f"data:{data[half:]}", "", "data: [DONE]", "", ""])
+        assert g.requested_tool_calls(_sse_row(text)) == {
+            "names": ["mcp__evil__y"], "readable": True, "reason": None,
+        }
+
+
+def test_event_data_that_is_not_json_makes_the_response_unreadable():
+    text = _stream(ANTHROPIC_STREAM[2], '{"type": "content_block_start", "content_block": {"type": "tool_')
+    assert g.requested_tool_calls(_sse_row(text)) == {
+        "names": ["mcp__fs__upload_file"], "readable": False, "reason": "RESPONSE_UNPARSABLE_EVENT",
+    }
+
+
+def test_an_html_error_page_is_readable_and_asks_for_nothing():
+    page = "<!DOCTYPE html>\r\n<html><body><h1>502 Bad Gateway</h1>\r\ndata loss: none</body></html>\r\n"
+    assert g.requested_tool_calls(_sse_row(page, **{"content-type": "text/html"})) == {
+        "names": [], "readable": True, "reason": None,
+    }
 
 
 def test_railmons_own_streamed_capture_reads_as_asking_for_nothing():
