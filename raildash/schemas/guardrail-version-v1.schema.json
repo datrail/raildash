@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:datrail:guardrail:guardrail-version:1",
+  "title": "DatRail OSS Data Guardrail version v1",
+  "$comment": "One immutable guardrail version (DR-184 design section 4.2). Closed everywhere, with the four rule names fixed. Rules this schema cannot express are checked in code (raildash.guardrail.guardrail_problems): created_at is UTC, a host is already in its normalized form, a port or max_request_bytes value is an integer and not a float such as 80.0 (which JSON Schema integer accepts), and a local agent_key list is sorted.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["guardrail_contract_version", "guardrail_version_id", "version", "created_at", "agent_identity", "derived_from", "rules"],
+  "properties": {
+    "guardrail_contract_version": {"const": 1},
+    "guardrail_version_id": {"type": "string", "minLength": 1},
+    "version": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "agent_identity": {"$ref": "#/$defs/identity"},
+    "derived_from": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alignment_version_id"],
+      "properties": {"alignment_version_id": {"type": "string", "minLength": 1}}
+    },
+    "rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["uploads", "saved_files", "service_ports", "out_of_spec_calls"],
+      "properties": {
+        "uploads": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_hosts", "max_request_bytes", "denied_tool_calls"],
+          "properties": {
+            "allowed_hosts": {"$ref": "#/$defs/hosts"},
+            "max_request_bytes": {
+              "type": "object",
+              "propertyNames": {"$ref": "#/$defs/host"},
+              "additionalProperties": {"type": "integer", "minimum": 0}
+            },
+            "denied_tool_calls": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"type": "string", "minLength": 1, "maxLength": 256}
+            }
+          }
+        },
+        "saved_files": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed"],
+          "properties": {
+            "allowed": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/saved_file"}}
+          }
+        },
+        "service_ports": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed"],
+          "properties": {
+            "allowed": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/port"}}
+          }
+        },
+        "out_of_spec_calls": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allowed_hosts", "allowed_mcp_servers", "seeded_from_declared"],
+          "properties": {
+            "allowed_hosts": {"$ref": "#/$defs/hosts"},
+            "allowed_mcp_servers": {"$ref": "#/$defs/mcp_servers"},
+            "seeded_from_declared": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["hosts", "mcp_servers"],
+              "properties": {
+                "hosts": {"$ref": "#/$defs/hosts"},
+                "mcp_servers": {"$ref": "#/$defs/mcp_servers"}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "host": {
+      "$comment": "An exact host name, or `*.` and a name for any subdomain of it (never the name itself). No other `*`, no port, no IP range. The normalized form (lower case, no trailing dot) is checked in code.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^(\\*\\.)?[^*\\s/\\[\\]]+$"
+    },
+    "hosts": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/host"}},
+    "mcp_servers": {
+      "$comment": "MCP server names after the normalization agents apply when they build tool names: every character outside [A-Za-z0-9_-] is `_`.",
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9_-]+$"}
+    },
+    "kind": {
+      "$comment": "The values /api/profile's file_types uses: a lower-cased extension with its dot, or (none). (other), an over-long extension, would allow any long extension and is refused.",
+      "not": {"const": "(other)"},
+      "anyOf": [
+        {"const": "(none)"},
+        {"type": "string", "pattern": "^\\.[^./\\\\A-Z\\s]{1,15}$"}
+      ]
+    },
+    "saved_file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "kinds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/kind"}},
+        "literal": {"type": "boolean"}
+      }
+    },
+    "port": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol", "port"],
+      "properties": {
+        "protocol": {"enum": ["tcp", "udp"]},
+        "port": {
+          "oneOf": [
+            {"type": "integer", "minimum": 1, "maximum": 65535},
+            {"const": "ephemeral"}
+          ]
+        },
+        "addr": {"type": "string", "minLength": 1, "maxLength": 64}
+      }
+    },
+    "identity": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": {"const": "deployment_environment"},
+            "value": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["deployment", "namespace"],
+              "properties": {"deployment": {"type": "string", "minLength": 1}, "namespace": {"type": "string", "minLength": 1}}
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": {"const": "deployment_compose"},
+            "value": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["host_id", "project", "service"],
+              "properties": {"host_id": {"type": "string", "minLength": 1}, "project": {"type": "string", "minLength": 1}, "service": {"type": "string", "minLength": 1}}
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {"kind": {"const": "local_agent_key"}, "value": {"type": "string", "minLength": 1, "maxLength": 128}}
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {"kind": {"const": "local_agent_keys"}, "value": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"}}}
+        }
+      ]
+    }
+  }
+}
