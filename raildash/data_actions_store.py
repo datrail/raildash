@@ -597,8 +597,9 @@ class DataActionsStore:
             wire.add(name.split("__", 1)[1])
         with self._lock:
             refs = [row[0] for row in self._db.execute(
-                f"SELECT DISTINCT capture_ref FROM data_action_calls WHERE tool IN "
-                f"({','.join('?' * len(wire))}) LIMIT 500",
+                f"SELECT capture_ref FROM data_action_calls WHERE tool IN "
+                f"({','.join('?' * len(wire))}) GROUP BY capture_ref "
+                f"ORDER BY max(last_seen) DESC LIMIT 500",
                 sorted(wire),
             )]
             rows = [row for row in self._data_action_rows_locked(refs, keep_schemas=True)

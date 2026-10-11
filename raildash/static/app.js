@@ -1277,6 +1277,9 @@ function guardrailRowAllowable(row, hasActive) {
 // reasons and the schemas behind them, fetched when opened), and Override:
 // the actions the user says the tool has, saved as a new version.
 const DATA_ACTION_KINDS = ["read", "upload", "update", "delete", "execute"];
+// A tool's Why, kept a minute, so a redraw that reopens it doesn't fetch again.
+const dataActionTools = new Map();
+const DATA_ACTION_TOOL_FRESH_MS = 60_000;
 
 function renderDataActionWhy(tool, action, active, refresh) {
   const details = el("details", "guardrail-why");
@@ -1293,7 +1296,11 @@ function renderDataActionWhy(tool, action, active, refresh) {
     body.dataset.loaded = "true";
     body.replaceChildren();
     try {
-      const found = await getJSONWithToken("/api/data-actions/tool", { name: tool });
+      const cached = dataActionTools.get(tool);
+      const found = cached && Date.now() - cached.at < DATA_ACTION_TOOL_FRESH_MS
+        ? cached.found
+        : await getJSONWithToken("/api/data-actions/tool", { name: tool });
+      dataActionTools.set(tool, { found, at: cached && cached.found === found ? cached.at : Date.now() });
       const why = found.classification;
       const said = `${why.actions.length ? why.actions.join(", ") : "unclassified"}` +
         `${why.weak_read ? " (read only on a hint)" : ""}: ${why.reasons.join("; ") || "no signal"}`;
@@ -1315,6 +1322,7 @@ function renderDataActionWhy(tool, action, active, refresh) {
         body.append(block);
       });
     } catch (error) {
+      delete body.dataset.loaded; // closing and opening it again retries
       body.append(errorMessage(`Couldn't read the tool: ${error.message}`));
     }
     // Override needs only the active version, so it's offered even when the
@@ -1329,6 +1337,8 @@ function renderDataActionWhy(tool, action, active, refresh) {
       box.type = "checkbox";
       box.value = kind;
       box.checked = Boolean(override && override.includes(kind));
+      // Unsaved choices hold the panel's redraw (see the poll), nothing else.
+      box.addEventListener("change", () => { details.dataset.dirty = "true"; });
       label.append(box, document.createTextNode(` ${kind} `));
       form.append(label);
       return box;
@@ -1635,7 +1645,7 @@ async function loadGuardrails(focusKey = null) {
   // An open editor, or an open Why · Override (its boxes are unsaved), isn't
   // redrawn under the user.
   if (focusKey === null && (guardrailBusy > 0
-    || body.querySelector(".guardrail-editor[open], .guardrail-why[open]"))) return;
+    || body.querySelector('.guardrail-editor[open], .guardrail-why[data-dirty="true"]'))) return;
   const generation = ++guardrailGeneration;
   let details;
   try {
