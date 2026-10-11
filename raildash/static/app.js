@@ -1273,11 +1273,75 @@ function guardrailRowAllowable(row, hasActive) {
   return true;
 }
 
-function renderGuardrailRow(row, refresh, hasActive) {
+// DR-205: a data-action row's tool, why it was classified as it was (its
+// reasons and the schemas behind them, fetched when opened), and Override:
+// the actions the user says the tool has, saved as a new version.
+const DATA_ACTION_KINDS = ["read", "upload", "update", "delete", "execute"];
+
+function renderDataActionWhy(tool, active, refresh) {
+  const details = el("details", "guardrail-why");
+  details.dataset.key = `why:${tool}`;
+  details.append(el("summary", null, "Why · Override"));
+  const body = el("div");
+  details.append(body);
+  details.addEventListener("toggle", async () => {
+    if (!details.open || body.dataset.loaded) return;
+    body.dataset.loaded = "true";
+    try {
+      const found = await getJSONWithToken("/api/data-actions/tool", { name: tool });
+      const why = found.classification;
+      body.replaceChildren(el("p", null,
+        `Classified ${why.actions.length ? why.actions.join(", ") : "unclassified"}` +
+        `${why.weak_read ? " (read only on a hint)" : ""}: ${why.reasons.join("; ") || "no signal"}.`));
+      (why.notes || []).forEach((note) => body.append(el("p", "muted", note)));
+      found.schemas.forEach((schema) => {
+        const block = el("details");
+        block.append(el("summary", null,
+          `${schema.source}${schema.endpoint ? ` from ${schema.endpoint}` : schema.host ? ` sent to ${schema.host}` : ""}`));
+        block.append(el("pre", "guardrail-schema", JSON.stringify(
+          { description: schema.description, input_schema: schema.input_schema, annotations: schema.annotations },
+          null, 2)));
+        body.append(block);
+      });
+    } catch (error) {
+      body.dataset.loaded = "";
+      body.replaceChildren(errorMessage(`Couldn't read the tool: ${error.message}`));
+      return;
+    }
+    if (!active || !active.guardrail.rules.data_actions) return;
+    const current = (active.guardrail.rules.data_actions.overrides || {})[tool];
+    const form = el("fieldset", "guardrail-override");
+    form.append(el("legend", null, current ? `Overridden: ${current.join(", ") || "none"}` : "Override its actions"));
+    const boxes = DATA_ACTION_KINDS.map((action) => {
+      const label = el("label");
+      const box = el("input");
+      box.type = "checkbox";
+      box.value = action;
+      box.checked = Boolean(current && current.includes(action));
+      label.append(box, document.createTextNode(` ${action} `));
+      form.append(label);
+      return box;
+    });
+    form.append(guardrailButton("Save as a new version", async () => {
+      const rules = JSON.parse(JSON.stringify(active.guardrail.rules));
+      rules.data_actions.overrides[tool] = boxes.filter((box) => box.checked).map((box) => box.value);
+      await postJSON(
+        `/api/guardrail-versions/${encodeURIComponent(active.guardrail.guardrail_version_id)}/edit`, { rules });
+      refresh();
+    }, { quiet: true, key: `override:${tool}` }));
+    body.append(form);
+  });
+  return details;
+}
+
+function renderGuardrailRow(row, refresh, hasActive, active = null) {
   const tr = el("tr");
   if (row.counts) tr.dataset.counts = "true";
   const item = el("td");
   item.append(el("code", null, row.overflow ? `${row.count} more items` : row.item));
+  if (row.rule === "data_actions" && row.detail.tool && row.detail.action !== "unreadable") {
+    item.append(renderDataActionWhy(row.detail.tool, active, refresh));
+  }
   // The server's own verdict: a row counts only while unacknowledged and
   // disallowed by the version in force, so none counts with no guardrail.
   const status = row.allowed_by
@@ -1332,7 +1396,7 @@ function renderAllowAll(rule, inRule, refresh, hasActive, agentRef) {
   return wrap;
 }
 
-function renderGuardrailRows(rows, refresh, hasActive, agentRef = null) {
+function renderGuardrailRows(rows, refresh, hasActive, agentRef = null, active = null) {
   const wrap = el("div", "guardrail-rows");
   if (!rows.length) {
     wrap.append(el("p", "muted", "No violations recorded."));
@@ -1357,7 +1421,7 @@ function renderGuardrailRows(rows, refresh, hasActive, agentRef = null) {
     const thead = el("thead");
     thead.append(head);
     const tbody = el("tbody");
-    inRule.forEach((row) => tbody.append(renderGuardrailRow(row, refresh, hasActive)));
+    inRule.forEach((row) => tbody.append(renderGuardrailRow(row, refresh, hasActive, active)));
     table.append(thead, tbody);
     wrap.append(table);
   });
@@ -1605,7 +1669,7 @@ async function loadGuardrails(focusKey = null) {
         "plain TCP, DNS or a stdio MCP server isn't seen."));
       if (detail.offers.length) card.append(renderGuardrailOffers(detail.agent_ref, detail.active, detail.offers, refresh));
       if (detail.data_actions_offer_available) card.append(renderDataActionsOffer(detail.agent_ref, refresh));
-      card.append(renderGuardrailRows(detail.rows, refresh, true, detail.agent_ref));
+      card.append(renderGuardrailRows(detail.rows, refresh, true, detail.agent_ref, detail.active));
       const policy = el("details", "guardrail-active-policy");
       policy.dataset.key = "policy";
       policy.append(el("summary", null, `What ${detail.active.guardrail.version} allows`));

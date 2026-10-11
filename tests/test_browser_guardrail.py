@@ -322,3 +322,58 @@ def test_the_panel_shows_data_actions_in_the_proposal_and_offers_them_to_a_v1_ag
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_a_data_action_row_says_why_and_an_override_saves_a_version(tmp_path):
+    """DR-205 M3: Why shows the classification's reasons and schemas, and
+    Override saves the actions the user says the tool has as a new version."""
+    from test_guardrail_data_actions import PNG, call, listed
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    store.upsert_session("s1")
+    store.add_interactions("s1", [listed(), call("read_doc", {"doc_id": "d"})], authenticated=True)
+    asp_id = store.load_asp(json.dumps(asp(listeners=[DEMO_LISTENER])).encode())["asp_id"]
+    alignment = store.make_baseline(asp_id, "v1.0")["alignment_version"]
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    store.record_heartbeat("browser", taps_attached=1, sent_at=_now())
+    store.add_interactions("s1", [call("upload_file", {"content": PNG})], authenticated=True)
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            row = card.locator("tr", has_text="mcp__upload_file · upload")
+            expect(row).to_contain_text("counts", timeout=TIMEOUT)
+            row.locator(".guardrail-why > summary").click()
+            why = row.locator(".guardrail-why")
+            expect(why).to_contain_text("Classified upload", timeout=TIMEOUT)
+            expect(why).to_contain_text('argument "content" is base64')
+            # Say the tool only reads: a new version, and the row stops counting.
+            why.locator('input[value="read"]').check()
+            why.get_by_role("button", name="Save as a new version").click()
+            expect(row).to_contain_text("allowed by", timeout=TIMEOUT)
+            card.locator(".guardrail-active-policy > summary").click()
+            expect(card.locator(".guardrail-active-policy")).to_contain_text("mcp@docs.example.com/mcp__upload_file: read")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

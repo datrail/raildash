@@ -583,7 +583,43 @@ class DataActionsStore:
         ]
         return {"rule": rule, "blocked_until_allowed": blocked}
 
-    def _data_action_rows_locked(self, capture_refs: Iterable[str]) -> list[dict[str, Any]]:
+    def data_action_tool(self, name: str) -> dict[str, Any] | None:
+        """One tool, for the panel's "Why": its classification now (reasons
+        and notes), and the schemas behind it, over every capture that
+        called it. None when no call of it was recorded."""
+        with self._lock:
+            refs = [row[0] for row in self._db.execute(
+                "SELECT DISTINCT capture_ref FROM data_action_calls"
+            )]
+            rows = [row for row in self._data_action_rows_locked(refs, keep_schemas=True)
+                    if row["tool"] == name]
+        if not rows:
+            return None
+        schemas: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            for item in row.get("schemas") or []:
+                key = f"{item.get('source')}|{item.get('endpoint') or ''}|{item.get('schema_hash')}"
+                schemas.setdefault(key, {
+                    "source": item.get("source"), "endpoint": item.get("endpoint") or None,
+                    "host": item.get("host") or None, "description": item.get("description"),
+                    "input_schema": item.get("input_schema"), "annotations": item.get("annotations"),
+                    "last_seen": item.get("last_seen"),
+                })
+        classification = da.classify(name, [
+            {"description": s["description"], "input_schema": s["input_schema"], "annotations": s["annotations"]}
+            for s in schemas.values()
+        ])
+        return {
+            "tool": name,
+            "classification": classification,
+            "schemas": sorted(schemas.values(), key=lambda s: s.get("last_seen") or "", reverse=True),
+            "calls": sum(row["count"] for row in rows),
+            "classes": sorted({row["class"] for row in rows}),
+        }
+
+    def _data_action_rows_locked(
+        self, capture_refs: Iterable[str], *, keep_schemas: bool = False,
+    ) -> list[dict[str, Any]]:
         refs = sorted(set(capture_refs))
         if not refs:
             return []
@@ -598,10 +634,8 @@ class DataActionsStore:
         for row in rows:
             special = row["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL)
             name = row.pop("_name", row["tool"])
-            classification = (
-                None if special else da.classify(name, row.pop("_schemas"))
-            )
-            row.pop("_schemas", None)
+            used = row.pop("_schemas", [])
+            classification = None if special else da.classify(name, used)
             undeclared = json.loads(row["undeclared"])
             actions = list(classification["actions"]) if classification else []
             if undeclared and da.UPLOAD not in actions:
@@ -626,6 +660,7 @@ class DataActionsStore:
                 # Calls past a bound weren't read either: both fail closed.
                 "unreadable": row["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL),
                 "classification": classification,
+                **({"schemas": used} if keep_schemas else {}),
             })
         uploads = [item for item in out if da.UPLOAD in item["actions"] or item["unreadable"]]
         others = [item for item in out if not (da.UPLOAD in item["actions"] or item["unreadable"])]
