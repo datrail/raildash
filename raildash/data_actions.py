@@ -8,10 +8,11 @@ every signal that fires adds actions from a closed set with a reason:
 2. MCP annotations: `destructiveHint` adds `delete` and `update`;
    `readOnlyHint` adds a *weak* `read`, and only when nothing below adds
    another action; `openWorldHint` adds nothing and is reported;
-3. the leading verb phrase of the tool's own name, else of its
-   description's first sentence: the first word in the verb table, and any
-   joined to it by `or`/`and` (`create_or_update_file` is `upload` and
-   `update`; `get_commit` is only `read`, its `commit` a noun);
+3. every word of the tool's own name that is in the verb table, else of
+   its description's first sentence. Nouns that are also verbs count too
+   (`get_commit` is `read` and `upload`): that fails safe, since reading
+   only the first verb would let a leading noun hide a later `delete`
+   (`query_execute` would be a strong `read`), and the user allows it once;
 4. arguments: a data-carrying argument, or an explicitly loose schema, adds
    `upload`; a destination-hint argument is reported and adds nothing;
 5. an opt-in model, asked only when 1-4 found nothing; its `read` is weak;
@@ -106,20 +107,11 @@ def words(text: str) -> list[str]:
 
 
 def _verb_actions(text: str) -> list[tuple[str, str]]:
-    """The leading verb phrase: the first word in `VERBS`, then each further
-    one joined to it by `or`/`and`. Later table words are nouns or objects
-    (`get_commit`, `read_message`, `get_workflow_run`)."""
-    tokens = words(text)
     found: list[tuple[str, str]] = []
-    for index, word in enumerate(tokens):
-        if word in VERBS:
-            found.append((VERBS[word], word))
-            rest = tokens[index + 1:]
-            while len(rest) >= 2 and rest[0] in ("or", "and") and rest[1] in VERBS:
-                if (VERBS[rest[1]], rest[1]) not in found:
-                    found.append((VERBS[rest[1]], rest[1]))
-                rest = rest[2:]
-            break
+    for word in words(text):
+        action = VERBS.get(word)
+        if action is not None and (action, word) not in found:
+            found.append((action, word))
     return found
 
 
@@ -173,11 +165,15 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
     """Steps 2-4 for one schema."""
     actions: dict[str, set[str]] = {}
     reasons: dict[str, None] = {}  # ordered and O(1) to de-duplicate
+    first_reason: dict[str, str] = {}
     notes: list[str] = []
 
     def add(action: str, source: str, reason: str) -> None:
+        first_for_action = action not in actions
+        first_reason.setdefault(action, reason)
         actions.setdefault(action, set()).add(source)
-        if len(reasons) < MAX_REASONS:
+        # Bounded, but every action keeps the reason that first gave it.
+        if len(reasons) < MAX_REASONS or first_for_action:
             reasons.setdefault(reason, None)
 
     annotations = schema.get("annotations") if isinstance(schema.get("annotations"), dict) else {}
@@ -207,7 +203,8 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
 
     if annotations.get("readOnlyHint") is True and not actions:
         add(READ, SOURCE_ANNOTATION, "annotation readOnlyHint")
-    return {"actions": actions, "reasons": list(reasons), "notes": notes,
+    return {"actions": actions, "reasons": list(reasons), "first_reason": first_reason,
+            "notes": notes,
             "destinations": destination_hints(input_schema)}
 
 
@@ -241,7 +238,10 @@ def classify(
         # An override is a list of actions from the closed set, or
         # `unclassified`. Anything else, or nothing, leaves the tool
         # unclassified rather than silently judged by nothing.
-        values = set(override) if isinstance(override, (list, tuple)) else set()
+        values = (
+            {value for value in override if isinstance(value, str)}
+            if isinstance(override, (list, tuple)) else set()
+        )
         chosen = [action for action in ACTIONS if action in values]
         result.update(
             actions=chosen, sources={action: [SOURCE_USER] for action in chosen},
@@ -256,10 +256,17 @@ def classify(
     valid = [item for item in schemas if isinstance(item, Mapping)]
     for item in valid:
         signals = _schema_signals(tool, item)
+        new_actions = set(signals["actions"]) - set(sources)
         for action, from_ in signals["actions"].items():
             sources.setdefault(action, set()).update(from_)
         for reason in signals["reasons"]:
             if len(reasons) < MAX_REASONS:
+                reasons.setdefault(reason, None)
+        for action in new_actions:
+            # The first reason this schema gave for an action new to the
+            # tool, even past the bound.
+            reason = signals["first_reason"].get(action)
+            if reason is not None:
                 reasons.setdefault(reason, None)
         for note in signals["notes"]:
             notes.setdefault(note, None)
@@ -271,9 +278,16 @@ def classify(
         reasons.pop("annotation readOnlyHint", None)
 
     if not sources and model_classifier is not None:
-        # Each distinct schema is asked on its own and the answers unioned,
-        # so a doctored newest schema can't speak for the others.
+        # Each distinct schema is asked once and the answers unioned, so a
+        # doctored newest schema can't speak for the others.
+        asked: set[str] = set()
         for item in valid:
+            key = json.dumps(
+                [item.get("description"), item.get("input_schema")], sort_keys=True, default=str
+            )
+            if key in asked:
+                continue
+            asked.add(key)
             try:
                 answer = model_classifier(item)
             except Exception:  # noqa: BLE001 - §5: a failure leaves unclassified
@@ -282,8 +296,9 @@ def classify(
             for action in chosen:
                 sources.setdefault(action, set()).add(SOURCE_MODEL)
             if chosen and len(reasons) < MAX_REASONS:
-                name = answer.get("model") or "model"
-                reasons.setdefault(f"{name}: {answer.get('reason') or 'no reason given'}", None)
+                name = answer.get("model")
+                label = f"model {name}" if name else "model"
+                reasons.setdefault(f"{label}: {answer.get('reason') or 'no reason given'}", None)
 
     actions = [action for action in ACTIONS if action in sources]
     result.update(

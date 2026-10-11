@@ -159,7 +159,7 @@ def test_the_model_is_asked_only_when_nothing_else_fired_and_only_closed_answers
     result = da.classify("frobnicate", [schema("Frobnicates.")], model_classifier=model)
     assert result["actions"] == ["read"] and result["weak_read"]
     assert result["sources"] == {"read": ["model"]}
-    assert result["reasons"] == ["m1: fetches"]
+    assert result["reasons"] == ["model m1: fetches"]
     da.classify("upload_file", [schema()], model_classifier=model)
     assert len(asked) == 1  # a tool the rules classify never reaches the model
     for bad in (None, {"actions": []}, {"actions": ["exfiltrate"]}, {"actions": ["read", "steal"]}, "read"):
@@ -195,12 +195,14 @@ def test_classify_all_groups_by_tool_and_applies_overrides():
 
 
 @pytest.mark.parametrize("tool,expected", [
-    ("get_commit", ["read"]), ("get_workflow_run", ["read"]), ("read_message", ["read"]),
-    ("get_comment", ["read"]), ("list_add_ons", ["read"]),
-    ("create_or_update_file", ["upload", "update"]), ("read_and_delete", ["read", "delete"]),
-    ("slack_post_message", ["upload"]),
+    # Nouns that are verbs count: noisy, but it fails safe.
+    ("get_commit", ["read", "upload"]), ("get_workflow_run", ["read", "execute"]),
+    # A leading noun never hides a later action.
+    ("query_execute", ["read", "execute"]), ("search_index_delete", ["read", "delete"]),
+    ("comment_delete", ["upload", "delete"]),
+    ("create_or_update_file", ["upload", "update"]), ("slack_post_message", ["upload"]),
 ])
-def test_only_the_leading_verb_phrase_counts(tool, expected):
+def test_every_verb_word_counts(tool, expected):
     assert actions(tool) == expected
 
 
@@ -214,7 +216,7 @@ def test_prefixes_split_from_the_left_and_acronyms_split():
 
 
 def test_overrides_are_validated():
-    for bad in ([], ["exfil"], "upload", {"upload"}):
+    for bad in ([], ["exfil"], "upload", {"upload"}, [{"a": 1}]):
         result = da.classify("upload_file", [schema()], override=bad)
         assert result["actions"] == [] and result["unclassified"], bad
 
@@ -258,3 +260,18 @@ def test_hostile_shapes_do_not_raise():
     result = da.classify("sync", odd)
     assert result["actions"] == ["upload"]
     assert da.classify(None, [schema()])["unclassified"]
+
+
+def test_identical_schemas_are_asked_once_and_every_action_keeps_a_reason():
+    calls = []
+
+    def model(tool_schema):
+        calls.append(1)
+        return {"actions": ["read"], "reason": "r", "model": "m"}
+
+    da.classify("frobnicate", [schema("same")] * 50, model_classifier=model)
+    assert len(calls) == 1
+    many = schema(properties={f"p{i}": {"format": "byte"} for i in range(30)})
+    result = da.classify("tidy", [many, schema(annotations={"destructiveHint": True})])
+    assert result["actions"] == ["upload", "update", "delete"]
+    assert "annotation destructiveHint" in result["reasons"]
