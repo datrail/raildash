@@ -97,15 +97,18 @@ class DataActionsStore:
 
     def _record_tool_calls(
         self, interaction: dict[str, Any], capture_ref: str, *, at: str | None = None
-    ) -> None:
-        """The calls one newly stored authenticated request carries. `at` is
-        the time to record (the capture's own, when backfilling)."""
+    ) -> list[dict[str, Any]] | None:
+        """The calls one newly stored authenticated request carries, and
+        returns them as recorded (for the `data_actions` rule), or None when
+        reading them failed. `at` is the time to record (the capture's own,
+        when backfilling)."""
         raw = interaction.get("raw")
         known = self._known_mcp_endpoints()
         if isinstance(raw, str) and not any(m in raw for m in _CALL_MARKERS):
             request = {"headers": {"host": interaction.get("host")}, "path": interaction.get("path")}
             if (interaction.get("method") or "").upper() != "POST" or tc.endpoint_key(request) not in known:
-                return
+                return []
+        recorded: list[dict[str, Any]] = []
         self._db.execute("SAVEPOINT tool_calls_hook")
         try:
             trusted = self._trusted_model_hosts()
@@ -119,27 +122,33 @@ class DataActionsStore:
             interaction_id = interaction.get("interaction_id")
             for call in found["calls"]:
                 self._upsert_call(capture_ref, call, now, interaction_id)
+                recorded.append(call)
             unreadable = found["mcp_post_unreadable"]
             if unreadable and unreadable["endpoint"] in known:
-                self._upsert_call(capture_ref, {
+                call = {
                     "class": tc.OBSERVED, "tool": UNREADABLE_TOOL, "endpoint": unreadable["endpoint"],
                     "arguments_bytes": unreadable["request_size"] or 0, "content_kinds": [],
                     "undeclared": [], "streamed": False, "schema_known": False, "destination": {},
-                }, now, interaction_id)
+                }
+                self._upsert_call(capture_ref, call, now, interaction_id)
+                recorded.append(call)
             if found["truncated"]:
                 # Calls past the cap weren't read; that must not read as
                 # nothing (fails closed, like an unreadable call).
-                self._upsert_call(capture_ref, {
+                call = {
                     "class": tc.OBSERVED, "tool": OVERFLOW_TOOL, "endpoint": "",
                     "arguments_bytes": 0, "content_kinds": [], "undeclared": [],
                     "streamed": False, "schema_known": False, "destination": {},
-                }, now, interaction_id)
+                }
+                self._upsert_call(capture_ref, call, now, interaction_id)
+                recorded.append(call)
         except Exception as exc:  # noqa: BLE001 - evidence must still be stored
             self._db.execute("ROLLBACK TO tool_calls_hook")
             self._db.execute("RELEASE tool_calls_hook")
             print(f"raildash: tool call extraction failed: {exc!r}", file=sys.stderr)
-            return
+            return None
         self._db.execute("RELEASE tool_calls_hook")
+        return recorded
 
     def _upsert_call(
         self, capture_ref: str, call: Mapping[str, Any], now: str, interaction_id: Any,
@@ -327,20 +336,107 @@ class DataActionsStore:
         classified. Single-user: any agent's endpoint is trusted for all."""
         return tuple(sorted(set(ts.KNOWN_MODEL_HOSTS) | self._asp_facts()["inference_hosts"]))
 
-    def _trusted_schemas(self, capture_refs: list[str], trusted: tuple[str, ...]) -> dict[str, list[dict[str, Any]]]:
+    def _trusted_schemas(
+        self, capture_refs: list[str], trusted: tuple[str, ...], tools: Iterable[str] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
         cutoff = (datetime.now(timezone.utc) - SCHEMA_WINDOW).strftime("%Y-%m-%dT%H:%M:%S")
         marks = ",".join("?" * len(capture_refs))
+        query = f"SELECT * FROM tool_schemas WHERE capture_ref IN ({marks}) AND last_seen >= ?"
+        params: list[Any] = [*capture_refs, cutoff]
+        if tools is not None:
+            names = sorted(set(tools))
+            if not names:
+                return {}
+            query += f" AND tool IN ({','.join('?' * len(names))})"
+            params.extend(names)
         out: dict[str, list[dict[str, Any]]] = {}
-        for row in self._db.execute(
-            f"SELECT * FROM tool_schemas WHERE capture_ref IN ({marks}) AND last_seen >= ?",
-            (*capture_refs, cutoff),
-        ):
+        for row in self._db.execute(query, params):
             item = dict(row)
             if item["source"] != ts.SOURCE_MCP_TOOLS_LIST and not g.host_allowed(item["host"] or None, trusted):
                 continue
             item["input_schema"] = json.loads(item["input_schema"])
             item["annotations"] = json.loads(item["annotations"]) if item["annotations"] else None
             out.setdefault(item["tool"], []).append(item)
+        return out
+
+    def _name_and_schemas(self, rows: list[dict[str, Any]], schemas: Mapping[str, list[dict[str, Any]]]) -> None:
+        """Give each row (`class`, `tool`, `endpoint`) its shown `_name` and
+        the `_schemas` that classify it. The line-up (§4.1): an observed
+        call at a declared server's endpoint is that server's
+        `mcp__<server>__<tool>`, and its model-side schemas count with the
+        server's listing; one at an undeclared endpoint is
+        `mcp@<endpoint>__<tool>`. Endpoint listings count within the 30-day
+        window; `schemas` are the captures' trusted ones by tool."""
+        servers = self._asp_facts()["servers"]  # endpoint -> declared server name
+        by_server = {name: endpoint for endpoint, name in servers.items()}
+        endpoints = {row["endpoint"] for row in rows if row["class"] == tc.OBSERVED and row["endpoint"]}
+        for row in rows:
+            server = _mcp_server_of(row["tool"]) if row["class"] == tc.REQUESTED else None
+            if server in by_server:
+                endpoints.add(by_server[server])
+        listed: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        cutoff = (datetime.now(timezone.utc) - SCHEMA_WINDOW).strftime("%Y-%m-%dT%H:%M:%S")
+        if endpoints:
+            ordered = sorted(endpoints)
+            # One query for every endpoint listing the rows need.
+            for item in self._db.execute(
+                f"SELECT * FROM tool_schemas WHERE source = ? AND last_seen >= ? AND endpoint IN "
+                f"({','.join('?' * len(ordered))})",
+                (ts.SOURCE_MCP_TOOLS_LIST, cutoff, *ordered),
+            ):
+                listed.setdefault((item["endpoint"], item["tool"]), []).append({
+                    **dict(item), "input_schema": json.loads(item["input_schema"]),
+                    "annotations": json.loads(item["annotations"]) if item["annotations"] else None,
+                })
+        for row in rows:
+            if row["class"] == tc.OBSERVED and row["endpoint"] and row["tool"] not in (
+                UNREADABLE_TOOL, OVERFLOW_TOOL
+            ):
+                server = servers.get(row["endpoint"])
+                row["_name"] = (
+                    f"mcp__{server}__{row['tool']}" if server else f"mcp@{row['endpoint']}__{row['tool']}"
+                )
+                row["_schemas"] = listed.get((row["endpoint"], row["tool"]), []) + (
+                    schemas.get(row["_name"], []) if server else []
+                )
+            else:
+                row["_name"] = row["tool"]
+                row["_schemas"] = list(schemas.get(row["tool"], []))
+                server = _mcp_server_of(row["tool"]) if row["class"] == tc.REQUESTED else None
+                if server in by_server:
+                    bare = row["tool"].split("__", 2)[2]
+                    row["_schemas"] += listed.get((by_server[server], bare), [])
+
+    def _calls_for_rule(self, capture_ref: str, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """One request's recorded calls as the `data_actions` rule reads them
+        (`guardrail.evaluate_data_actions`): the shown tool name, the
+        classified actions and the rest. The caller holds the transaction."""
+        if not calls:
+            return []
+        servers = self._asp_facts()["servers"]
+        needed = {call["tool"] for call in calls}
+        needed |= {f"mcp__{servers[call['endpoint']]}__{call['tool']}" for call in calls
+                   if call["class"] == tc.OBSERVED and call.get("endpoint") in servers}
+        # Only the schemas these calls need, not the capture's every one.
+        schemas = self._trusted_schemas([capture_ref], self._trusted_model_hosts(), needed)
+        rows = [{"class": call["class"], "tool": call["tool"], "endpoint": call["endpoint"] or ""}
+                for call in calls]
+        self._name_and_schemas(rows, schemas)
+        out = []
+        for row, call in zip(rows, calls):
+            special = call["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL)
+            classification = None if special else da.classify(row["_name"], row["_schemas"])
+            out.append({
+                "tool": row["_name"] if not special else f"mcp@{call['endpoint'] or '(more calls)'}",
+                "class": call["class"],
+                "classified": list(classification["actions"]) if classification else [],
+                "undeclared": list(call.get("undeclared") or []),
+                "unreadable": special,
+                "bytes": int(call.get("arguments_bytes") or 0),
+                "content_kinds": list(call.get("content_kinds") or []),
+                "endpoint": call["endpoint"] or None,
+                "not_offered": False,
+            })
         return out
 
     def data_action_rows(self, capture_refs: Iterable[str]) -> list[dict[str, Any]]:
@@ -356,49 +452,7 @@ class DataActionsStore:
             rows = [dict(row) for row in self._db.execute(
                 f"SELECT * FROM data_action_calls WHERE capture_ref IN ({marks})", refs
             )]
-            servers = self._asp_facts()["servers"]  # endpoint -> declared server name
-            by_server = {name: endpoint for endpoint, name in servers.items()}
-            endpoints = {row["endpoint"] for row in rows if row["class"] == tc.OBSERVED and row["endpoint"]}
-            for row in rows:
-                server = _mcp_server_of(row["tool"]) if row["class"] == tc.REQUESTED else None
-                if server in by_server:
-                    endpoints.add(by_server[server])
-            endpoints = sorted(endpoints)
-            listed: dict[tuple[str, str], list[dict[str, Any]]] = {}
-            cutoff = (datetime.now(timezone.utc) - SCHEMA_WINDOW).strftime("%Y-%m-%dT%H:%M:%S")
-            if endpoints:
-                # One query for every endpoint listing the rows need.
-                for item in self._db.execute(
-                    f"SELECT * FROM tool_schemas WHERE source = ? AND last_seen >= ? AND endpoint IN "
-                    f"({','.join('?' * len(endpoints))})",
-                    (ts.SOURCE_MCP_TOOLS_LIST, cutoff, *endpoints),
-                ):
-                    listed.setdefault((item["endpoint"], item["tool"]), []).append({
-                        **dict(item), "input_schema": json.loads(item["input_schema"]),
-                        "annotations": json.loads(item["annotations"]) if item["annotations"] else None,
-                    })
-            for row in rows:
-                # The line-up (§4.1): an observed call at a declared server's
-                # endpoint is that server's `mcp__<server>__<tool>`, and its
-                # model-side schemas count with the server's listing; one at
-                # an undeclared endpoint is `mcp@<endpoint>__<tool>`.
-                if row["class"] == tc.OBSERVED and row["endpoint"] and row["tool"] not in (
-                    UNREADABLE_TOOL, OVERFLOW_TOOL
-                ):
-                    server = servers.get(row["endpoint"])
-                    row["_name"] = (
-                        f"mcp__{server}__{row['tool']}" if server else f"mcp@{row['endpoint']}__{row['tool']}"
-                    )
-                    row["_schemas"] = listed.get((row["endpoint"], row["tool"]), []) + (
-                        schemas.get(row["_name"], []) if server else []
-                    )
-                else:
-                    row["_name"] = row["tool"]
-                    row["_schemas"] = list(schemas.get(row["tool"], []))
-                    server = _mcp_server_of(row["tool"]) if row["class"] == tc.REQUESTED else None
-                    if server in by_server:
-                        bare = row["tool"].split("__", 2)[2]
-                        row["_schemas"] += listed.get((by_server[server], bare), [])
+            self._name_and_schemas(rows, schemas)
         out = []
         for row in rows:
             special = row["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL)

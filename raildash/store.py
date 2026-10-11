@@ -52,7 +52,7 @@ from .asp import (
     parse_bundle,
     resolve_identity,
 )
-from .guardrail_store import GUARDRAIL_SCHEMA, GuardrailCustody
+from .guardrail_store import EVERY_AGENT, GUARDRAIL_SCHEMA, MARK_CHECK_FAILED, GuardrailCustody
 from . import tool_schemas as _tool_schemas
 from .data_actions_store import DATA_ACTIONS_SCHEMA, DataActionsStore
 
@@ -1628,6 +1628,11 @@ class Store(GuardrailCustody, DataActionsStore):
             # DR-184 M2: only an authenticated capture can affect a guardrail
             # (design §4.1), so only such a batch reads the active ones.
             active = self._active_guardrails() if authenticated else []
+            # DR-205: calls are classified for judging only when some active
+            # version has the data_actions rule.
+            judge_data_actions = any(
+                "data_actions" in json.loads(item["row"]["contract_json"])["rules"] for item in active
+            )
             for row in rows:
                 if authenticated and not replaced and row.get("interaction_id"):
                     replaced = (
@@ -1652,13 +1657,15 @@ class Store(GuardrailCustody, DataActionsStore):
                 )
                 inserted += cur.rowcount
                 if authenticated and cur.rowcount and row.get("interaction_id"):
-                    self._record_capture_tools({**row, "session_id": session_id})
+                    calls = self._record_capture_tools(
+                        {**row, "session_id": session_id}, judge=judge_data_actions,
+                    )
                     if active:
                         stored = self._db.execute(
                             "SELECT * FROM interactions WHERE session_id = ? AND interaction_id = ?",
                             (session_id, row["interaction_id"]),
                         ).fetchone()
-                        self._guardrail_on_request(dict(stored), active)
+                        self._guardrail_on_request(dict(stored), active, calls)
             if inserted:
                 self._db.execute(
                     """
@@ -1690,13 +1697,31 @@ class Store(GuardrailCustody, DataActionsStore):
             self._db.commit()
         return inserted
 
-    def _record_capture_tools(self, interaction: dict[str, Any], *, at: str | None = None) -> None:
+    def _record_capture_tools(
+        self, interaction: dict[str, Any], *, at: str | None = None, judge: bool = False,
+    ) -> list[dict[str, Any]]:
         """DR-205: the tool schemas (M0) and tool calls (M1) one stored
-        authenticated request carries. `at` is the time to record them at
-        (the capture's own, when backfilling)."""
+        authenticated request carries. With `judge` (an active guardrail
+        has the `data_actions` rule), returns the calls as that rule reads
+        them; a failure to read or classify them marks the check failed, so
+        the rule is Unverified rather than quietly Held. `at` is the time to
+        record them at (the capture's own, when backfilling)."""
         if _tool_schemas.may_carry_tools(interaction.get("raw")):
             self._record_tool_schemas(interaction, at=at)
-        self._record_tool_calls(interaction, _capture_ref(interaction), at=at)
+        ref = _capture_ref(interaction)
+        recorded = self._record_tool_calls(interaction, ref, at=at)
+        if not judge:
+            return []
+        if recorded is None:
+            # The calls couldn't be read: the rule can't say Held (§5).
+            self._mark(*EVERY_AGENT, MARK_CHECK_FAILED, self._receive_time())
+            return []
+        try:
+            return self._calls_for_rule(ref, recorded)
+        except Exception as exc:  # noqa: BLE001 - evidence must still be stored
+            print(f"raildash: data-action classification failed: {exc!r}", file=sys.stderr)
+            self._mark(*EVERY_AGENT, MARK_CHECK_FAILED, self._receive_time())
+            return []
 
     def _record_tool_schemas(self, interaction: dict[str, Any], *, at: str | None = None) -> None:
         """DR-205 M0: the tool schemas one newly stored authenticated
