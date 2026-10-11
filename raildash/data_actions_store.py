@@ -39,7 +39,11 @@ SCHEMA_WINDOW = timedelta(days=30)
 # against the endpoint's newest listing and every listing of the last day.
 NOT_OFFERED_DELAY = timedelta(seconds=60)
 NOT_OFFERED_LISTING_WINDOW = timedelta(hours=24)
-MAX_PENDING = 5000
+# The pages of one listing (`nextCursor`) arrive close together: every page
+# received within this of the newest one is part of the newest listing.
+LISTING_PAGES_WINDOW = timedelta(minutes=10)
+# Per agent: past this many queued calls, its calls are judged at once.
+MAX_PENDING = 1000
 BACKFILL_WINDOW = timedelta(hours=24)
 BACKFILL_SETTING = "data_actions_backfilled_v1"
 MAX_DESTINATION_VALUE_CHARS = 200
@@ -82,8 +86,11 @@ CREATE TABLE IF NOT EXISTS data_action_pending (
     tool            TEXT NOT NULL,
     wire_tool       TEXT NOT NULL,
     endpoint        TEXT NOT NULL,
+    called_at       TEXT NOT NULL,
     due_at          TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS data_action_pending_identity
+    ON data_action_pending(identity_kind, identity_value);
 """
 
 
@@ -239,23 +246,24 @@ class DataActionsStore:
              int(bool(call["schema_known"])), interaction_id, *key),
         )
 
-    def _offered_locked(self, endpoint: str, tool: str, now: datetime) -> bool | None:
+    def _offered_locked(self, endpoint: str, tool: str, called_at: datetime) -> bool | None:
         """Whether an endpoint offers a tool (§4.4): it is in the endpoint's
-        newest `tools/list` reply, whatever its age, or in any listing of the
-        last 24 hours. None when no listing was ever captured from the
-        endpoint: there is nothing to compare, and the check doesn't fire."""
+        newest listing, whatever its age (every page of it: pages received
+        within `LISTING_PAGES_WINDOW` of the newest), or in any listing of
+        the 24 hours before the call. None when no listing was ever captured
+        from the endpoint: there is nothing to compare."""
         newest = self._db.execute(
-            "SELECT interaction_id FROM tool_schemas WHERE source = ? AND endpoint = ? "
-            "ORDER BY last_seen DESC LIMIT 1",
+            "SELECT max(last_seen) FROM tool_schemas WHERE source = ? AND endpoint = ?",
             (ts.SOURCE_MCP_TOOLS_LIST, endpoint),
-        ).fetchone()
+        ).fetchone()[0]
         if newest is None:
             return None
-        cutoff = self._receive_time(now - NOT_OFFERED_LISTING_WINDOW)
+        pages_from = self._receive_time(datetime.fromisoformat(newest.replace("Z", "+00:00")) - LISTING_PAGES_WINDOW)
+        window_from = self._receive_time(called_at - NOT_OFFERED_LISTING_WINDOW)
         return self._db.execute(
             "SELECT 1 FROM tool_schemas WHERE source = ? AND endpoint = ? AND tool = ? "
-            "AND (interaction_id IS ? OR last_seen >= ?) LIMIT 1",
-            (ts.SOURCE_MCP_TOOLS_LIST, endpoint, tool, newest[0], cutoff),
+            "AND last_seen >= ? LIMIT 1",
+            (ts.SOURCE_MCP_TOOLS_LIST, endpoint, tool, min(pages_from, window_from)),
         ).fetchone() is not None
 
     def _known_mcp_endpoints(self) -> set[str]:

@@ -789,30 +789,39 @@ class GuardrailCustody:
         calls: Sequence[Mapping[str, Any]], now: str,
     ) -> None:
         """§4.4 G5: an observed MCP call the endpoint's listings don't have
+        (or that has no listing yet: its first may come in a later batch)
         is queued, and judged once the delay has passed (`_run_not_offered`).
-        A call to an endpoint that never listed its tools isn't queued."""
-        due = self._receive_time(_instant(now) + das.NOT_OFFERED_DELAY)
+        Past `MAX_PENDING` queued calls of this agent, its call is judged at
+        once."""
+        called = _instant(now)
+        due = self._receive_time(called + das.NOT_OFFERED_DELAY)
         for call in calls:
             endpoint, wire = call.get("endpoint"), call.get("wire_tool")
             if call.get("class") != g.OBSERVED or call.get("unreadable") or not endpoint or not wire:
                 continue
-            if self._offered_locked(endpoint, wire, _instant(now)) is not False:
+            if self._offered_locked(endpoint, wire, called) is True:
                 continue
-            if self._db.execute("SELECT count(*) FROM data_action_pending").fetchone()[0] >= das.MAX_PENDING:
-                # Past the bound the call is judged now rather than dropped.
+            queued = self._db.execute(
+                "SELECT count(*) FROM data_action_pending WHERE identity_kind = ? AND identity_value = ?",
+                (kind, value),
+            ).fetchone()[0]
+            if queued >= das.MAX_PENDING:
                 self._judge_not_offered_locked(kind, value, interaction.get("interaction_id"),
-                                               call["tool"], wire, endpoint, now)
+                                               call["tool"], wire, endpoint, now, now)
                 continue
             self._db.execute(
-                """INSERT INTO data_action_pending
-                       (identity_kind, identity_value, interaction_id, tool, wire_tool, endpoint, due_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (kind, value, interaction.get("interaction_id"), call["tool"], wire, endpoint, due),
+                """INSERT INTO data_action_pending (identity_kind, identity_value, interaction_id,
+                       tool, wire_tool, endpoint, called_at, due_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (kind, value, interaction.get("interaction_id"), call["tool"], wire, endpoint, now, due),
             )
 
     def _run_not_offered_locked(self, now: str | None = None) -> None:
         """Judge every queued call whose delay has passed. Run from the
-        write paths that arrive anyway: a capture batch and a heartbeat."""
+        write paths that arrive anyway: after a capture batch is stored
+        (its own listings included) and on a heartbeat. Each call is judged
+        in its own savepoint; one that fails is dropped and marks the check
+        failed, so it can't block the rest."""
         current = now or self._receive_time()
         due = self._db.execute(
             "SELECT * FROM data_action_pending WHERE due_at <= ? ORDER BY pending_id LIMIT 500",
@@ -820,18 +829,31 @@ class GuardrailCustody:
         ).fetchall()
         for row in due:
             self._db.execute("DELETE FROM data_action_pending WHERE pending_id = ?", (row["pending_id"],))
-            self._judge_not_offered_locked(
-                row["identity_kind"], row["identity_value"], row["interaction_id"],
-                row["tool"], row["wire_tool"], row["endpoint"], current,
-            )
+            self._db.execute("SAVEPOINT not_offered_one")
+            try:
+                self._judge_not_offered_locked(
+                    row["identity_kind"], row["identity_value"], row["interaction_id"],
+                    row["tool"], row["wire_tool"], row["endpoint"], row["called_at"], current,
+                )
+            except Exception as exc:  # noqa: BLE001 - the rest of the queue still runs
+                self._db.execute("ROLLBACK TO not_offered_one")
+                print(f"raildash: a not-offered check failed: {exc!r}", file=sys.stderr)
+                self._mark(*EVERY_AGENT, MARK_CHECK_FAILED, current)
+            self._db.execute("RELEASE not_offered_one")
 
     def _judge_not_offered_locked(
-        self, kind: str, value: str, interaction_id: Any, tool: str, wire: str, endpoint: str, now: str,
+        self, kind: str, value: str, interaction_id: Any, tool: str, wire: str, endpoint: str,
+        called_at: str, now: str,
     ) -> None:
-        if self._offered_locked(endpoint, wire, _instant(now)) is not False:
+        """The window is anchored at the call (24 hours before it), so a call
+        judged late isn't held to listings that aged out meanwhile. Still no
+        listing ever from the endpoint: nothing to compare, not judged."""
+        if self._offered_locked(endpoint, wire, _instant(called_at)) is not False:
             return
         active = self._active_guardrail_row(kind, value)
-        if active is None:
+        if active is None or _instant(called_at) < _instant(active["activated_at"]):
+            # Turned off, or a version activated after the call: as for any
+            # request, a version never judges what came before it (§4.5).
             return
         rule = json.loads(active["contract_json"])["rules"].get(g.DATA_ACTIONS)
         if rule is None or g.data_action_allowed(rule, tool, "not_offered"):
@@ -842,8 +864,7 @@ class GuardrailCustody:
             kind="data_action", tool=tool, action="not_offered", endpoint=endpoint, wire_tool=wire,
             from_undeclared=False, undeclared=[],
         )
-        with self._hook_guard("not offered"):
-            self._record_violations(kind, value, active["guardrail_version_id"], [violation], now)
+        self._record_violations(kind, value, active["guardrail_version_id"], [violation], now)
 
     def _data_actions_dismissed_key(self, kind: str, value: str) -> str:
         return f"data_actions_offer_dismissed:{kind}:{value}"

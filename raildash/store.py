@@ -1620,9 +1620,6 @@ class Store(GuardrailCustody, DataActionsStore):
         with self._lock:
             # DR-184 M2: only an authenticated capture can affect a guardrail
             # (design §4.1), so only such a batch reads the active ones.
-            if authenticated:
-                # DR-205: calls queued as "not offered" whose delay passed.
-                self._run_not_offered_guarded()
             active = self._active_guardrails() if authenticated else []
             # DR-205: calls are classified for judging only when some active
             # version has the data_actions rule.
@@ -1680,6 +1677,10 @@ class Store(GuardrailCustody, DataActionsStore):
                     """,
                     (session_id, session_id, session_id),
                 )
+            if authenticated:
+                # DR-205: calls queued as "not offered" whose delay passed,
+                # judged after this batch's own listings are stored.
+                self._run_not_offered_guarded()
             if replaced:
                 # `first_seen` is otherwise set once; a replaced forged row
                 # may have been the one that set it.

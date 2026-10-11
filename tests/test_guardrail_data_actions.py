@@ -417,7 +417,11 @@ def test_an_endpoint_that_never_listed_its_tools_is_not_judged(store):
     ref, _ = with_data_actions(store, rule(unclassified="allow"))
     live(store)
     send(store, call("anything", {}))
+    # Queued (its first listing may still come), then dropped unjudged.
+    _due_now(store)
+    live(store)
     assert store._db.execute("SELECT count(*) FROM data_action_pending").fetchone()[0] == 0
+    assert not any("not offered" in key[1] for key in rows(store, ref))
 
 
 def test_an_allowed_not_offered_tool_is_not_a_row(store):
@@ -428,3 +432,79 @@ def test_an_allowed_not_offered_tool_is_not_a_row(store):
     _due_now(store)
     live(store)
     assert not any("not offered" in key[1] for key in rows(store, ref))
+
+
+def _age_listings(store, hours):
+    from datetime import timedelta
+
+    old = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat(timespec="microseconds").replace("+00:00", "Z")
+    store._db.execute("UPDATE tool_schemas SET last_seen = ?, first_seen = ? WHERE source = 'mcp_tools_list'", (old, old))
+    store._db.commit()
+
+
+def test_every_page_of_the_newest_listing_counts_after_a_day(store):
+    ref, _ = with_data_actions(store, rule([{"tool": f"mcp@{ENDPOINT}__*", "actions": ["read", "unclassified"]}]))
+    live(store)
+    pages = [{"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": n, "inputSchema": READ_SCHEMA} for n in names]}}
+             for names in (("a_read", "b_read"), ("c_read", "d_read"))]
+    send(store, *(mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, page) for page in pages))
+    _age_listings(store, 25)
+    send(store, call("a_read", {}))
+    _due_now(store)
+    live(store)
+    assert not any("not offered" in key[1] for key in rows(store, ref))
+
+
+def test_a_listing_in_the_batch_that_runs_the_queue_counts(store):
+    ref, _ = with_data_actions(store, rule([{"tool": f"mcp@{ENDPOINT}__*", "actions": ["read", "unclassified"]}]))
+    live(store)
+    send(store, listed(), call("export_all", {}))
+    _due_now(store)
+    later = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "export_all", "inputSchema": READ_SCHEMA}]}}
+    send(store, mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, later))
+    assert not any("not offered" in key[1] for key in rows(store, ref))
+
+
+def test_a_late_first_listing_is_still_compared(store):
+    ref, _ = with_data_actions(store, rule([{"tool": f"mcp@{ENDPOINT}__*", "actions": ["read", "unclassified"]}]))
+    live(store)
+    send(store, call("export_all", {}))  # no listing yet
+    send(store, listed())  # the first listing, without export_all
+    _due_now(store)
+    live(store)
+    assert ("data_actions", f"mcp@{ENDPOINT}__export_all · not offered by {ENDPOINT}") in rows(store, ref)
+
+
+def test_a_version_activated_after_the_call_does_not_judge_it(store):
+    ref, adopted = with_data_actions(store, rule([{"tool": f"mcp@{ENDPOINT}__*", "actions": ["read", "unclassified"]}]))
+    live(store)
+    send(store, listed(), call("export_all", {}))
+    store.edit_guardrail(adopted["guardrail"]["guardrail_version_id"], adopted["guardrail"]["rules"])
+    _due_now(store)
+    live(store)
+    assert not any("not offered" in key[1] for key in rows(store, ref))
+
+
+def test_a_failing_judgement_marks_the_check_and_does_not_block_the_queue(store, monkeypatch):
+    ref, _ = with_data_actions(store, rule([{"tool": f"mcp@{ENDPOINT}__*", "actions": ["read", "unclassified"]}]))
+    live(store)
+    send(store, listed(), call("export_all", {}), call("other_tool", {}))
+    _due_now(store)
+    original = type(store)._judge_not_offered_locked
+    calls_seen = []
+
+    def flaky(self, *args):
+        calls_seen.append(args[3])
+        if len(calls_seen) == 1:
+            raise RuntimeError("boom")
+        return original(self, *args)
+
+    monkeypatch.setattr(type(store), "_judge_not_offered_locked", flaky)
+    live(store)
+    assert len(calls_seen) == 2
+    assert store._db.execute("SELECT count(*) FROM data_action_pending").fetchone()[0] == 0
+    from raildash.guardrail_store import EVERY_AGENT, MARK_CHECK_FAILED
+
+    assert store._mark_at(*EVERY_AGENT, MARK_CHECK_FAILED) is not None
+    # The other call was still judged.
+    assert any("not offered" in key[1] for key in rows(store, ref))
