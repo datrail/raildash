@@ -353,3 +353,76 @@ def test_the_fallback_schema_never_comes_from_an_untrusted_host(tmp_path):
     [row] = [r for r in store.data_action_rows(["session:s1"]) if r["tool"] == "get_status"]
     assert row["undeclared"] == ["notes"] and "upload" in row["actions"]
     store.close()
+
+
+# ------------------------------------------------------------ profile (M1c)
+
+
+def test_the_observed_profile_lists_data_actions_without_destination_values(tmp_path):
+    store = new_store(tmp_path)
+    listed(store)
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "read_doc", "arguments": {"doc_id": "a"}}}))
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": {"name": "upload_file", "arguments": {"content": PNG, "repo": "pub/x"}}}))
+    profile = store.observed_profile("s1")
+    actions = profile["observed"]["data_actions"]
+    assert [item["tool"] for item in actions] == ["upload_file", "read_doc"]
+    upload = actions[0]
+    assert upload["actions"] == ["upload"] and upload["content_kinds"] == ["image"]
+    assert upload["reasons"] and "destination" not in upload
+    assert "pub/x" not in json.dumps(profile)
+    # Another agent's view of the session has none of the unattributed rows.
+    assert store.observed_profile("s1", agent_key="other")["observed"]["data_actions"] == []
+    store.close()
+
+
+def test_an_attributed_agents_profile_shows_its_own_rows(tmp_path):
+    store = new_store(tmp_path)
+    item = mcp_call({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": {"name": "read_doc", "arguments": {"doc_id": "a"}}})
+    item.update({"runtime_identity_version": 1, "attribution": {"state": "attributed", "method": "cgroup"},
+                 "agent_ref": {"host_id": "h", "sandbox_name": "b", "agent_key": "writer"}})
+    add(store, item)
+    assert [a["tool"] for a in store.observed_profile("s1", agent_key="writer")["observed"]["data_actions"]] == ["read_doc"]
+    assert [a["tool"] for a in store.observed_profile("s1")["observed"]["data_actions"]] == ["read_doc"]
+    store.close()
+
+
+def test_profile_entries_merge_per_tool_and_say_their_scope(tmp_path):
+    store = new_store(tmp_path)
+    store.upsert_session("s2", agent="agent", source="test")
+    listed(store)
+
+    def attributed(session, key, repo):
+        item = mcp_call({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "upload_file", "arguments": {"content": PNG, "repo": repo}}})
+        item.update({"runtime_identity_version": 1, "attribution": {"state": "attributed", "method": "cgroup"},
+                     "agent_ref": {"host_id": "h", "sandbox_name": "b", "agent_key": key}})
+        store.add_interactions(session, [normalise(item)], authenticated=True)
+
+    attributed("s1", "k1", "pub/a")
+    attributed("s1", "k1", "pub/b")
+    attributed("s1", "k2", "pub/a")
+    attributed("s2", "k1", "pub/c")
+    [entry] = store.observed_profile("s1")["observed"]["data_actions"]
+    # One entry per tool, whatever the destination or agent behind it.
+    assert entry["tool"] == "upload_file" and entry["scope"] == "agent"
+    # An identified agent's calls count across its captures (s2's too).
+    assert entry["count"] == 4
+    [k1] = store.observed_profile("s1", agent_key="k1")["observed"]["data_actions"]
+    assert k1["count"] == 3
+    store.close()
+
+
+def test_the_profile_caps_data_actions_and_says_so(tmp_path, monkeypatch):
+    from raildash import store as store_module
+
+    monkeypatch.setattr(store_module, "MAX_PROFILE_DIMENSION_VALUES", 3)
+    store = new_store(tmp_path)
+    for index in range(5):
+        add(store, model_turn({"content": [{"type": "tool_use", "name": f"tool_{index}", "input": {}}]}))
+    observed = store.observed_profile("s1")["observed"]
+    assert len(observed["data_actions"]) == 3
+    assert "data_actions" in observed["truncated_dimensions"]
+    store.close()

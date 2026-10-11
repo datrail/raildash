@@ -843,3 +843,86 @@ def test_a_capture_with_model_calls_has_no_empty_profile_note(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_the_data_actions_group_shows_uploads_first_with_their_reasons(tmp_path):
+    """DR-205 M1: each tool call's data actions, classified from the schema
+    the agent was given; an upload comes first, its reasons on hover."""
+    import base64
+
+    from raildash.ingest import normalise
+    from raildash.store import Store
+
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64).decode()
+    listing = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+        {"name": "read_doc", "description": "Read one doc.",
+         "inputSchema": {"type": "object", "properties": {"doc_id": {"type": "string"}}}},
+        {"name": "upload_file", "description": "Upload a file.",
+         "inputSchema": {"type": "object", "properties": {
+             "content": {"type": "string", "contentEncoding": "base64"}}}}]}}
+
+    def exchange(index, body, reply=None):
+        return normalise({
+            "interaction_id": f"mcp{index}", "timestamp": f"2026-10-11T07:00:{index:02d}Z",
+            "request": {"method": "POST", "path": "/mcp", "headers": {"host": "docs.example.com"},
+                        "body": body},
+            "response": {"status_code": 200, "headers": {"content-type": "application/json"},
+                         "body": reply or {}},
+        })
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    store.upsert_session("work", agent="agent", source="test")
+    store.add_interactions("work", [
+        exchange(1, {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, listing),
+        exchange(2, {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                     "params": {"name": "read_doc", "arguments": {"doc_id": "d"}}}),
+        exchange(3, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                     "params": {"name": "upload_file", "arguments": {"content": png}}}),
+    ], authenticated=True)
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database), "serve",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1400, "height": 1000})
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url, wait_until="networkidle")
+            group = page.locator(".profile-group").filter(
+                has=page.get_by_role("heading", name="Data actions", exact=True))
+            chips = group.locator(".profile-chip")
+            chips.first.wait_for()
+            assert chips.count() == 2
+            first = chips.nth(0)
+            assert first.locator(".profile-value").inner_text() == "upload_file"
+            assert first.locator(".profile-count").inner_text().startswith("upload · 1 observed")
+            assert "image" in first.locator(".profile-count").inner_text()
+            why = first.locator(".profile-why")
+            assert not why.is_visible()
+            # Keyboard: the chip takes focus, and its reason shows and is its
+            # description.
+            first.focus()
+            page.keyboard.press("Tab")
+            page.keyboard.press("Shift+Tab")
+            assert why.is_visible()
+            assert 'argument "content" is base64' in why.inner_text()
+            assert first.get_attribute("aria-describedby") == why.get_attribute("id")
+            assert chips.nth(1).locator(".profile-count").inner_text().startswith("read · 1 observed")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

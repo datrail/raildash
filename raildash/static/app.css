@@ -580,6 +580,17 @@ code { font-family: var(--mono); }
   border-left: 0;
   border-top: 1px solid var(--line);
 }
+/* DR-205: a chip's reason line, under it on hover and on keyboard focus. */
+.profile-why {
+  display: none;
+  padding: 3px 7px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-soft);
+  font-family: var(--sans, inherit);
+  overflow-wrap: anywhere;
+}
+.profile-chip:hover .profile-why,
+.profile-chip:focus-visible .profile-why { display: block; }
 /* DR-203: the show-all button under a capped list sits at its start. */
 .profile-more {
   justify-self: start;
