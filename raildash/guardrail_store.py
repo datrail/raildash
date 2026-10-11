@@ -568,7 +568,9 @@ class GuardrailCustody:
             json.loads(active["contract_json"]), bundle, asp_id=asp_id,
             previous_collected_at=previous[0] if previous else None, now=now,
         )
-        violations = [v for rule in g.ASP_RULES for v in result["rules"][rule]["violations"]]
+        violations = [
+            v for rule in g.ALL_ASP_RULES for v in result["rules"].get(rule, {}).get("violations", [])
+        ]
         self._record_violations(
             kind, value, active["guardrail_version_id"], violations, now, recheck=recheck
         )
@@ -658,10 +660,8 @@ class GuardrailCustody:
         contract = {
             # DR-205: a version with the data_actions rule is a v2; one
             # without stays v1, exactly as before.
-            "guardrail_contract_version": (
-                g.GUARDRAIL_CONTRACT_VERSION_V2 if g.DATA_ACTIONS in rules
-                else g.GUARDRAIL_CONTRACT_VERSION
-            ),
+            # DR-207: and one with egress_containment is a v3.
+            "guardrail_contract_version": g.contract_version(rules),
             "guardrail_version_id": version_id,
             "version": self._next_version_label(kind, value),
             "created_at": self._receive_time(),
@@ -750,7 +750,9 @@ class GuardrailCustody:
                 cache[stamp] = proposal
             proposal = json.loads(json.dumps(proposal))
             result["guardrail"]["rules"][g.DATA_ACTIONS] = proposal["rule"]
-            result["guardrail"]["guardrail_contract_version"] = g.GUARDRAIL_CONTRACT_VERSION_V2
+            result["guardrail"]["guardrail_contract_version"] = g.contract_version(
+                result["guardrail"]["rules"]
+            )
             result["data_actions_blocked"] = proposal["blocked_until_allowed"]
         return result
 
@@ -939,6 +941,55 @@ class GuardrailCustody:
             )
             self._event(kind, value, "dismiss_data_actions", active["guardrail_version_id"], {})
             return {"agent_ref": ref, "dismissed": True}
+
+    def _egress_locked(self, kind: str, value: str) -> dict[str, Any] | None:
+        """The newest ASP's egress containment and declared proxy, as the
+        panel's Egress line shows them (DR-207 §4.4), or None with no ASP.
+        In a multi-agent sandbox it's the sandbox's, which every agent in
+        it shares."""
+        newest = self._newest_asps(kind, value)
+        if not newest:
+            return None
+        bundle = parse_bundle(bytes(newest[0]["exact_bundle"]))
+        attributes = dict((bundle.get("sandbox") or {}).get("attributes") or {}) if (
+            bundle.get("bundle_version") == g.BUNDLE_VERSION_V2
+        ) else dict(bundle.get("attributes") or {})
+        reading = g.egress_reading(attributes.get(g.EGRESS_ATTRIBUTE))
+        proxy = attributes.get(g.EGRESS_PROXY_ATTRIBUTE)
+        declared = proxy.get("value") if isinstance(proxy, dict) and proxy.get("status") == "ANSWERED" else None
+        return {
+            "reading": reading,
+            "proxy_declared": declared if isinstance(declared, dict) else None,
+        }
+
+    def require_containment(self, ref: str, require: str = "contained") -> dict[str, Any]:
+        """**Require containment** (DR-207 §4.4): a new v3 version, the
+        active version's rules unchanged plus `egress_containment`. The
+        user's explicit choice, so it's made even when the newest ASP
+        doesn't meet it; the answer says whether the version starts
+        Violated, which the panel warns about before asking."""
+        if require not in ("contained", "allow_list_enforced"):
+            raise ValueError("require must be contained or allow_list_enforced")
+        with self._write_transaction():
+            kind, value = self._resolve_agent_ref(ref)
+            active = self._active_guardrail_row(kind, value)
+            if active is None:
+                raise ValueError("this agent has no active guardrail")
+            contract = json.loads(active["contract_json"])
+            if contract["rules"].get(g.EGRESS) == {"require": require}:
+                raise ValueError("the active version already requires this")
+            rules = {**json.loads(json.dumps(contract["rules"])), g.EGRESS: {"require": require}}
+            created = self._create_version_locked(
+                kind, value, rules, derived_from=contract["derived_from"]["alignment_version_id"],
+                created_by="require_containment", detail={"require": require},
+            )
+            egress = self._egress_locked(kind, value)
+            reading = (egress or {}).get("reading") or {}
+            return {
+                **self._version_view(created, active=True),
+                "starts_violated": reading.get("status") == "ANSWERED"
+                and not g.egress_meets(reading.get("level"), require),
+            }
 
     def propose_guardrail(self, alignment_version_id: str) -> dict[str, Any]:
         """§4.4's proposal from one locked baseline. Nothing is stored."""
@@ -1301,6 +1352,7 @@ class GuardrailCustody:
                 "agent_ref": ref,
                 "agent_identity": self._identity_object(kind, value),
                 "data_actions_offer_available": self._data_actions_offer_available_locked(kind, value),
+                "egress": self._egress_locked(kind, value),
                 **summary,
                 "active": self._version_view(active, active=True) if active is not None else None,
                 "rows": rows,

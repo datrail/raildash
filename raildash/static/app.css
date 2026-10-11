@@ -449,6 +449,9 @@ code { font-family: var(--mono); }
 .guardrail-rule-held strong { color: var(--ok); }
 .guardrail-rule-violated strong { color: var(--fail); }
 .guardrail-rule-unverified strong { color: var(--warn); }
+.guardrail-egress { margin: 0; font: 11.5px var(--mono); overflow-wrap: anywhere; }
+.guardrail-egress-contained { color: var(--ok); font-weight: 600; }
+.guardrail-egress-open { color: var(--fail); font-weight: 600; }
 .guardrail-rows { display: grid; gap: 6px; }
 .guardrail-rows h5, .guardrail-offers h5 {
   margin: 4px 0 0; color: var(--ink-faint);

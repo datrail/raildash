@@ -124,6 +124,32 @@
               }
             }
           ]
+        },
+        "egress_containment": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/attribute"
+            },
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ANSWERED",
+                      "PARTIAL"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "$ref": "#/$defs/egress_containment_value"
+                  }
+                }
+              }
+            }
+          ]
         }
       },
       "additionalProperties": {
@@ -280,6 +306,125 @@
         }
       },
       "$comment": "The files the sandbox opened, as the kernel saw them (observed_file_access): one entry per (path, layer), read/write/exec the union of every open. ANSWERED and PARTIAL carry this list; RailMon writes null for ABSENT and BLIND. The whole value must also stay under 262144 bytes as compact JSON — checked in code, not here (see the top-level $comment)."
+    },
+    "egress_containment_value": {
+      "type": "object",
+      "required": [
+        "level",
+        "contained",
+        "enforcer",
+        "observations",
+        "via",
+        "allow_list",
+        "reasons"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "level": {
+          "enum": [
+            "allow_list_enforced",
+            "no_network",
+            "internal_network",
+            "open",
+            "host_network",
+            "host_process"
+          ]
+        },
+        "contained": {
+          "type": "boolean"
+        },
+        "enforcer": {
+          "enum": [
+            "openshell",
+            null
+          ]
+        },
+        "observations": {
+          "type": "object",
+          "required": [
+            "network_mode",
+            "networks",
+            "openshell_labels",
+            "privileged",
+            "runtime_socket_mounts"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "network_mode": {
+              "$comment": "a string, or null for a host process",
+              "maxLength": 256
+            },
+            "networks": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "object",
+                "required": [
+                  "name",
+                  "internal",
+                  "gateway_peers"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "internal": {
+                    "enum": [
+                      true,
+                      false,
+                      null
+                    ]
+                  },
+                  "gateway_peers": {
+                    "type": "array",
+                    "maxItems": 64,
+                    "items": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    }
+                  }
+                }
+              }
+            },
+            "openshell_labels": {
+              "type": "boolean"
+            },
+            "privileged": {
+              "type": "boolean"
+            },
+            "runtime_socket_mounts": {
+              "type": "array",
+              "maxItems": 64,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1024
+              }
+            }
+          }
+        },
+        "via": {
+          "$comment": "container:<name> when the network namespace is another container's, else null",
+          "maxLength": 300
+        },
+        "allow_list": {
+          "const": null
+        },
+        "reasons": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        }
+      },
+      "$comment": "DR-207. Whether the agent can open a connection to any outside host itself, read from Docker's view of the container (egress_containment). contained is true exactly for the first three levels. allow_list is always null in this pack: an enforced allow-list whose contents are not readable from the host, not an empty one. ANSWERED and PARTIAL carry this object; PARTIAL is always level open. RailMon writes null for ABSENT, BLIND and FAILED."
     },
     "non_runtime_source": {
       "allOf": [

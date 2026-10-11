@@ -282,6 +282,7 @@ token, including both reads:
 | `POST /api/guardrail-rows/{row_id}/allow` | Allow this: a new version that allows the row's item |
 | `POST /api/guardrails/{agent_ref}/allow-rows` `{"row_ids": [...]}` | Allow all: one new version that allows several of one rule's rows; all or nothing |
 | `POST /api/guardrails/{agent_ref}/offers/allow` or `.../dismiss` `{"kind": "host", "value": "..."}` | Allow or dismiss a newly declared host or MCP server |
+| `POST /api/guardrails/{agent_ref}/egress-containment` `{}` or `{"require": "allow_list_enforced"}` | Require containment: a new version that requires the agent's egress be contained; `starts_violated` says whether the newest ASP already fails it |
 
 The proposal allows each written path of the baseline exactly, plus one
 glob it always shows: `**/__pycache__/*.pyc`, Python's bytecode caches.
@@ -291,6 +292,22 @@ it before adopting if you want those writes judged; a file named like a
 bytecode cache in a `__pycache__` directory isn't flagged while it's there.
 A guardrail adopted before RailDash seeded this line doesn't have it;
 **Edit** adds it.
+
+**Egress containment** (DR-207; railxia/docs
+`design/2026-10-11-egress-containment`). Each agent's panel has an
+**Egress** line read from RailMon's `egress_containment`, an observed level:
+- Contained: an OpenShell sandbox's enforced allow-list, no network, or
+  internal networks only, naming any container that is the way out.
+- Open: the agent can reach any host, is on the host's network, or is a host
+  process.
+
+A proxy the container's environment declares (`egress_proxy_declared`) is
+shown beside the line, and never counts. A version can require containment
+with the optional `egress_containment` rule (`{"require": "contained"}` or
+`"allow_list_enforced"`). Such a version is contract v3. The proposal
+includes the rule only when the baseline was contained, and **Require
+containment** adds it to any version. An ASP from before RailMon's rule pack
+11 leaves the line unknown and the rule Unverified.
 
 `RAILDASH_GUARDRAIL_MAX_OPEN_ROWS` (default 1000) caps the unacknowledged
 rows per agent before further items count in one overflow row, and

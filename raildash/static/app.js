@@ -1001,6 +1001,8 @@ const GUARDRAIL_RULE_LABELS = {
   out_of_spec_calls: "Out-of-spec calls",
   // DR-205: only a v2 version has it; a v1 version's line list skips it.
   data_actions: "Data actions",
+  // DR-207: only a version that requires containment has it.
+  egress_containment: "Egress containment",
 };
 const GUARDRAIL_REASONS = {
   NO_HEARTBEAT: "no collector heartbeat in the last 3 minutes",
@@ -1070,7 +1072,7 @@ function guardrailButton(label, action, { quiet = false, key = label } = {}) {
 function renderGuardrailRules(rules) {
   const list = el("ul", "guardrail-rules");
   Object.entries(GUARDRAIL_RULE_LABELS).forEach(([rule, label]) => {
-    if (rule === "data_actions" && !(rules || {})[rule]) return;
+    if ((rule === "data_actions" || rule === "egress_containment") && !(rules || {})[rule]) return;
     const result = (rules || {})[rule] || {};
     const item = el("li", `guardrail-rule guardrail-rule-${result.state || "unverified"}`);
     item.dataset.rule = rule;
@@ -1120,7 +1122,74 @@ function renderGuardrailPolicy(rules) {
     }
     add("Unclassified tools", actions.unclassified === "allow" ? "allowed" : "flagged");
   }
+  // DR-207: what the agent's egress must be (a v3 version only).
+  const egress = rules.egress_containment;
+  if (egress) {
+    add("Egress", egress.require === "allow_list_enforced"
+      ? "must be an enforced allow-list (an OpenShell sandbox)"
+      : "must be contained (an enforced allow-list, no network, or internal networks only)");
+  }
   return dl;
+}
+
+// DR-207 §4.4: the newest ASP's egress containment in words, with the
+// declared proxy beside it. Never "Contained" on partial or missing evidence.
+const EGRESS_WORDS = {
+  allow_list_enforced: ["Contained", "OpenShell enforces an allow-list (its contents aren't visible to datRail)"],
+  no_network: ["Contained", "no network at all"],
+  internal_network: ["Contained", "internal networks only"],
+  open: ["Open", "this agent can reach any host"],
+  host_network: ["Open", "on the host's network"],
+  host_process: ["Open", "a host process, not in a container"],
+};
+
+function renderEgressLine(egress) {
+  const line = el("p", "guardrail-egress");
+  line.dataset.key = "egress";
+  line.append(el("strong", null, "Egress: "));
+  const reading = egress && egress.reading;
+  if (!reading) {
+    line.append(document.createTextNode("unknown (the newest ASP doesn't say; RailMon before rule pack 11)"));
+    return line;
+  }
+  if (reading.status === "PARTIAL") {
+    line.append(document.createTextNode("unknown (a network couldn't be inspected)"));
+  } else if (!reading.level) {
+    line.append(document.createTextNode(`unknown (${guardrailReason(reading.status) || "not collected"})`));
+  } else {
+    const [word, why] = EGRESS_WORDS[reading.level] || ["Unknown", reading.level];
+    line.append(el("span", reading.contained ? "guardrail-egress-contained" : "guardrail-egress-open", word),
+      document.createTextNode(`: ${why}`));
+    if (reading.level === "internal_network") {
+      line.append(document.createTextNode(reading.gateway_peers && reading.gateway_peers.length
+        ? `, reaching outside only through ${reading.gateway_peers.join(", ")}` : ", with no way out"));
+    }
+    if (reading.via) line.append(el("span", "muted", ` (the network of ${reading.via.replace(/^container:/, "")})`));
+    line.append(el("span", "muted", " — observed"));
+  }
+  const proxy = egress.proxy_declared;
+  if (proxy && Object.keys(proxy).length) {
+    const names = Object.keys(proxy).filter((name) => name !== "NO_PROXY");
+    const note = reading.contained ? "" : ", but the network doesn't force traffic through it";
+    line.append(el("span", "muted",
+      ` · declares a proxy (${names.map((name) => `${name}=${proxy[name]}`).join(", ") || "NO_PROXY only"})${note} — declared`));
+  }
+  return line;
+}
+
+// DR-207: **Require containment** on a version that doesn't, warning first
+// when the newest ASP already fails it.
+function renderRequireContainment(agentRef, egress, refresh) {
+  const section = el("div", "guardrail-require-egress");
+  const reading = (egress && egress.reading) || {};
+  if (reading.status === "ANSWERED" && !reading.contained) {
+    section.append(el("p", "hint", "This agent isn't contained now, so a version that requires it starts Violated."));
+  }
+  section.append(guardrailButton("Require containment", async () => {
+    await postJSON(`/api/guardrails/${encodeURIComponent(agentRef)}/egress-containment`, {});
+    refresh();
+  }, { quiet: true, key: `require-egress:${agentRef}` }));
+  return section;
 }
 
 // DR-205: declared MCP tools the proposal doesn't allow, each with what it
@@ -1261,6 +1330,8 @@ function renderRulesEditor(rules, buttonLabel, basis, onSave) {
 function guardrailRowAllowable(row, hasActive) {
   if (!hasActive || row.overflow || row.allowed_by) return false;
   if (row.item === "(unknown host)") return false;
+  // Not being contained is lifted by an edit that stops requiring it.
+  if (row.rule === "egress_containment") return false;
   const hostRow = row.detail.kind === "host"
     || (row.rule === "out_of_spec_calls" && row.detail.kind !== "mcp_server");
   if (hostRow && row.item.includes("*")) return false;
@@ -1691,8 +1762,12 @@ async function loadGuardrails(focusKey = null) {
       return;
     }
 
+    card.append(renderEgressLine(detail.egress));
     if (detail.active) {
       card.append(renderGuardrailRules(detail.rules));
+      if (!detail.active.guardrail.rules.egress_containment && detail.egress) {
+        card.append(renderRequireContainment(detail.agent_ref, detail.egress, refresh));
+      }
       card.append(el("p", "hint",
         "Uploads and out-of-spec calls are judged on the TLS requests the collector captured; " +
         "plain TCP, DNS or a stdio MCP server isn't seen."));
