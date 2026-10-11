@@ -54,7 +54,7 @@ from .asp import (
 )
 from .guardrail_store import EVERY_AGENT, GUARDRAIL_SCHEMA, MARK_CHECK_FAILED, GuardrailCustody
 from . import tool_schemas as _tool_schemas
-from .data_actions_store import DATA_ACTIONS_SCHEMA, DataActionsStore
+from .data_actions_store import DATA_ACTIONS_SCHEMA, DataActionsStore, capture_ref
 
 CREDENTIAL_REDACTION_SCHEMA_VERSION = 1
 MIGRATION_BATCH_ROWS = 16
@@ -352,15 +352,8 @@ _UPGRADE_UNAUTHENTICATED_INTERACTION = (
 
 
 def _capture_ref(interaction: dict[str, Any]) -> str:
-    """The capture's own identity for its tool schemas (see `tool_schemas`)."""
-    if interaction.get("attribution_state") == "attributed" and all(
-        interaction.get(column) for column in ("agent_host_id", "sandbox_name", "agent_key")
-    ):
-        return (
-            f"agent:{interaction['agent_host_id']}/{interaction['sandbox_name']}"
-            f"/{interaction['agent_key']}"
-        )
-    return f"session:{interaction['session_id']}"
+    """See `data_actions_store.capture_ref`."""
+    return capture_ref(interaction)
 
 
 def _comparison_state(comparable: Any, has_drift: Any) -> str:

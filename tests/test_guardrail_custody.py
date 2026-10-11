@@ -190,7 +190,8 @@ def test_each_rules_shown_state_agrees_with_its_rows(store):
     store.adopt_guardrail(alignment["alignment_version_id"])
     store.allow_guardrail_row(rows(store, ref)[("service_ports", "tcp/127.0.0.1/8443")]["row_id"])
     live(store)
-    held = {rule: {"state": "held", "reason": None} for rule in g.RULES}
+    # The adopted proposal is a v2 version (DR-205): five rules.
+    held = {rule: {"state": "held", "reason": None} for rule in g.RULES_V2}
     assert store.guardrail_detail(ref)["rules"] == held
 
     send(store, request("exfil.attacker.net"))
@@ -322,6 +323,10 @@ def test_a_request_to_an_allowed_host_with_an_unlisted_mcp_server_is_one_request
     send(store, request("api.anthropic.com", tools=("mcp__example__search", "mcp__notion__search",
                                                    "mcp__fs__upload_file")))
     found = rows(store, ref)
+    # The fixture's request carries no tool list, so under the v2 proposal
+    # its MCP calls are also unclassified data_actions rows (DR-205); this
+    # test is about the DR-184 rules.
+    found = {key: row for key, row in found.items() if key[0] != "data_actions"}
     assert set(found) == {("out_of_spec_calls", "mcp__notion"), ("out_of_spec_calls", "mcp__fs"),
                           ("uploads", "mcp__fs__upload_file"), ("service_ports", "tcp/127.0.0.1/8443")}
     assert found[("out_of_spec_calls", "mcp__notion")]["evidence_class"] == "requested"
