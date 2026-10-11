@@ -1169,7 +1169,9 @@ function renderDataActionsOffer(agentRef, refresh) {
   details.append(el("summary", null, "Show the proposal"));
   const body = el("div");
   details.append(body);
+  let shown = null; // the offer drawn here, which is what Add adds
   const draw = (offer) => {
+    shown = offer;
     body.replaceChildren();
     if (!offer) {
       body.append(el("p", "muted", "Nothing to offer now."));
@@ -1196,8 +1198,8 @@ function renderDataActionsOffer(agentRef, refresh) {
   const base = `/api/guardrails/${encodeURIComponent(agentRef)}/data-actions`;
   const actions = el("div", "asp-actions");
   actions.append(guardrailButton("Add data actions", async () => {
-    // What's added is exactly what was shown; unseen, it's shown first.
-    const offer = freshOffer(agentRef);
+    // What's added is exactly what is shown; unseen, it's shown first.
+    const offer = shown;
     if (!offer) {
       details.open = true;
       throw new Error("Review the proposal first, then add it.");
