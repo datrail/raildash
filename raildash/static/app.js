@@ -1067,6 +1067,7 @@ function renderGuardrailRules(rules) {
   Object.entries(GUARDRAIL_RULE_LABELS).forEach(([rule, label]) => {
     const result = (rules || {})[rule] || {};
     const item = el("li", `guardrail-rule guardrail-rule-${result.state || "unverified"}`);
+    item.dataset.rule = rule;
     item.append(el("strong", null, label), document.createTextNode(` ${result.state || "unverified"}`));
     if (result.reason) item.append(el("span", "muted", ` — ${guardrailReason(result.reason)}`));
     list.append(item);

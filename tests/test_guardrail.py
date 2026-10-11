@@ -969,6 +969,40 @@ def test_the_state_roll_up(active, states, rows, expected):
     assert g.agent_state(has_active_guardrail=active, rule_results=states, counting_rows=rows) == expected
 
 
+@pytest.mark.parametrize(
+    ("result", "counting", "shown"),
+    [
+        ({"state": "held", "reason": None}, False, ("held", None)),
+        ({"state": "held", "reason": None}, True, ("violated", None)),  # a request rule's row
+        ({"state": "violated", "reason": None}, False, ("held", None)),  # acknowledged or allowed
+        ({"state": "violated", "reason": None}, True, ("violated", None)),
+        ({"state": "violated", "reason": "STALE"}, False, ("unverified", "STALE")),
+        ({"state": "violated", "reason": "STALE"}, True, ("violated", "STALE")),
+        ({"state": "unverified", "reason": "NO_HEARTBEAT"}, True, ("violated", "NO_HEARTBEAT")),
+        ({"state": "unverified", "reason": "NO_HEARTBEAT"}, False, ("unverified", "NO_HEARTBEAT")),
+        (None, False, ("unverified", "NOT_COLLECTED")),
+    ],
+)
+def test_a_rule_is_shown_violated_exactly_while_it_has_a_counting_row(result, counting, shown):
+    results = {} if result is None else {"uploads": dict(result, violations=[])}
+    states = g.shown_rule_states(results, ["uploads"] if counting else [])
+    assert (states["uploads"]["state"], states["uploads"]["reason"]) == shown
+    # With every other rule held, the agent's roll-up reads it the same way.
+    others = {rule: state for rule, state in _states().items() if rule != "uploads"}
+    agent = g.agent_state(has_active_guardrail=True, rule_results=dict(others, **results),
+                          counting_rows=int(counting))
+    assert agent == shown[0]
+
+
+def test_a_counting_overflow_row_shows_the_rules_whose_latest_result_is_violated():
+    # An item past the row cap is only in the overflow row, which names no rule.
+    results = _states(saved_files="violated")
+    states = g.shown_rule_states(results, ["(overflow)"], overflow_rule="(overflow)")
+    assert {rule: s["state"] for rule, s in states.items()} == {
+        "service_ports": "held", "saved_files": "violated", "uploads": "held", "out_of_spec_calls": "held"}
+    assert g.shown_rule_states(results, [], overflow_rule="(overflow)")["saved_files"]["state"] == "held"
+
+
 def test_no_asp_yet_leaves_the_asp_rules_unverified():
     request = g.request_rules_status(now=NOW, last_heartbeat_at=NOW, last_unattributed_at=None,
                                      last_tool_calls_unreadable_at=None)

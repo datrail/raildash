@@ -280,7 +280,8 @@ paths:
         Token-gated (DR-184), like every guardrail route: states (`held`,
         `violated`, `unverified`, `no_guardrail`), each rule's state and
         reason, the active version's label and the number of counting rows.
-        No hosts, paths or ports.
+        A rule is `violated` exactly while it has a counting row, the same
+        rows that make the agent `violated`. No hosts, paths or ports.
       parameters:
         - {$ref: '#/components/parameters/RailDashToken'}
       responses:

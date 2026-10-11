@@ -909,16 +909,15 @@ class GuardrailCustody:
                 rule: {"state": g.UNVERIFIED, "reason": g.CHECK_FAILED, "violations": []}
                 for rule in g.RULES
             }
+        counting = [row for row in rows if row["counts"]]
         state = g.agent_state(
-            has_active_guardrail=True, rule_results=rules,
-            counting_rows=sum(1 for row in rows if row["counts"]),
+            has_active_guardrail=True, rule_results=rules, counting_rows=len(counting),
         )
         summary = {
             "state": state,
-            "rules": {
-                rule: {"state": result["state"], "reason": result.get("reason")}
-                for rule, result in rules.items()
-            },
+            "rules": g.shown_rule_states(
+                rules, (row["rule"] for row in counting), overflow_rule=OVERFLOW_RULE
+            ),
         }
         return summary, active, rows
 
