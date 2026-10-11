@@ -1278,57 +1278,73 @@ function guardrailRowAllowable(row, hasActive) {
 // the actions the user says the tool has, saved as a new version.
 const DATA_ACTION_KINDS = ["read", "upload", "update", "delete", "execute"];
 
-function renderDataActionWhy(tool, active, refresh) {
+function renderDataActionWhy(tool, action, active, refresh) {
   const details = el("details", "guardrail-why");
-  details.dataset.key = `why:${tool}`;
-  details.append(el("summary", null, "Why · Override"));
+  details.dataset.key = `why:${tool}:${action}`;
+  const summary = el("summary", null, "Why · Override");
+  summary.setAttribute("aria-label", `Why ${tool} is ${action}, and override its actions`);
+  details.append(summary);
   const body = el("div");
   details.append(body);
+  const override = active && active.guardrail.rules.data_actions
+    ? (active.guardrail.rules.data_actions.overrides || {})[tool] : undefined;
   details.addEventListener("toggle", async () => {
     if (!details.open || body.dataset.loaded) return;
     body.dataset.loaded = "true";
+    body.replaceChildren();
     try {
       const found = await getJSONWithToken("/api/data-actions/tool", { name: tool });
       const why = found.classification;
-      body.replaceChildren(el("p", null,
-        `Classified ${why.actions.length ? why.actions.join(", ") : "unclassified"}` +
-        `${why.weak_read ? " (read only on a hint)" : ""}: ${why.reasons.join("; ") || "no signal"}.`));
+      const said = `${why.actions.length ? why.actions.join(", ") : "unclassified"}` +
+        `${why.weak_read ? " (read only on a hint)" : ""}: ${why.reasons.join("; ") || "no signal"}`;
+      // With an override in force, that is what the rule judges by; the
+      // classifier's view (over every capture of the tool) is shown under it.
+      body.append(el("p", null, override
+        ? `Overridden as ${override.join(", ")}. The classifier says ${said}.`
+        : `Classified ${said}.`));
       (why.notes || []).forEach((note) => body.append(el("p", "muted", note)));
       found.schemas.forEach((schema) => {
         const block = el("details");
         block.append(el("summary", null,
           `${schema.source}${schema.endpoint ? ` from ${schema.endpoint}` : schema.host ? ` sent to ${schema.host}` : ""}`));
-        block.append(el("pre", "guardrail-schema", JSON.stringify(
+        const pre = el("pre", "guardrail-schema", JSON.stringify(
           { description: schema.description, input_schema: schema.input_schema, annotations: schema.annotations },
-          null, 2)));
+          null, 2));
+        pre.tabIndex = 0; // so a long schema scrolls from the keyboard
+        block.append(pre);
         body.append(block);
       });
     } catch (error) {
-      body.dataset.loaded = "";
-      body.replaceChildren(errorMessage(`Couldn't read the tool: ${error.message}`));
-      return;
+      body.append(errorMessage(`Couldn't read the tool: ${error.message}`));
     }
-    if (!active || !active.guardrail.rules.data_actions) return;
-    const current = (active.guardrail.rules.data_actions.overrides || {})[tool];
+    // Override needs only the active version, so it's offered even when the
+    // tool couldn't be read. Not on a "not offered" row: an override changes
+    // what a tool does, not whether its server listed it.
+    if (action === "not_offered" || !active || !active.guardrail.rules.data_actions) return;
     const form = el("fieldset", "guardrail-override");
-    form.append(el("legend", null, current ? `Overridden: ${current.join(", ") || "none"}` : "Override its actions"));
-    const boxes = DATA_ACTION_KINDS.map((action) => {
+    form.append(el("legend", null, override ? `Overridden: ${override.join(", ")}` : "Override its actions"));
+    const boxes = DATA_ACTION_KINDS.map((kind) => {
       const label = el("label");
       const box = el("input");
       box.type = "checkbox";
-      box.value = action;
-      box.checked = Boolean(current && current.includes(action));
-      label.append(box, document.createTextNode(` ${action} `));
+      box.value = kind;
+      box.checked = Boolean(override && override.includes(kind));
+      label.append(box, document.createTextNode(` ${kind} `));
       form.append(label);
       return box;
     });
+    form.append(el("p", "muted",
+      "Tick what the tool does; at least one. To drop an override, switch to an earlier version."));
     form.append(guardrailButton("Save as a new version", async () => {
+      const chosen = boxes.filter((box) => box.checked).map((box) => box.value);
+      if (!chosen.length) throw new Error("Tick at least one action.");
       const rules = JSON.parse(JSON.stringify(active.guardrail.rules));
-      rules.data_actions.overrides[tool] = boxes.filter((box) => box.checked).map((box) => box.value);
+      rules.data_actions.overrides = rules.data_actions.overrides || {};
+      rules.data_actions.overrides[tool] = chosen;
       await postJSON(
         `/api/guardrail-versions/${encodeURIComponent(active.guardrail.guardrail_version_id)}/edit`, { rules });
       refresh();
-    }, { quiet: true, key: `override:${tool}` }));
+    }, { quiet: true, key: `override:${tool}:${action}` }));
     body.append(form);
   });
   return details;
@@ -1340,7 +1356,7 @@ function renderGuardrailRow(row, refresh, hasActive, active = null) {
   const item = el("td");
   item.append(el("code", null, row.overflow ? `${row.count} more items` : row.item));
   if (row.rule === "data_actions" && row.detail.tool && row.detail.action !== "unreadable") {
-    item.append(renderDataActionWhy(row.detail.tool, active, refresh));
+    item.append(renderDataActionWhy(row.detail.tool, row.detail.action, active, refresh));
   }
   // The server's own verdict: a row counts only while unacknowledged and
   // disallowed by the version in force, so none counts with no guardrail.
@@ -1616,7 +1632,10 @@ async function loadGuardrails(focusKey = null) {
     body.replaceChildren(el("p", "muted", "The Data Guardrail is available in the live local dashboard."));
     return;
   }
-  if (focusKey === null && (guardrailBusy > 0 || body.querySelector(".guardrail-editor[open]"))) return;
+  // An open editor, or an open Why · Override (its boxes are unsaved), isn't
+  // redrawn under the user.
+  if (focusKey === null && (guardrailBusy > 0
+    || body.querySelector(".guardrail-editor[open], .guardrail-why[open]"))) return;
   const generation = ++guardrailGeneration;
   let details;
   try {

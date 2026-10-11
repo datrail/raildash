@@ -362,6 +362,9 @@ def test_a_data_action_row_says_why_and_an_override_saves_a_version(tmp_path):
             why = row.locator(".guardrail-why")
             expect(why).to_contain_text("Classified upload", timeout=TIMEOUT)
             expect(why).to_contain_text('argument "content" is base64')
+            # Nothing ticked isn't "harmless": Save asks for an action.
+            why.get_by_role("button", name="Save as a new version").click()
+            expect(why).to_contain_text("Tick at least one action.", timeout=TIMEOUT)
             # Say the tool only reads: a new version, and the row stops counting.
             why.locator('input[value="read"]').check()
             why.get_by_role("button", name="Save as a new version").click()

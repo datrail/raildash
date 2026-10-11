@@ -587,9 +587,19 @@ class DataActionsStore:
         """One tool, for the panel's "Why": its classification now (reasons
         and notes), and the schemas behind it, over every capture that
         called it. None when no call of it was recorded."""
+        # Only the captures that called something by this name: the shown
+        # name, or the name on the wire (`mcp@<endpoint>__<t>` and an
+        # observed `mcp__<server>__<t>` were called as `<t>`).
+        wire = {name}
+        if name.startswith("mcp__") and len(name.split("__", 2)) == 3:
+            wire.add(name.split("__", 2)[2])
+        if name.startswith("mcp@") and "__" in name:
+            wire.add(name.split("__", 1)[1])
         with self._lock:
             refs = [row[0] for row in self._db.execute(
-                "SELECT DISTINCT capture_ref FROM data_action_calls"
+                f"SELECT DISTINCT capture_ref FROM data_action_calls WHERE tool IN "
+                f"({','.join('?' * len(wire))}) LIMIT 500",
+                sorted(wire),
             )]
             rows = [row for row in self._data_action_rows_locked(refs, keep_schemas=True)
                     if row["tool"] == name]
