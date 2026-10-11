@@ -19,6 +19,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import threading
 import uuid
 from contextlib import contextmanager
@@ -52,6 +53,7 @@ from .asp import (
     resolve_identity,
 )
 from .guardrail_store import GUARDRAIL_SCHEMA, GuardrailCustody
+from . import tool_schemas as _tool_schemas
 
 CREDENTIAL_REDACTION_SCHEMA_VERSION = 1
 MIGRATION_BATCH_ROWS = 16
@@ -259,6 +261,30 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+-- DR-205 M0: tool schemas read from token-carrying captures (data-actions
+-- design §4.1), keyed by the capture's own identity: `agent:<host_id>/
+-- <sandbox>/<agent_key>` for an attributed request, else `session:<id>`.
+-- Which guardrail identity that is gets decided where a rule uses it (M2),
+-- as `request_owner` does for a request. `host` is where the listing was
+-- sent or came from; the classifier drops a model request's tools that went
+-- to neither the agent's inference endpoint nor a known provider.
+CREATE TABLE IF NOT EXISTS tool_schemas (
+    capture_ref    TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    endpoint       TEXT NOT NULL DEFAULT '',
+    tool           TEXT NOT NULL,
+    schema_hash    TEXT NOT NULL,
+    host           TEXT,
+    server         TEXT,
+    description    TEXT,
+    input_schema   TEXT NOT NULL,
+    annotations    TEXT,
+    first_seen     TEXT NOT NULL,
+    last_seen      TEXT NOT NULL,
+    interaction_id TEXT,
+    PRIMARY KEY (capture_ref, source, endpoint, tool, schema_hash)
+);
+
 CREATE TRIGGER IF NOT EXISTS asps_immutable_update
 BEFORE UPDATE ON asps BEGIN SELECT RAISE(ABORT, 'ASPs are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS asps_immutable_delete
@@ -320,6 +346,18 @@ _UPGRADE_UNAUTHENTICATED_INTERACTION = (
     # by another authenticated copy, so a redelivery stays a no-op.
     + " WHERE interactions.authenticated = 0"
 )
+
+
+def _capture_ref(interaction: dict[str, Any]) -> str:
+    """The capture's own identity for its tool schemas (see `tool_schemas`)."""
+    if interaction.get("attribution_state") == "attributed" and all(
+        interaction.get(column) for column in ("agent_host_id", "sandbox_name", "agent_key")
+    ):
+        return (
+            f"agent:{interaction['agent_host_id']}/{interaction['sandbox_name']}"
+            f"/{interaction['agent_key']}"
+        )
+    return f"session:{interaction['session_id']}"
 
 
 def _comparison_state(comparable: Any, has_drift: Any) -> str:
@@ -1609,12 +1647,14 @@ class Store(GuardrailCustody):
                     },
                 )
                 inserted += cur.rowcount
-                if active and cur.rowcount and row.get("interaction_id"):
-                    stored = self._db.execute(
+                if authenticated and cur.rowcount and row.get("interaction_id"):
+                    stored = dict(self._db.execute(
                         "SELECT * FROM interactions WHERE session_id = ? AND interaction_id = ?",
                         (session_id, row["interaction_id"]),
-                    ).fetchone()
-                    self._guardrail_on_request(dict(stored), active)
+                    ).fetchone())
+                    self._record_tool_schemas(stored)
+                    if active:
+                        self._guardrail_on_request(stored, active)
             if inserted:
                 self._db.execute(
                     """
@@ -1645,6 +1685,65 @@ class Store(GuardrailCustody):
                 )
             self._db.commit()
         return inserted
+
+    def _record_tool_schemas(self, interaction: dict[str, Any]) -> None:
+        """DR-205 M0: the tool schemas one newly stored authenticated
+        request carries, upserted in the transaction that stores it. A
+        failure is reported and rolled back to its savepoint; the capture is
+        still stored, and the schemas already known stay."""
+        self._db.execute("SAVEPOINT tool_schemas_hook")
+        try:
+            found = _tool_schemas.extract_tool_schemas(interaction)["schemas"]
+            if found:
+                ref = _capture_ref(interaction)
+                now = self._receive_time()
+                for item in found:
+                    self._db.execute(
+                        """
+                        INSERT INTO tool_schemas (
+                            capture_ref, source, endpoint, tool, schema_hash, host,
+                            server, description, input_schema, annotations,
+                            first_seen, last_seen, interaction_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (capture_ref, source, endpoint, tool, schema_hash)
+                        DO UPDATE SET last_seen = excluded.last_seen,
+                                      interaction_id = excluded.interaction_id
+                        """,
+                        (
+                            ref, item["source"], item["endpoint"] or "", item["tool"],
+                            item["schema_hash"], item["host"], item["server"],
+                            item["description"],
+                            json.dumps(item["input_schema"], sort_keys=True),
+                            json.dumps(item["annotations"], sort_keys=True)
+                            if item["annotations"] is not None else None,
+                            now, now, interaction.get("interaction_id"),
+                        ),
+                    )
+        except Exception as exc:  # noqa: BLE001 - evidence must still be stored
+            self._db.execute("ROLLBACK TO tool_schemas_hook")
+            self._db.execute("RELEASE tool_schemas_hook")
+            print(f"raildash: tool schema extraction failed: {exc!r}", file=sys.stderr)
+            return
+        self._db.execute("RELEASE tool_schemas_hook")
+
+    def tool_schemas(self, capture_ref: str | None = None) -> list[dict[str, Any]]:
+        """Stored tool schemas, newest first, optionally for one capture ref."""
+        query = "SELECT * FROM tool_schemas"
+        args: tuple[Any, ...] = ()
+        if capture_ref is not None:
+            query += " WHERE capture_ref = ?"
+            args = (capture_ref,)
+        with self._lock:
+            rows = self._db.execute(query + " ORDER BY last_seen DESC, tool", args).fetchall()
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["input_schema"] = json.loads(item["input_schema"])
+            item["annotations"] = (
+                json.loads(item["annotations"]) if item["annotations"] is not None else None
+            )
+            out.append(item)
+        return out
 
     def add_raw_events(
         self,
