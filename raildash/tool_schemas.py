@@ -61,7 +61,9 @@ MAX_SCHEMA_BYTES = 64 * 1024
 
 UNREADABLE = "UNREADABLE_CAPTURE"
 # Cheap substrings a stored row must contain to be worth parsing at all.
-_MARKERS = ('"tools"', '"functions"', "tools/list", "mcp_list_tools")
+# Unquoted: a body stored as `{"raw": text}` is JSON inside JSON, its quotes
+# escaped.
+_MARKERS = ("tools", "functions")
 NOT_A_TOOL_SOURCE = "NOT_A_TOOL_SOURCE"
 TOO_MANY_TOOLS = "TOO_MANY_TOOLS"
 
