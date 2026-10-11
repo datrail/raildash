@@ -722,8 +722,22 @@ class GuardrailCustody:
         result["data_actions_blocked"] = []
         if result["guardrail"] is not None:
             # DR-205 §4.4: the proposal includes `data_actions`, so a new
-            # guardrail is a v2 version.
-            proposal = self._data_actions_proposal_locked(mine, start, locked_at)
+            # guardrail is a v2 version. The panel asks for the proposal on
+            # every poll, so it is cached until a new capture or schema
+            # arrives (its inputs are the window's requests and schemas).
+            stamp = (
+                alignment["alignment_version_id"],
+                self._db.execute("SELECT max(id) FROM interactions").fetchone()[0],
+                tuple(self._db.execute("SELECT max(last_seen), count(*) FROM tool_schemas").fetchone()),
+                tuple(self._db.execute("SELECT max(rowid), count(*) FROM asps").fetchone()),
+            )
+            cache = self.__dict__.setdefault("_data_actions_proposal_cache", {})
+            proposal = cache.get(stamp)
+            if proposal is None:
+                proposal = self._data_actions_proposal_locked(mine, start, locked_at)
+                cache.clear()
+                cache[stamp] = proposal
+            proposal = json.loads(json.dumps(proposal))
             result["guardrail"]["rules"][g.DATA_ACTIONS] = proposal["rule"]
             result["guardrail"]["guardrail_contract_version"] = g.GUARDRAIL_CONTRACT_VERSION_V2
             result["data_actions_blocked"] = proposal["blocked_until_allowed"]

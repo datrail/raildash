@@ -1147,6 +1147,10 @@ function renderDataActionsBlocked(blocked) {
 
 // DR-205: an agent whose active version predates data actions is offered
 // them. The proposal is fetched when the user opens it, not on every poll.
+// The fetched offer per agent, so a poll's redraw (which reopens the
+// details) shows it again without fetching, and Add sends exactly it.
+const dataActionsOffers = new Map();
+
 function renderDataActionsOffer(agentRef, refresh) {
   const section = el("section", "guardrail-offers guardrail-data-actions-offer");
   section.append(el("h5", null, "Add data actions"));
@@ -1158,32 +1162,46 @@ function renderDataActionsOffer(agentRef, refresh) {
   details.append(el("summary", null, "Show the proposal"));
   const body = el("div");
   details.append(body);
+  const draw = (offer) => {
+    body.replaceChildren();
+    if (!offer) {
+      body.append(el("p", "muted", "Nothing to offer now."));
+      return;
+    }
+    body.append(renderDataActionsPolicy(offer.rule));
+    body.append(renderDataActionsBlocked(offer.blocked_until_allowed));
+  };
+  if (dataActionsOffers.has(agentRef)) draw(dataActionsOffers.get(agentRef));
   details.addEventListener("toggle", async () => {
-    if (!details.open || body.dataset.loaded) return;
-    body.dataset.loaded = "true";
+    if (!details.open || dataActionsOffers.has(agentRef) || body.dataset.loading) return;
+    body.dataset.loading = "true";
     try {
       const { offer } = await getJSONWithToken(`/api/guardrails/${encodeURIComponent(agentRef)}/data-actions-offer`);
-      body.replaceChildren();
-      if (!offer) {
-        body.append(el("p", "muted", "Nothing to offer now."));
-        return;
-      }
-      body.append(renderDataActionsPolicy(offer.rule));
-      body.append(renderDataActionsBlocked(offer.blocked_until_allowed));
+      dataActionsOffers.set(agentRef, offer);
+      draw(offer);
     } catch (error) {
-      body.dataset.loaded = "";
       body.replaceChildren(errorMessage(`The proposal couldn't be read: ${error.message}`));
+    } finally {
+      delete body.dataset.loading;
     }
   });
   section.append(details);
   const base = `/api/guardrails/${encodeURIComponent(agentRef)}/data-actions`;
   const actions = el("div", "asp-actions");
   actions.append(guardrailButton("Add data actions", async () => {
-    await postJSON(base, {});
+    // What's added is exactly what was shown; unseen, it's shown first.
+    const offer = dataActionsOffers.get(agentRef);
+    if (!offer) {
+      details.open = true;
+      throw new Error("Review the proposal first, then add it.");
+    }
+    await postJSON(base, { rule: offer.rule });
+    dataActionsOffers.delete(agentRef);
     refresh();
   }, { key: `data-actions-add:${agentRef}` }));
   actions.append(guardrailButton("Dismiss", async () => {
     await postJSON(`${base}/dismiss`, {});
+    dataActionsOffers.delete(agentRef);
     refresh();
   }, { quiet: true, key: `data-actions-dismiss:${agentRef}` }));
   section.append(actions);

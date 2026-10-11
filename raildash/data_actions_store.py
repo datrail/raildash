@@ -488,6 +488,9 @@ class DataActionsStore:
         # made after the window, an undeclared upload among them.
         called: dict[str, set[str]] = {}
         for request in requests:
+            raw = request.get("raw")
+            if isinstance(raw, str) and not any(marker in raw for marker in _CALL_MARKERS):
+                continue  # no call can be in it; an unreadable POST isn't a call to allow
             ref = capture_ref(request)
             found = self._extract_calls(request, ref)
             for call in self._calls_for_rule(ref, found["calls"]):
