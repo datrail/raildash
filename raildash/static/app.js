@@ -1148,8 +1148,15 @@ function renderDataActionsBlocked(blocked) {
 // DR-205: an agent whose active version predates data actions is offered
 // them. The proposal is fetched when the user opens it, not on every poll.
 // The fetched offer per agent, so a poll's redraw (which reopens the
-// details) shows it again without fetching, and Add sends exactly it.
+// details) shows it again without fetching, and Add sends exactly it. An
+// empty answer isn't kept, and one older than a minute is fetched again.
 const dataActionsOffers = new Map();
+const DATA_ACTIONS_OFFER_FRESH_MS = 60_000;
+
+function freshOffer(agentRef) {
+  const cached = dataActionsOffers.get(agentRef);
+  return cached && Date.now() - cached.at < DATA_ACTIONS_OFFER_FRESH_MS ? cached.offer : null;
+}
 
 function renderDataActionsOffer(agentRef, refresh) {
   const section = el("section", "guardrail-offers guardrail-data-actions-offer");
@@ -1171,13 +1178,13 @@ function renderDataActionsOffer(agentRef, refresh) {
     body.append(renderDataActionsPolicy(offer.rule));
     body.append(renderDataActionsBlocked(offer.blocked_until_allowed));
   };
-  if (dataActionsOffers.has(agentRef)) draw(dataActionsOffers.get(agentRef));
+  if (freshOffer(agentRef)) draw(freshOffer(agentRef));
   details.addEventListener("toggle", async () => {
-    if (!details.open || dataActionsOffers.has(agentRef) || body.dataset.loading) return;
+    if (!details.open || freshOffer(agentRef) || body.dataset.loading) return;
     body.dataset.loading = "true";
     try {
       const { offer } = await getJSONWithToken(`/api/guardrails/${encodeURIComponent(agentRef)}/data-actions-offer`);
-      dataActionsOffers.set(agentRef, offer);
+      if (offer) dataActionsOffers.set(agentRef, { offer, at: Date.now() });
       draw(offer);
     } catch (error) {
       body.replaceChildren(errorMessage(`The proposal couldn't be read: ${error.message}`));
@@ -1190,7 +1197,7 @@ function renderDataActionsOffer(agentRef, refresh) {
   const actions = el("div", "asp-actions");
   actions.append(guardrailButton("Add data actions", async () => {
     // What's added is exactly what was shown; unseen, it's shown first.
-    const offer = dataActionsOffers.get(agentRef);
+    const offer = freshOffer(agentRef);
     if (!offer) {
       details.open = true;
       throw new Error("Review the proposal first, then add it.");

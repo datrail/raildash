@@ -725,10 +725,17 @@ class GuardrailCustody:
             # guardrail is a v2 version. The panel asks for the proposal on
             # every poll, so it is cached until a new capture or schema
             # arrives (its inputs are the window's requests and schemas).
+            # Only captures inside the window, new schema rows and new ASPs
+            # (trusted hosts, declared servers) can change it; a capture
+            # after the lock, or a schema seen again, can't.
             stamp = (
                 alignment["alignment_version_id"],
-                self._db.execute("SELECT max(id) FROM interactions").fetchone()[0],
-                tuple(self._db.execute("SELECT max(last_seen), count(*) FROM tool_schemas").fetchone()),
+                tuple(self._db.execute(
+                    "SELECT max(id), count(*) FROM interactions WHERE authenticated = 1 "
+                    "AND timestamp_ns BETWEEN ? AND ?",
+                    (int(start.timestamp() * 1e9), int(locked_at.timestamp() * 1e9)),
+                ).fetchone()),
+                self._db.execute("SELECT count(*) FROM tool_schemas").fetchone()[0],
                 tuple(self._db.execute("SELECT max(rowid), count(*) FROM asps").fetchone()),
             )
             cache = self.__dict__.setdefault("_data_actions_proposal_cache", {})
