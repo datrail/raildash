@@ -247,7 +247,14 @@ def _merged_detail(rule: str, old: Mapping[str, Any], new: Mapping[str, Any]) ->
     """The detail a repeat leaves on a row: the new hit's, except that an
     `uploads` host row keeps the worst request seen, so that a later
     version re-checking it (`guardrail.item_allowed`) can't be passed by a
-    small last request after a large one."""
+    small last request after a large one. A `data_actions` row keeps every
+    undeclared argument it has seen, and that its upload came from one, so
+    a later version's override can't clear it (DR-205)."""
+    if rule == g.DATA_ACTIONS:
+        merged = dict(new)
+        merged["undeclared"] = sorted({*(old.get("undeclared") or ()), *(new.get("undeclared") or ())})
+        merged["from_undeclared"] = bool(old.get("from_undeclared") or new.get("from_undeclared"))
+        return merged
     if rule != "uploads" or new.get("kind") != "host" or old.get("kind") != "host":
         return dict(new)
     merged = dict(new)

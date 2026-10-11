@@ -255,3 +255,13 @@ def test_calls_are_classified_for_judging_only_under_a_v2_version(store, monkeyp
     live(store)
     send(store, listed(), call("read_doc", {"doc_id": "d"}))
     assert seen == []
+
+
+def test_a_repeat_without_undeclared_arguments_keeps_the_upload_counting(store):
+    ref, adopted = with_data_actions(store, rule(overrides={f"mcp@{ENDPOINT}__read_doc": ["read"]},
+                                                 allowed=[{"tool": f"mcp@{ENDPOINT}__read_doc", "actions": ["read"]}]))
+    live(store)
+    send(store, listed(), call("read_doc", {"doc_id": "a", "blob": "x" * 40}))
+    send(store, call("read_doc", {"doc_id": "b", "blob": "y"}))
+    row = rows(store, ref)[("data_actions", f"mcp@{ENDPOINT}__read_doc · upload")]
+    assert row["counts"] and row["detail"]["from_undeclared"] and row["detail"]["undeclared"] == ["blob"]

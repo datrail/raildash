@@ -1631,7 +1631,7 @@ class Store(GuardrailCustody, DataActionsStore):
             # DR-205: calls are classified for judging only when some active
             # version has the data_actions rule.
             judge_data_actions = any(
-                '"data_actions"' in (item["row"]["contract_json"] or "") for item in active
+                "data_actions" in json.loads(item["row"]["contract_json"])["rules"] for item in active
             )
             for row in rows:
                 if authenticated and not replaced and row.get("interaction_id"):
