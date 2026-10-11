@@ -380,6 +380,24 @@ paths:
         '404': {description: No such id}
         '409': {description: The agent's current state refuses this action}
 
+  /api/guardrails/{agent_ref}/egress-containment:
+    post:
+      operationId: requireContainment
+      summary: Require containment - a new (v3) version with the active rules plus egress_containment
+      description: >-
+        Token-gated (DR-207). Body `{}` requires any contained level of the newest ASP's
+        egress_containment; `{"require": "allow_list_enforced"}` only an enforced allow-list.
+        The answer's `starts_violated` says whether the newest ASP already fails it.
+      parameters:
+        - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '201': {description: The new version, now active, with starts_violated}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such id}
+        '409': {description: No guardrail is active, or it already requires this}
+        '422': {description: require is not contained or allow_list_enforced}
+
   /api/guardrail-rows/{row_id}/acknowledge:
     post:
       operationId: acknowledgeGuardrailRow

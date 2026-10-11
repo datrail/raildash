@@ -1234,6 +1234,25 @@ async def api_dismiss_data_actions(agent_ref: str, request: Request) -> dict[str
     return _guardrail_call(get_store().dismiss_data_actions, agent_ref)
 
 
+@app.post(
+    "/api/guardrails/{agent_ref}/egress-containment",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_require_containment(agent_ref: str, request: Request) -> dict[str, Any]:
+    """**Require containment** (DR-207): a new version with the active
+    version's rules plus `egress_containment`. Body `{}` requires any
+    contained level; `{"require": "allow_list_enforced"}` only an enforced
+    allow-list. The answer's `starts_violated` says whether the newest ASP
+    already fails it."""
+    body = await _control_object(request)
+    require = body.get("require", "contained")
+    if not isinstance(require, str):
+        raise HTTPException(422, "require must be a string")
+    # An unknown value is a 422 from the store's own check (`_guardrail_call`).
+    return _guardrail_call(get_store().require_containment, agent_ref, require)
+
+
 # --------------------------------------------------------- legacy JSON routes
 # Kept because the previous server documented them in its own index page and
 # openapi.yaml. Same paths, same meaning.

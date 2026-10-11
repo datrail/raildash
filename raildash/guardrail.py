@@ -6,7 +6,9 @@ every captured request of that agent is checked against. It is policy the
 operator approved, kept apart from the alignment version (the baseline), so
 the alignment contract and every locked baseline stay as they are. The design
 is railxia/docs `design/2026-10-07-data-guardrail/data-guardrail-design.md`;
-section numbers below are its.
+section numbers below are its. Later versions add optional rules: v2
+`data_actions` (DR-205) and v3 `egress_containment` (DR-207,
+`design/2026-10-11-egress-containment`).
 
 Like `raildash.asp`, this module has no database, HTTP or UI dependency and
 never reads the clock: every time it needs is an argument. Storage and the
@@ -19,15 +21,15 @@ The API, in the order a caller meets it:
 - `propose_guardrail(...)`: the §4.4 first guardrail from a locked baseline
   and the agent's requests from the 24 h before the lock, with what would be
   a violation and why a declared list is empty.
-- `evaluate_asp(guardrail, bundle, ...)`: `service_ports` and `saved_files`
-  against one parsed ASP, staleness included.
+- `evaluate_asp(guardrail, bundle, ...)`: `service_ports`, `saved_files`
+  and `egress_containment` against one parsed ASP, staleness included.
 - `request_owner(interaction, guardrails, ...)`: which active guardrail one
   captured request belongs to, if any (§4.3).
 - `evaluate_request(guardrail, interaction, ...)`: `uploads` and
   `out_of_spec_calls` against one captured request.
 - `request_rules_status(...)`: whether the two request rules can be verified
   at all now (collector heartbeat, unattributed traffic).
-- `rule_states(asp_result, request_status)`: the four rules' latest results
+- `rule_states(asp_result, request_status)`: every rule's latest results
   in one map, multi-agent applied.
 - `shown_rule_states(rule_results, counting_rules)`: each rule's state as
   the panel and `/api/guardrails` show it, from the same rows the agent's
@@ -148,17 +150,33 @@ _VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
 # v1 version stays valid and is judged on its four rules.
 SCHEMA_V2_PATH = SCHEMA_PATH.with_name("guardrail-version-v2.schema.json")
 SCHEMA_V2: dict[str, Any] = json.loads(SCHEMA_V2_PATH.read_text())
+# DR-207: v3 adds the optional `egress_containment` rule and makes
+# `data_actions` optional. A version is v3 exactly when it has
+# `egress_containment` (`contract_version`), so one rule set has one encoding.
+SCHEMA_V3_PATH = SCHEMA_PATH.with_name("guardrail-version-v3.schema.json")
+SCHEMA_V3: dict[str, Any] = json.loads(SCHEMA_V3_PATH.read_text())
 _VALIDATORS = {
     1: _VALIDATOR,
     2: Draft202012Validator(SCHEMA_V2, format_checker=FormatChecker()),
+    3: Draft202012Validator(SCHEMA_V3, format_checker=FormatChecker()),
 }
 
 GUARDRAIL_CONTRACT_VERSION = SCHEMA["properties"]["guardrail_contract_version"]["const"]
 GUARDRAIL_CONTRACT_VERSION_V2 = SCHEMA_V2["properties"]["guardrail_contract_version"]["const"]
+GUARDRAIL_CONTRACT_VERSION_V3 = SCHEMA_V3["properties"]["guardrail_contract_version"]["const"]
 RULES = ("uploads", "saved_files", "service_ports", "out_of_spec_calls")
 DATA_ACTIONS = "data_actions"
+EGRESS = "egress_containment"
 RULES_V2 = (*RULES, DATA_ACTIONS)
 ASP_RULES = ("service_ports", "saved_files")
+# Every rule judged on the newest ASP: v1's two, and DR-207's when a version has it.
+ALL_ASP_RULES = (*ASP_RULES, EGRESS)
+# The attribute `egress_containment` reads (RailMon rule pack 11), and the
+# levels that are contained (egress-containment design §4.2).
+EGRESS_ATTRIBUTE = "egress_containment"
+EGRESS_PROXY_ATTRIBUTE = "egress_proxy_declared"
+CONTAINED_LEVELS = ("allow_list_enforced", "no_network", "internal_network")
+EGRESS_LEVELS = (*CONTAINED_LEVELS, "open", "host_network", "host_process")
 REQUEST_RULES = ("uploads", "out_of_spec_calls")
 # `request_rules_status` answers for every request rule a version can have.
 ALL_REQUEST_RULES = (*REQUEST_RULES, DATA_ACTIONS)
@@ -172,10 +190,20 @@ JUDGED_TOOL_PREFIXES = ("mcp__", "mcp@", "provider-mcp__")
 
 
 def contract_rules(contract: Mapping[str, Any] | None) -> tuple[str, ...]:
-    """The rules a version has: v1's four, and `data_actions` in v2."""
-    if contract is not None and DATA_ACTIONS in (contract.get("rules") or {}):
-        return RULES_V2
-    return RULES
+    """The rules a version has: v1's four, plus `data_actions` and
+    `egress_containment` where it lists them."""
+    present = (contract or {}).get("rules") or {}
+    return (*RULES, *(rule for rule in (DATA_ACTIONS, EGRESS) if rule in present))
+
+
+def contract_version(rules: Mapping[str, Any]) -> int:
+    """The contract version a rule set is written at: v3 with
+    `egress_containment`, else v2 with `data_actions`, else v1."""
+    if EGRESS in rules:
+        return GUARDRAIL_CONTRACT_VERSION_V3
+    if DATA_ACTIONS in rules:
+        return GUARDRAIL_CONTRACT_VERSION_V2
+    return GUARDRAIL_CONTRACT_VERSION
 LISTENERS_ATTRIBUTE = "observed_listeners"
 
 HELD, VIOLATED, UNVERIFIED = "held", "violated", "unverified"
@@ -980,7 +1008,8 @@ def evaluate_asp(
     now: datetime | str,
     newest_received_at: datetime | str | None = None,
 ) -> dict[str, Any]:
-    """`service_ports` and `saved_files` against the newest parsed ASP.
+    """`service_ports`, `saved_files` and, where the version has it,
+    `egress_containment` (DR-207) against the newest parsed ASP.
 
     Staleness is judged on `newest_received_at` when the caller knows it,
     else on the bundle's own `collected_at`; `previous_collected_at` is then
@@ -991,8 +1020,8 @@ def evaluate_asp(
     `bundle` is what `raildash.asp.parse_bundle` returns for the stored
     bytes; the caller has matched its identity to the guardrail's.
     Returns `{"multi_agent": bool, "stale": bool, "rules": {...}}`. A
-    multi-agent bundle evaluates nothing and makes all four rules
-    Unverified; `rule_states` carries that over the request rules.
+    multi-agent bundle evaluates nothing and makes every rule the version
+    has Unverified; `rule_states` carries that over the request rules.
 
     Per rule, from the attribute's status: `ANSWERED` and `ABSENT` are
     verified; `PARTIAL` is violated when a listed item breaks the rule (a
@@ -1008,7 +1037,7 @@ def evaluate_asp(
             "stale": False,
             "rules": {
                 rule: {"state": UNVERIFIED, "reason": MULTI_AGENT, "violations": []}
-                for rule in RULES
+                for rule in contract_rules(guardrail)
             },
         }
     stale = asp_is_stale(newest_received_at or bundle["collected_at"], previous_collected_at, now)
@@ -1027,7 +1056,77 @@ def evaluate_asp(
             stale,
         ),
     }
+    if EGRESS in rules:
+        results[EGRESS] = _egress_rule(attributes.get(EGRESS_ATTRIBUTE), rules[EGRESS], stale, source)
     return {"multi_agent": False, "stale": stale, "rules": results}
+
+
+def egress_meets(level: Any, require: str) -> bool:
+    """Whether a containment level meets a rule's `require`."""
+    if require == "allow_list_enforced":
+        return level == "allow_list_enforced"
+    return level in CONTAINED_LEVELS
+
+
+def egress_reading(attribute: Any) -> dict[str, Any] | None:
+    """The newest ASP's containment as the panel shows it, or None when the
+    attribute isn't there (an ASP from before RailMon's rule pack 11).
+    A level is read only from an `ANSWERED` or `PARTIAL` value of the
+    published shape; anything else is shown as unknown with its status."""
+    if not isinstance(attribute, dict):
+        return None
+    status = attribute.get("status")
+    value = attribute.get("value")
+    reading: dict[str, Any] = {"status": status, "level": None, "contained": None}
+    if status in ("ANSWERED", "PARTIAL") and isinstance(value, dict) and value.get("level") in EGRESS_LEVELS:
+        # The bundle schemas close this value (v1's own, v2's held to it in
+        # `raildash.asp`), but a reading is never where a bad one crashes.
+        observations = value.get("observations") if isinstance(value.get("observations"), dict) else {}
+        networks = [n for n in _list(observations.get("networks")) if isinstance(n, dict)]
+        reading.update(
+            level=value["level"],
+            contained=value["level"] in CONTAINED_LEVELS and status == "ANSWERED",
+            enforcer=value.get("enforcer") if isinstance(value.get("enforcer"), str) else None,
+            via=value.get("via") if isinstance(value.get("via"), str) else None,
+            gateway_peers=sorted({str(p) for n in networks for p in _list(n.get("gateway_peers"))}),
+            reasons=[str(r) for r in _list(value.get("reasons"))],
+        )
+    return reading
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
+
+
+def _egress_rule(
+    attribute: Any, rule: Mapping[str, Any], stale: bool, source: dict[str, Any]
+) -> dict[str, Any]:
+    """`egress_containment` on the newest ASP (egress-containment design
+    §4.4). `ANSWERED` is verified; `PARTIAL` is missing evidence (a network
+    RailMon couldn't inspect decided it), not an observed break, so it is
+    Unverified with no row, as DR-184 G3 holds for every rule; `BLIND`,
+    `FAILED` and a missing attribute are Unverified. A violation on a stale
+    ASP stays real and says so, like the other ASP rules."""
+    if not isinstance(attribute, dict):
+        return {"state": UNVERIFIED, "reason": NOT_COLLECTED, "violations": []}
+    status = attribute.get("status")
+    if status == "PARTIAL":
+        return {"state": UNVERIFIED, "reason": PARTIAL_NO_VIOLATION, "violations": []}
+    if status != "ANSWERED":
+        return {"state": UNVERIFIED, "reason": status or NOT_COLLECTED, "violations": []}
+    value = attribute.get("value")
+    level = value.get("level") if isinstance(value, dict) else None
+    if level not in EGRESS_LEVELS:
+        return {"state": UNVERIFIED, "reason": MALFORMED_EVIDENCE, "violations": []}
+    reason = STALE if stale else None
+    if egress_meets(level, rule["require"]):
+        return {"state": UNVERIFIED if reason else HELD, "reason": reason, "violations": []}
+    violation = _violation(
+        EGRESS, level, OBSERVED, source,
+        level=level, require=rule["require"],
+        reasons=[str(r) for r in _list(value.get("reasons"))][:16],
+    )
+    return {"state": VIOLATED, "reason": reason, "violations": [violation]}
 
 
 def _attribute_rule(attribute: Any, check: Any, stale: bool) -> dict[str, Any]:
@@ -1110,7 +1209,7 @@ def rule_states(
     asp_result: Mapping[str, Any] | None, request_status: Mapping[str, Mapping[str, Any]],
     rules: Iterable[str] = RULES,
 ) -> dict[str, dict[str, Any]]:
-    """All four rules' latest results: the ASP rules from `evaluate_asp`
+    """Every rule's latest results: the ASP rules from `evaluate_asp`
     (Unverified `NOT_COLLECTED` when no ASP has been evaluated) and the
     request rules from `request_rules_status`, except that a multi-agent ASP
     makes every rule Unverified (multi-agent)."""
@@ -1119,7 +1218,7 @@ def rule_states(
         multi = next(iter(asp_result["rules"].values()))
         return {rule: dict(asp_result["rules"].get(rule, multi)) for rule in rules}
     states: dict[str, dict[str, Any]] = {}
-    for rule in ASP_RULES:
+    for rule in (r for r in rules if r in ALL_ASP_RULES):
         result = (asp_result or {}).get("rules", {}).get(rule)
         states[rule] = (
             dict(result)
@@ -1127,7 +1226,7 @@ def rule_states(
             else {"state": UNVERIFIED, "reason": NOT_COLLECTED, "violations": []}
         )
     for rule in rules:
-        if rule not in ASP_RULES:
+        if rule not in ALL_ASP_RULES:
             states[rule] = dict(request_status[rule])
     return states
 
@@ -1241,6 +1340,11 @@ def item_allowed(guardrail: Mapping[str, Any], violation: Mapping[str, Any]) -> 
             # A v1 version has no such rule: switching back to one stops it.
             return True
         return data_action_row_allowed(rules[DATA_ACTIONS], detail)
+    if rule == EGRESS:
+        if EGRESS not in rules:
+            # A version that doesn't require containment stops the row.
+            return True
+        return egress_meets(detail.get("level", item), rules[EGRESS]["require"])
     return False
 
 
@@ -1482,6 +1586,13 @@ def propose_guardrail(
             },
         },
     }
+    # DR-207 §4.4: containment is required only when the baseline was
+    # contained, so adopting never starts Violated, and an agent that was
+    # contained gets a regression alarm.
+    egress = egress_reading(attributes.get(EGRESS_ATTRIBUTE))
+    if egress is not None and egress["contained"]:
+        guardrail["rules"][EGRESS] = {"require": "contained"}
+        guardrail["guardrail_contract_version"] = contract_version(guardrail["rules"])
     # What the agent called before the lock that nothing declared: not
     # seeded, since surfacing it is what the rule is for.
     seen: set[str] = set()
@@ -1508,6 +1619,7 @@ def propose_guardrail(
         "would_be_violations": would_be,
         "empty_because": empty_because,
         "reason": None,
+        "egress": egress,
     }
 
 
@@ -1705,6 +1817,10 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
                 return updated
         allowed.append({"tool": tool, "actions": [action]})
         return updated
+    if rule == EGRESS:
+        # The row is the agent not being contained; "allowing" it would be
+        # dropping the requirement, which is an edit, not one click.
+        raise ValueError("an uncontained agent can't be allowed; edit the version to stop requiring containment")
     raise ValueError(f"unknown rule {rule!r}")
 
 

@@ -49,6 +49,13 @@ _DEPLOYMENT_VALUE_VALIDATOR = Draft202012Validator(
 _FILE_ACCESS_VALUE_VALIDATOR = Draft202012Validator(
     {**SCHEMA["$defs"]["file_access_value"], "$schema": SCHEMA["$schema"]}
 )
+# DR-207: and for `egress_containment` (`egress_containment_value`), wherever
+# a v2 bundle carries it: RailMon writes it sandbox-scoped, and the guardrail
+# reads a lone agent's scope under the sandbox's.
+_EGRESS_VALUE_VALIDATOR = Draft202012Validator(
+    {**SCHEMA["$defs"]["egress_containment_value"], "$schema": SCHEMA["$schema"]}
+)
+EGRESS_ATTRIBUTE = "egress_containment"
 FILE_ACCESS_ATTRIBUTE = "observed_file_access"
 FILE_ACCESS_VALUED_STATUSES = frozenset({"ANSWERED", "PARTIAL"})
 # The bound the v1 schema's top-level `$comment` names as code-only: the value
@@ -276,6 +283,20 @@ def _attestation_ref_problems(
     return problems
 
 
+def _egress_value_problems(where: str, attributes: Any) -> list[str]:
+    """An ANSWERED or PARTIAL `egress_containment` value in a v2 scope, held
+    to v1's `egress_containment_value` (DR-207)."""
+    attribute = attributes.get(EGRESS_ATTRIBUTE) if isinstance(attributes, dict) else None
+    if not isinstance(attribute, dict) or attribute.get("status") not in FILE_ACCESS_VALUED_STATUSES:
+        return []
+    return [
+        f"{where}.{EGRESS_ATTRIBUTE}.value"
+        + "".join(f"[{part}]" if isinstance(part, int) else f".{part}" for part in error.path)
+        + f": {error.message}"
+        for error in _EGRESS_VALUE_VALIDATOR.iter_errors(attribute.get("value"))
+    ]
+
+
 def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
     """The rules the published v2 schema cannot express (per its own
     `$comment`): every `attestation_ref`, in `sandbox.attributes` or any
@@ -286,7 +307,9 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
     `_semantic_problems`); and an ANSWERED sandbox `deployment` value has
     v1's shape and byte bound, since it resolves to the same identity; and
     an ANSWERED or PARTIAL sandbox `observed_file_access` value has v1's
-    `file_access_value` shape and its byte bound (DR-154)."""
+    `file_access_value` shape and its byte bound (DR-154); and an ANSWERED
+    or PARTIAL `egress_containment` value, in any scope, has v1's
+    `egress_containment_value` shape (DR-207)."""
     problems, attestation_ids = _common_semantic_problems(bundle)
 
     sandbox = bundle.get("sandbox")
@@ -310,6 +333,7 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
                 f"sandbox.attributes.{FILE_ACCESS_ATTRIBUTE}.value{location}: {error.message}"
             )
         problems.extend(_file_access_byte_problems(file_access, "sandbox.attributes"))
+    problems.extend(_egress_value_problems("sandbox.attributes", sandbox_attributes))
 
     agents = bundle.get("agents")
     agent_keys: list[str] = []
@@ -328,6 +352,7 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
                 f"agents[{index}].attributes", agent.get("attributes"), attestation_ids
             )
         )
+        problems.extend(_egress_value_problems(f"agents[{index}].attributes", agent.get("attributes")))
     if agent_keys != sorted(agent_keys):
         problems.append("agents: agent_key values must be sorted ascending")
     if len(set(agent_keys)) != len(agent_keys):

@@ -380,3 +380,59 @@ def test_a_data_action_row_says_why_and_an_override_saves_a_version(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_the_egress_line_and_require_containment(tmp_path):
+    """DR-207 M2: the Egress line in words with the declared proxy beside it,
+    and Require containment on an open agent warning first, then making a
+    version whose rule is violated."""
+    from test_guardrail_egress import PROXY, egress
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    value = asp(listeners=[DEMO_LISTENER], egress_containment=egress("open"), egress_proxy_declared=PROXY)
+    asp_id = store.load_asp(json.dumps(value).encode())["asp_id"]
+    alignment = store.make_baseline(asp_id, "v1.0")["alignment_version"]
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            line = card.locator(".guardrail-egress")
+            expect(line).to_contain_text("Open: this agent can reach any host", timeout=TIMEOUT)
+            expect(line).to_contain_text("declares a proxy (HTTPS_PROXY=http://proxy.corp:3128)")
+            expect(line).to_contain_text("doesn't force traffic through it")
+            expect(card.locator('.guardrail-rules [data-rule="egress_containment"]')).to_have_count(0)
+            require = card.locator(".guardrail-require-egress")
+            expect(require).to_contain_text("starts Violated")
+            require.get_by_role("button", name="Require containment").click()
+            expect(card.locator('.guardrail-rules [data-rule="egress_containment"]')).to_contain_text(
+                "violated", timeout=TIMEOUT)
+            expect(card.locator(".asp-state")).to_have_text("Violated")
+            expect(card.locator("tr", has_text="open")).to_contain_text("counts")
+            expect(card.locator(".guardrail-require-egress")).to_have_count(0)
+            card.locator(".guardrail-active-policy > summary").click()
+            expect(card.locator(".guardrail-active-policy")).to_contain_text("must be contained")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
