@@ -851,9 +851,10 @@ class GuardrailCustody:
         if self._offered_locked(endpoint, wire, _instant(called_at)) is not False:
             return
         active = self._active_guardrail_row(kind, value)
-        if active is None or _instant(called_at) < _instant(active["activated_at"]):
-            # Turned off, or a version activated after the call: as for any
-            # request, a version never judges what came before it (§4.5).
+        if active is None:
+            # Turned off since the call. (A call is only queued while a
+            # guardrail is active, so a newer version -- an Allow this, an
+            # edit -- judges it with today's policy, and doesn't drop it.)
             return
         rule = json.loads(active["contract_json"])["rules"].get(g.DATA_ACTIONS)
         if rule is None or g.data_action_allowed(rule, tool, "not_offered"):

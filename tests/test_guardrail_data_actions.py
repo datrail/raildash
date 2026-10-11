@@ -475,14 +475,20 @@ def test_a_late_first_listing_is_still_compared(store):
     assert ("data_actions", f"mcp@{ENDPOINT}__export_all · not offered by {ENDPOINT}") in rows(store, ref)
 
 
-def test_a_version_activated_after_the_call_does_not_judge_it(store):
+def test_a_newer_version_judges_a_queued_call_and_a_turn_off_drops_it(store):
     ref, adopted = with_data_actions(store, rule([{"tool": f"mcp@{ENDPOINT}__*", "actions": ["read", "unclassified"]}]))
     live(store)
     send(store, listed(), call("export_all", {}))
+    # An edit (as Allow this makes) in the delay doesn't lose the call.
     store.edit_guardrail(adopted["guardrail"]["guardrail_version_id"], adopted["guardrail"]["rules"])
     _due_now(store)
     live(store)
-    assert not any("not offered" in key[1] for key in rows(store, ref))
+    assert any("not offered" in key[1] for key in rows(store, ref))
+    send(store, call("another_tool", {}))
+    store.turn_off_guardrail(ref)
+    _due_now(store)
+    live(store)
+    assert not any("another_tool" in key[1] for key in rows(store, ref))
 
 
 def test_a_failing_judgement_marks_the_check_and_does_not_block_the_queue(store, monkeypatch):
