@@ -264,3 +264,85 @@ def test_a_failed_extraction_still_stores_the_capture(tmp_path, monkeypatch):
     assert store.add_interactions("s1", [normalise(anthropic_request())], authenticated=True) == 1
     assert store.tool_schemas() == []
     store.close()
+
+
+# ------------------------------------------------------- review round 1
+
+
+def test_odd_jsonrpc_ids_match_nothing_and_never_cost_the_rest_of_the_reply():
+    odd = [{"jsonrpc": "2.0", "id": [1], "result": {"tools": [{"name": "x", "inputSchema": READ_SCHEMA}]}},
+           {"jsonrpc": "2.0", "id": True, "result": {"tools": [{"name": "y", "inputSchema": READ_SCHEMA}]}},
+           {"jsonrpc": "2.0", "id": 1.0, "result": {"tools": [{"name": "z", "inputSchema": READ_SCHEMA}]}},
+           {"jsonrpc": "2.0", "id": "1", "result": {"tools": [{"name": "w", "inputSchema": READ_SCHEMA}]}},
+           LISTING]
+    assert set(by_tool(ts.extract_tool_schemas(stored(mcp_tools_list(odd))))) == {"read_doc", "upload_file"}
+    string_id = mcp_tools_list({**LISTING, "id": "a"}, request_id="a")
+    assert set(by_tool(ts.extract_tool_schemas(stored(string_id)))) == {"read_doc", "upload_file"}
+
+
+def test_the_legacy_functions_list_is_read():
+    item = exchange("api.openai.com", "/v1/chat/completions", {
+        "model": "gpt-4", "messages": [],
+        "functions": [{"name": "read_doc", "description": "Read one doc.", "parameters": READ_SCHEMA}],
+    })
+    assert list(by_tool(ts.extract_tool_schemas(stored(item)))) == ["read_doc"]
+
+
+def test_a_huge_tool_list_stops_at_the_cap_quickly():
+    import time
+    huge = exchange("api.anthropic.com", "/v1/messages", {
+        "model": "m", "messages": [],
+        "tools": [{"name": f"t{i}", "input_schema": {}} for i in range(200_000)],
+    })
+    started = time.monotonic()
+    result = ts.extract_tool_schemas(stored(huge))
+    assert result["reason"] == ts.TOO_MANY_TOOLS
+    assert len(result["schemas"]) == ts.MAX_TOOLS_PER_SOURCE
+    assert time.monotonic() - started < 3
+
+
+def test_rows_that_cannot_carry_tools_are_not_parsed():
+    assert not ts.may_carry_tools(json.dumps(exchange("api.example.com", "/x", {"a": 1})))
+    assert ts.may_carry_tools(json.dumps(anthropic_request()))
+    assert ts.may_carry_tools(json.dumps(mcp_tools_list(LISTING)))
+
+
+def test_a_schema_sent_to_a_bogus_host_first_does_not_take_the_trusted_row(tmp_path):
+    store = Store(tmp_path / "r.db")
+    store.upsert_session("s1", agent="agent", source="test")
+    bogus = anthropic_request()
+    bogus["interaction_id"] = "bogus"
+    bogus["request"]["headers"]["host"] = "evil.example"
+    store.add_interactions("s1", [normalise(bogus)], authenticated=True)
+    store.add_interactions("s1", [normalise(anthropic_request())], authenticated=True)
+    hosts = {(row["tool"], row["host"]) for row in store.tool_schemas("session:s1")}
+    assert ("mcp__docs__upload_file", "evil.example") in hosts
+    assert ("mcp__docs__upload_file", "api.anthropic.com") in hosts
+    store.close()
+
+
+def test_an_authenticated_copy_of_an_unauthenticated_capture_records_its_schemas(tmp_path):
+    store = Store(tmp_path / "r.db")
+    store.upsert_session("s1", agent="agent", source="test")
+    store.add_interactions("s1", [normalise(anthropic_request())])
+    assert store.tool_schemas() == []
+    store.add_interactions("s1", [normalise(anthropic_request())], authenticated=True)
+    assert {row["tool"] for row in store.tool_schemas("session:s1")} == {"Bash", "mcp__docs__upload_file"}
+    store.close()
+
+
+def test_a_database_from_before_m0_gains_the_table(tmp_path):
+    import sqlite3
+
+    database = tmp_path / "r.db"
+    store = Store(database)
+    store.close()
+    db = sqlite3.connect(database)
+    db.execute("DROP TABLE tool_schemas")
+    db.commit()
+    db.close()
+    store = Store(database)
+    store.upsert_session("s1", agent="agent", source="test")
+    store.add_interactions("s1", [normalise(anthropic_request())], authenticated=True)
+    assert len(store.tool_schemas()) == 2
+    store.close()

@@ -266,15 +266,17 @@ CREATE TABLE IF NOT EXISTS settings (
 -- <sandbox>/<agent_key>` for an attributed request, else `session:<id>`.
 -- Which guardrail identity that is gets decided where a rule uses it (M2),
 -- as `request_owner` does for a request. `host` is where the listing was
--- sent or came from; the classifier drops a model request's tools that went
--- to neither the agent's inference endpoint nor a known provider.
+-- sent or came from, and is part of the key: the classifier drops a model
+-- request's tools that went to neither the agent's inference endpoint nor a
+-- known provider, so the same schema sent to a bogus host first must not
+-- take the row a trusted host's copy needs.
 CREATE TABLE IF NOT EXISTS tool_schemas (
     capture_ref    TEXT NOT NULL,
     source         TEXT NOT NULL,
     endpoint       TEXT NOT NULL DEFAULT '',
     tool           TEXT NOT NULL,
     schema_hash    TEXT NOT NULL,
-    host           TEXT,
+    host           TEXT NOT NULL DEFAULT '',
     server         TEXT,
     description    TEXT,
     input_schema   TEXT NOT NULL,
@@ -282,7 +284,7 @@ CREATE TABLE IF NOT EXISTS tool_schemas (
     first_seen     TEXT NOT NULL,
     last_seen      TEXT NOT NULL,
     interaction_id TEXT,
-    PRIMARY KEY (capture_ref, source, endpoint, tool, schema_hash)
+    PRIMARY KEY (capture_ref, source, endpoint, tool, schema_hash, host)
 );
 
 CREATE TRIGGER IF NOT EXISTS asps_immutable_update
@@ -1648,13 +1650,14 @@ class Store(GuardrailCustody):
                 )
                 inserted += cur.rowcount
                 if authenticated and cur.rowcount and row.get("interaction_id"):
-                    stored = dict(self._db.execute(
-                        "SELECT * FROM interactions WHERE session_id = ? AND interaction_id = ?",
-                        (session_id, row["interaction_id"]),
-                    ).fetchone())
-                    self._record_tool_schemas(stored)
+                    if _tool_schemas.may_carry_tools(row.get("raw")):
+                        self._record_tool_schemas({**row, "session_id": session_id})
                     if active:
-                        self._guardrail_on_request(stored, active)
+                        stored = self._db.execute(
+                            "SELECT * FROM interactions WHERE session_id = ? AND interaction_id = ?",
+                            (session_id, row["interaction_id"]),
+                        ).fetchone()
+                        self._guardrail_on_request(dict(stored), active)
             if inserted:
                 self._db.execute(
                     """
@@ -1705,13 +1708,13 @@ class Store(GuardrailCustody):
                             server, description, input_schema, annotations,
                             first_seen, last_seen, interaction_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (capture_ref, source, endpoint, tool, schema_hash)
+                        ON CONFLICT (capture_ref, source, endpoint, tool, schema_hash, host)
                         DO UPDATE SET last_seen = excluded.last_seen,
                                       interaction_id = excluded.interaction_id
                         """,
                         (
                             ref, item["source"], item["endpoint"] or "", item["tool"],
-                            item["schema_hash"], item["host"], item["server"],
+                            item["schema_hash"], item["host"] or "", item["server"],
                             item["description"],
                             json.dumps(item["input_schema"], sort_keys=True),
                             json.dumps(item["annotations"], sort_keys=True)

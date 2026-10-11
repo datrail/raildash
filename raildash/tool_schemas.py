@@ -21,9 +21,10 @@ classifier (M1) leaves it out. Keeping it costs a row; dropping it at ingest
 would need the agent's newest ASP for every captured request.
 
 Nothing here fails closed, unlike `guardrail.requested_tool_calls`: a schema
-that can't be read is simply not added, and the schemas a tool already has
-stay. Each extraction says why it read nothing (`reason`), for the tests and
-for the panel to explain an empty list.
+that can't be read is simply not added (an SSE event that isn't JSON, a
+compressed or over-large reply, a malformed tool or id), and the schemas a
+tool already has stay. `reason` says why when the capture itself can't be
+read, isn't a tool source, or was cut at a bound.
 """
 
 from __future__ import annotations
@@ -59,6 +60,8 @@ MAX_TOOLS_PER_SOURCE = 512
 MAX_SCHEMA_BYTES = 64 * 1024
 
 UNREADABLE = "UNREADABLE_CAPTURE"
+# Cheap substrings a stored row must contain to be worth parsing at all.
+_MARKERS = ('"tools"', '"functions"', "tools/list", "mcp_list_tools")
 NOT_A_TOOL_SOURCE = "NOT_A_TOOL_SOURCE"
 TOO_MANY_TOOLS = "TOO_MANY_TOOLS"
 
@@ -74,6 +77,14 @@ def schema_hash(description: Any, input_schema: Any, annotations: Any) -> str:
 
 def known_model_host(host: str | None, extra: tuple[str, ...] = ()) -> bool:
     return g.host_allowed(host, (*KNOWN_MODEL_HOSTS, *extra))
+
+
+def may_carry_tools(raw: Any) -> bool:
+    """Whether a stored row's `raw` text could hold a tool listing, so the
+    full parse is spent only on rows that might."""
+    if not isinstance(raw, str):
+        return True
+    return any(marker in raw for marker in _MARKERS)
 
 
 def extract_tool_schemas(interaction: Mapping[str, Any]) -> dict[str, Any]:
@@ -98,29 +109,33 @@ def extract_tool_schemas(interaction: Mapping[str, Any]) -> dict[str, Any]:
     request_body = _json_body(request.get("body"))
 
     out: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
     capped = False
 
     def add(source: str, tool: Any, description: Any, input_schema: Any,
             annotations: Any = None, *, endpoint: str | None = None,
-            server: str | None = None) -> None:
+            server: str | None = None) -> bool:
+        """Add one tool; False once its source is full, so the caller stops."""
         nonlocal capped
-        if not isinstance(tool, str) or not tool or not isinstance(input_schema, dict):
-            return
-        if sum(1 for item in out if item["source"] == source) >= MAX_TOOLS_PER_SOURCE:
+        if counts.get(source, 0) >= MAX_TOOLS_PER_SOURCE:
             capped = True
-            return
+            return False
+        if not isinstance(tool, str) or not tool or not isinstance(input_schema, dict):
+            return True
         description = description if isinstance(description, str) else None
         annotations = annotations if isinstance(annotations, dict) else None
-        size = len(json.dumps([description, input_schema, annotations], ensure_ascii=False))
-        if size > MAX_SCHEMA_BYTES:
+        text = json.dumps([description, input_schema, annotations], ensure_ascii=False)
+        if len(text.encode("utf-8", "surrogatepass")) > MAX_SCHEMA_BYTES:
             capped = True
-            return
+            return True
+        counts[source] = counts.get(source, 0) + 1
         out.append({
             "source": source, "tool": tool, "host": host, "endpoint": endpoint,
             "server": server, "description": description, "input_schema": input_schema,
             "annotations": annotations,
             "schema_hash": schema_hash(description, input_schema, annotations),
         })
+        return True
 
     # A model request's tool list.
     if _is_model_request(request_body):
@@ -128,41 +143,53 @@ def extract_tool_schemas(interaction: Mapping[str, Any]) -> dict[str, Any]:
             function = item.get("function")
             if item.get("type") == "function" and isinstance(function, dict):
                 # OpenAI Chat Completions.
-                add(SOURCE_MODEL_REQUEST, function.get("name"), function.get("description"),
-                    function.get("parameters"))
+                keep = add(SOURCE_MODEL_REQUEST, function.get("name"),
+                           function.get("description"), function.get("parameters"))
             elif item.get("type") == "function":
                 # OpenAI Responses.
-                add(SOURCE_MODEL_REQUEST, item.get("name"), item.get("description"),
-                    item.get("parameters"))
+                keep = add(SOURCE_MODEL_REQUEST, item.get("name"), item.get("description"),
+                           item.get("parameters"))
             elif "input_schema" in item:
                 # Anthropic Messages (client tools; server tools carry none).
-                add(SOURCE_MODEL_REQUEST, item.get("name"), item.get("description"),
-                    item.get("input_schema"))
+                keep = add(SOURCE_MODEL_REQUEST, item.get("name"), item.get("description"),
+                           item.get("input_schema"))
+            else:
+                keep = True
+            if not keep:
+                break
+        # OpenAI Chat Completions' older `functions[]`.
+        for function in _dicts(request_body.get("functions")):
+            if not add(SOURCE_MODEL_REQUEST, function.get("name"), function.get("description"),
+                       function.get("parameters")):
+                break
         # A hosted MCP tool's listing comes back in the reply.
         for item in _response_items(exchange):
-            if item.get("type") == "mcp_list_tools":
-                label = item.get("server_label")
-                if not isinstance(label, str) or not label:
-                    continue
-                server = g.normalize_mcp_server(label)
-                for tool in _dicts(item.get("tools")):
-                    name = tool.get("name")
-                    add(SOURCE_PROVIDER_MCP_LIST,
-                        f"{PROVIDER_MCP_PREFIX}{server}__{name}" if isinstance(name, str) else None,
-                        tool.get("description"), tool.get("input_schema"),
-                        tool.get("annotations"), server=server)
+            if item.get("type") != "mcp_list_tools":
+                continue
+            label = item.get("server_label")
+            if not isinstance(label, str) or not label:
+                continue
+            server = g.normalize_mcp_server(label)
+            for tool in _dicts(item.get("tools")):
+                name = tool.get("name")
+                if not add(SOURCE_PROVIDER_MCP_LIST,
+                           f"{PROVIDER_MCP_PREFIX}{server}__{name}" if isinstance(name, str) else None,
+                           tool.get("description"), tool.get("input_schema"),
+                           tool.get("annotations"), server=server):
+                    break
 
     # An MCP server's answer to `tools/list`.
     ids = _tools_list_ids(request_body)
     if ids:
         endpoint = f"{host or g.UNKNOWN_HOST}{path or '/'}"
         for message in _jsonrpc_replies(exchange):
-            if message.get("id") not in ids:
+            if _rpc_id(message.get("id")) not in ids:
                 continue
             result = message.get("result")
             for tool in _dicts(result.get("tools") if isinstance(result, dict) else None):
-                add(SOURCE_MCP_TOOLS_LIST, tool.get("name"), tool.get("description"),
-                    tool.get("inputSchema"), tool.get("annotations"), endpoint=endpoint)
+                if not add(SOURCE_MCP_TOOLS_LIST, tool.get("name"), tool.get("description"),
+                           tool.get("inputSchema"), tool.get("annotations"), endpoint=endpoint):
+                    break
 
     if capped:
         return {"schemas": out, "reason": TOO_MANY_TOOLS}
@@ -188,13 +215,23 @@ def _is_model_request(body: Any) -> bool:
     return isinstance(body, dict) and "model" in body and ("messages" in body or "input" in body)
 
 
-def _tools_list_ids(body: Any) -> set[Any]:
+def _rpc_id(value: Any) -> tuple[str, Any] | None:
+    """A JSON-RPC id as a comparable key: a string or an integer, typed, so
+    `1`, `"1"`, `1.0` and `true` stay apart. Anything else matches nothing."""
+    if isinstance(value, str):
+        return ("s", value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return ("i", value)
+    return None
+
+
+def _tools_list_ids(body: Any) -> set[tuple[str, Any]]:
     """The JSON-RPC ids of `tools/list` requests in a body (a batch counts)."""
     messages = body if isinstance(body, list) else [body]
     return {
-        message.get("id") for message in _dicts(messages)
-        if message.get("method") == "tools/list" and "id" in message
-        and isinstance(message.get("id"), (str, int))
+        key for message in _dicts(messages)
+        if message.get("method") == "tools/list"
+        and (key := _rpc_id(message.get("id"))) is not None
     }
 
 
@@ -210,7 +247,7 @@ def _response(exchange: Mapping[str, Any]) -> dict[str, Any] | None:
 
 def _response_messages(exchange: Mapping[str, Any]) -> Iterator[Any]:
     """The response body's JSON values: the body itself, or each SSE event's
-    data. An event that isn't JSON is skipped (§ module docstring)."""
+    data. An event that isn't JSON is skipped (see the module docstring)."""
     response = _response(exchange)
     if response is None:
         return
