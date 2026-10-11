@@ -903,7 +903,7 @@ def test_the_data_actions_group_shows_uploads_first_with_their_reasons(tmp_path)
             chips.first.wait_for()
             assert chips.count() == 2
             first = chips.nth(0)
-            assert first.locator(".profile-value").inner_text() == "upload_file"
+            assert first.locator(".profile-value").inner_text() == "mcp@docs.example.com/mcp__upload_file"
             assert first.locator(".profile-count").inner_text().startswith("upload · 1 observed")
             assert "image" in first.locator(".profile-count").inner_text()
             why = first.locator(".profile-why")

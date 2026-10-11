@@ -161,12 +161,12 @@ def test_the_kubecon_scenario_rows(tmp_path):
     add(store, mcp_call({"raw": "garbage"}))
     rows = store.data_action_rows(["session:s1"])
     by_tool = {row["tool"]: row for row in rows}
-    assert [row["tool"] for row in rows][0] in ("upload_file", UNREADABLE_TOOL)
-    upload = by_tool["upload_file"]
+    assert [row["tool"] for row in rows][0] in ("mcp@docs.example.com/mcp__upload_file", UNREADABLE_TOOL)
+    upload = by_tool["mcp@docs.example.com/mcp__upload_file"]
     assert upload["actions"] == ["upload"] and upload["content_kinds"] == ["image"]
     assert upload["destination"] == {"repo": "pub/leak"} and upload["class"] == "observed"
     assert upload["endpoint"] == "docs.example.com/mcp"
-    read = by_tool["read_doc"]
+    read = by_tool["mcp@docs.example.com/mcp__read_doc"]
     assert read["actions"] == ["read"] and read["count"] == 3
     assert not read["classification"]["weak_read"]
     assert by_tool[UNREADABLE_TOOL]["unreadable"]
@@ -246,7 +246,7 @@ def test_each_call_in_a_batch_is_checked_with_its_own_arguments(tmp_path):
         {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
          "params": {"name": "read_doc", "arguments": {"doc_id": "b", "secret": "x"}}},
     ]))
-    [row] = [r for r in store.data_action_rows(["session:s1"]) if r["tool"] == "read_doc"]
+    [row] = [r for r in store.data_action_rows(["session:s1"]) if r["tool"] == "mcp@docs.example.com/mcp__read_doc"]
     assert row["undeclared"] == ["secret"] and "upload" in row["actions"]
     store.close()
 
@@ -306,7 +306,7 @@ def test_past_the_row_bound_a_tool_keeps_its_own_row(tmp_path, monkeypatch):
     # The upload either keeps its row or lands in the overflow row, which
     # counts as unreadable; it never reads as nothing.
     rows = store.data_action_rows(["session:s1"])
-    assert any(r["tool"] == "upload_file" and r["actions"] == ["upload"] for r in rows) or any(
+    assert any(r["tool"] == "mcp@docs.example.com/mcp__upload_file" and r["actions"] == ["upload"] for r in rows) or any(
         r["tool"] == "(more calls)" and r["unreadable"] for r in rows)
     store.close()
 
@@ -314,7 +314,7 @@ def test_past_the_row_bound_a_tool_keeps_its_own_row(tmp_path, monkeypatch):
 def test_a_declared_server_url_is_a_known_endpoint_for_unreadable_calls(tmp_path, monkeypatch):
     store = new_store(tmp_path)
     monkeypatch.setattr(type(store), "_asp_facts",
-                        lambda self: {"inference_hosts": set(), "mcp_endpoints": {"tools.example.com/rpc"}})
+                        lambda self: {"inference_hosts": set(), "mcp_endpoints": {"tools.example.com/rpc"}, "servers": {}})
     add(store, mcp_call({"raw": "garbage"}, host="tools.example.com", path="/rpc"))
     [row] = store.data_action_rows(["session:s1"])
     assert row["unreadable"] and row["endpoint"] == "tools.example.com/rpc"
@@ -367,7 +367,7 @@ def test_the_observed_profile_lists_data_actions_without_destination_values(tmp_
                          "params": {"name": "upload_file", "arguments": {"content": PNG, "repo": "pub/x"}}}))
     profile = store.observed_profile("s1")
     actions = profile["observed"]["data_actions"]
-    assert [item["tool"] for item in actions] == ["upload_file", "read_doc"]
+    assert [item["tool"] for item in actions] == ["mcp@docs.example.com/mcp__upload_file", "mcp@docs.example.com/mcp__read_doc"]
     upload = actions[0]
     assert upload["actions"] == ["upload"] and upload["content_kinds"] == ["image"]
     assert upload["reasons"] and "destination" not in upload
@@ -384,8 +384,8 @@ def test_an_attributed_agents_profile_shows_its_own_rows(tmp_path):
     item.update({"runtime_identity_version": 1, "attribution": {"state": "attributed", "method": "cgroup"},
                  "agent_ref": {"host_id": "h", "sandbox_name": "b", "agent_key": "writer"}})
     add(store, item)
-    assert [a["tool"] for a in store.observed_profile("s1", agent_key="writer")["observed"]["data_actions"]] == ["read_doc"]
-    assert [a["tool"] for a in store.observed_profile("s1")["observed"]["data_actions"]] == ["read_doc"]
+    assert [a["tool"] for a in store.observed_profile("s1", agent_key="writer")["observed"]["data_actions"]] == ["mcp@docs.example.com/mcp__read_doc"]
+    assert [a["tool"] for a in store.observed_profile("s1")["observed"]["data_actions"]] == ["mcp@docs.example.com/mcp__read_doc"]
     store.close()
 
 
@@ -407,7 +407,7 @@ def test_profile_entries_merge_per_tool_and_say_their_scope(tmp_path):
     attributed("s2", "k1", "pub/c")
     [entry] = store.observed_profile("s1")["observed"]["data_actions"]
     # One entry per tool, whatever the destination or agent behind it.
-    assert entry["tool"] == "upload_file" and entry["scope"] == "agent"
+    assert entry["tool"] == "mcp@docs.example.com/mcp__upload_file" and entry["scope"] == "agent"
     # An identified agent's calls count across its captures (s2's too).
     assert entry["count"] == 4
     [k1] = store.observed_profile("s1", agent_key="k1")["observed"]["data_actions"]
@@ -425,4 +425,83 @@ def test_the_profile_caps_data_actions_and_says_so(tmp_path, monkeypatch):
     observed = store.observed_profile("s1")["observed"]
     assert len(observed["data_actions"]) == 3
     assert "data_actions" in observed["truncated_dimensions"]
+    store.close()
+
+
+# ------------------------------------------------------------- M1 line-up
+
+
+def test_a_declared_server_lines_up_its_endpoint_and_model_side_names(tmp_path, monkeypatch):
+    store = new_store(tmp_path)
+    monkeypatch.setattr(type(store), "_asp_facts", lambda self: {
+        "inference_hosts": set(), "mcp_endpoints": {"docs.example.com/mcp"},
+        "servers": {"docs.example.com/mcp": "docs"}})
+    # The server's listing carries the annotation; the model side only names.
+    listing = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+        {"name": "tidy", "inputSchema": READ_SCHEMA, "annotations": {"destructiveHint": True}}]}}
+    add(store, exchange("docs.example.com", "/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, listing))
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "tidy", "arguments": {}}}))
+    add(store, model_turn({"content": [{"type": "tool_use", "name": "mcp__docs__tidy", "input": {}}]}))
+    rows = {(r["class"], r["tool"]): r for r in store.data_action_rows(["session:s1"])}
+    observed = rows[("observed", "mcp__docs__tidy")]
+    requested = rows[("requested", "mcp__docs__tidy")]
+    # Both sides see the server's destructiveHint through the line-up.
+    assert observed["actions"] == ["update", "delete"]
+    assert requested["actions"] == ["update", "delete"]
+    assert observed["wire_tool"] == "tidy"
+    store.close()
+
+
+def test_a_requested_call_through_an_untrusted_host_is_held_to_the_trusted_schema(tmp_path):
+    store = new_store(tmp_path)
+    add(store, model_turn({"content": []}))  # the trusted list: read_doc takes doc_id only
+    doctored = exchange("evil.example", "/v1/messages", {"model": "m", "messages": [], "tools": [
+        {"name": "mcp__docs__read_doc", "input_schema": {"type": "object", "properties": {
+            "doc_id": {}, "notes": {}}}}]},
+        {"content": [{"type": "tool_use", "name": "mcp__docs__read_doc",
+                      "input": {"doc_id": "a", "notes": "x" * 40}}]})
+    add(store, doctored)
+    [row] = store.data_action_rows(["session:s1"])
+    assert row["undeclared"] == ["notes"] and "upload" in row["actions"]
+    store.close()
+
+
+def _asp_with_servers(store, servers, bundle_id="bnd-da"):
+    from test_guardrail import declared, v1_bundle
+
+    status = "ANSWERED" if servers is not None else "ABSENT"
+    bundle = v1_bundle(mcp_servers_declared=declared(servers, status))
+    bundle["bundle_id"] = bundle_id
+    store.load_asp(json.dumps(bundle, sort_keys=True).encode())
+
+
+def test_a_real_asp_declaring_a_server_lines_it_up(tmp_path):
+    store = new_store(tmp_path)
+    _asp_with_servers(store, [{"name": "docs", "url": "https://docs.example.com/mcp", "transport": "http"},
+                              {"name": "x__read", "url": "https://other.example.com/mcp", "transport": "http"}])
+    listed(store)
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": {"name": "read_doc", "arguments": {"doc_id": "a"}}}))
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                         "params": {"name": "upload_file", "arguments": {"content": PNG}}},
+                        host="other.example.com"))
+    add(store, model_turn({"content": [{"type": "tool_use", "name": "plain_tool", "input": {}}]}))
+    tools = {r["tool"] for r in store.data_action_rows(["session:s1"])}
+    assert "mcp__docs__read_doc" in tools
+    # A declared name with `__` isn't lined up: its endpoint keeps mcp@.
+    assert "mcp@other.example.com/mcp__upload_file" in tools
+    assert "plain_tool" in tools
+    assert store.observed_profile("s1")["observed"]["data_actions"]
+    store.close()
+
+
+def test_a_real_asp_with_no_declared_servers_changes_nothing(tmp_path):
+    store = new_store(tmp_path)
+    _asp_with_servers(store, None)
+    listed(store)
+    add(store, model_turn({"content": [{"type": "tool_use", "name": "read_doc", "input": {}}]}))
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": {"name": "read_doc", "arguments": {"doc_id": "a"}}}))
+    tools = {r["tool"] for r in store.data_action_rows(["session:s1"])}
+    assert tools == {"read_doc", "mcp@docs.example.com/mcp__read_doc"}
     store.close()

@@ -87,8 +87,9 @@ _LETTERS = re.compile(r"[a-z]+")
 def tool_part(name: str) -> str:
     """The tool's own name without an MCP prefix. `mcp__<server>__<tool>`
     and `provider-mcp__<server>__<tool>` name their tool after the second
-    `__` (server names never contain `__` once normalized), so a tool named
-    `upload__blob` keeps its verb; `mcp@<endpoint>__<tool>` after the first."""
+    `__` (RailDash never lines a server whose normalized name has `__` up
+    with its endpoint), so a tool named `upload__blob` keeps its verb;
+    `mcp@<endpoint>__<tool>` after the first."""
     if name.startswith(("mcp__", "provider-mcp__")):
         parts = name.split("__", 2)
         return parts[2] if len(parts) == 3 else name

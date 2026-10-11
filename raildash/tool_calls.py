@@ -165,6 +165,7 @@ def extract_tool_calls(
     *,
     endpoint_schema: Callable[[str, str], Any] | None = None,
     fallback_schema: Callable[[str], Any] | None = None,
+    trusted_host: Callable[[str | None], bool] | None = None,
 ) -> dict[str, Any]:
     """`{calls, mcp_post_unreadable, truncated}` for one stored exchange.
 
@@ -173,9 +174,10 @@ def extract_tool_calls(
     The schema a call is checked against (§4.3):
 
     - requested: the tool list in the same request; when the request body
-      couldn't be read (cut at the capture's bound, or missing),
-      `fallback_schema(tool)`, the newest the caller holds, and the call says
-      `schema_fallback`;
+      couldn't be read (cut at the capture's bound, or missing), or it went
+      to a host `trusted_host` doesn't trust (its list could be doctored,
+      §4.1), `fallback_schema(tool)`, the newest trusted one the caller
+      holds, and the call says `schema_fallback`;
     - observed: `endpoint_schema(endpoint, tool)`, the endpoint's newest
       `tools/list` entry.
 
@@ -252,7 +254,8 @@ def extract_tool_calls(
     if ts._is_model_request(body) or (body_lost and _replies_like_a_model(exchange)):
         # Requested: the model's reply, against this request's own tools,
         # or the newest known schema when the request couldn't be read.
-        readable = ts._is_model_request(body)
+        host = g.normalize_host(_split_host_path(dict(request))[0])
+        readable = ts._is_model_request(body) and (trusted_host is None or trusted_host(host))
         given = {
             item["tool"]: item["input_schema"]
             for item in ts.extract_tool_schemas(interaction)["schemas"]
