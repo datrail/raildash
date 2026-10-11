@@ -18,9 +18,14 @@ weak.
 A network call never runs while RailDash holds its store lock: classifying
 reads answers from a cache table only (`lookup`), and a miss is queued for
 a background thread (`ModelClassifierWorker`) that asks the model and
-stores the answer. The tool shows `unclassified` until the answer arrives,
-which is the safe direction. A failed ask is cached too, and asked again
-after `RETRY_AFTER`.
+stores the answer. Until it arrives the tool is `unclassified`, the safe
+direction: the first call of a tool nothing else classifies is flagged as
+unclassified, and later calls use the answer (an earlier row isn't
+re-judged). A failed ask is cached too, and asked again after
+`RETRY_AFTER`; an answer outside the closed set after `INVALID_RETRY_AFTER`.
+
+The key goes only to the configured URL: a redirect is refused, not
+followed (urllib would carry `Authorization` to wherever it points).
 """
 
 from __future__ import annotations
@@ -40,6 +45,9 @@ from typing import Any, Callable, Mapping
 from . import data_actions as da
 
 RETRY_AFTER = timedelta(hours=1)
+# The same schema at temperature 0 likely gets the same answer again.
+INVALID_RETRY_AFTER = timedelta(hours=24)
+INVALID = {"_invalid": True}
 REQUEST_TIMEOUT = 30
 MAX_QUEUE = 1000
 
@@ -86,6 +94,7 @@ class ModelClassifierWorker:
         self._post = post or _post_json
         self._queue: queue.Queue[tuple[str, dict[str, Any]]] = queue.Queue(MAX_QUEUE)
         self._queued: set[str] = set()
+        self._queued_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
     # --- what the classifier calls, under the store lock: no network -----
@@ -95,16 +104,22 @@ class ModelClassifierWorker:
         answer = self.store._model_answer_locked(key)
         if answer is not None:
             asked_at, value = answer
-            if value is not None:
+            wait = INVALID_RETRY_AFTER if value == INVALID else RETRY_AFTER
+            if value is not None and value != INVALID:
                 return value
-            if datetime.now(timezone.utc) - asked_at < RETRY_AFTER:
+            if datetime.now(timezone.utc) - asked_at < wait:
                 return None
-        if key not in self._queued:
-            try:
-                self._queue.put_nowait((key, {k: schema.get(k) for k in ("tool", "description", "input_schema")}))
-                self._queued.add(key)
-            except queue.Full:
-                pass  # asked again on a later classification
+        with self._queued_lock:
+            if key in self._queued:
+                return None
+            # Marked before it is queued, and unmarked only once its answer
+            # is stored, so a poll meanwhile doesn't queue it twice.
+            self._queued.add(key)
+        try:
+            self._queue.put_nowait((key, {k: schema.get(k) for k in ("tool", "description", "input_schema")}))
+        except queue.Full:
+            with self._queued_lock:
+                self._queued.discard(key)  # asked on a later classification
         return None
 
     # --- the background side ---------------------------------------------
@@ -115,7 +130,16 @@ class ModelClassifierWorker:
 
     def _run(self) -> None:
         while True:
+            self.run_one()
+
+    def run_one(self) -> None:
+        """One blocking step of the worker: an exception (a busy or closed
+        database, say) is logged by type and skipped, never ends it."""
+        try:
             self.drain_once(block=True)
+        except Exception as exc:  # noqa: BLE001 - the worker must outlive one bad item
+            print(f"raildash: the classifier model worker skipped an item: {type(exc).__name__}",
+                  file=sys.stderr)
 
     def drain_once(self, *, block: bool = False) -> int:
         """Ask about every queued schema (one when blocking). Returns how many
@@ -126,9 +150,14 @@ class ModelClassifierWorker:
                 key, schema = self._queue.get(block=block and asked == 0)
             except queue.Empty:
                 return asked
-            self._queued.discard(key)
-            self.store.record_model_answer(key, self.settings.model, self._ask(schema))
-            asked += 1
+            try:
+                if self.store.model_answer_fresh(key):
+                    continue  # answered meanwhile
+                self.store.record_model_answer(key, self.settings.model, self._ask(schema))
+                asked += 1
+            finally:
+                with self._queued_lock:
+                    self._queued.discard(key)
             if block:
                 return asked
 
@@ -142,12 +171,22 @@ class ModelClassifierWorker:
         except Exception as exc:  # noqa: BLE001 - a failed ask is retried later
             print(f"raildash: the classifier model couldn't be asked: {type(exc).__name__}", file=sys.stderr)
             return None
-        return da.parse_model_reply(self.settings.model, reply)
+        return da.parse_model_reply(self.settings.model, reply) or dict(INVALID)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: following one would send the key elsewhere."""
+
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
 
 
 def _post_json(url: str, headers: dict[str, str], body: bytes) -> dict[str, Any]:
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:  # noqa: S310 - the user's URL
+    with _OPENER.open(request, timeout=REQUEST_TIMEOUT) as response:  # noqa: S310 - the user's URL
         return json.loads(response.read(1_048_576))
 
 

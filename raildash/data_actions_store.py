@@ -153,6 +153,12 @@ class DataActionsStore:
         asked = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
         return asked, (json.loads(row[0]) if row[0] else None)
 
+    def model_answer_fresh(self, key: str) -> bool:
+        """Whether a usable answer is already stored (the worker skips it)."""
+        with self._lock:
+            found = self._model_answer_locked(key)
+        return found is not None and found[1] is not None and not found[1].get("_invalid")
+
     def record_model_answer(self, key: str, model: str, answer: Mapping[str, Any] | None) -> None:
         """Store the model's answer for one schema (None: the ask failed)."""
         with self._write_transaction():

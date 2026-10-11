@@ -86,3 +86,72 @@ def test_nothing_starts_unless_configured(tmp_path):
     assert cm.start_from_env(store, {}) is None
     assert store.model_classifier is None
     store.close()
+
+
+def test_a_redirect_is_refused_so_the_key_never_follows_it(tmp_path):
+    import http.server
+    import threading
+    import urllib.error
+
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):  # noqa: N802
+            seen.append((self.path, self.headers.get("Authorization")))
+            self.send_response(302)
+            self.send_header("Location", "/elsewhere")
+            self.end_headers()
+
+        do_GET = do_POST  # noqa: N815
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        try:
+            cm._post_json(f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                          {"Authorization": "Bearer k"}, b"{}")
+        except urllib.error.HTTPError as error:
+            assert error.code == 302
+        assert seen == [("/v1/chat/completions", "Bearer k")]  # never /elsewhere
+    finally:
+        server.shutdown()
+
+
+def test_the_worker_survives_a_bad_item_and_an_invalid_answer_waits_a_day(tmp_path):
+    store = _store(tmp_path)
+    answers = iter([{"choices": [{"message": {"content": json.dumps({"actions": ["steal"]})}}]}])
+    worker = cm.ModelClassifierWorker(store, cm.ModelSettings("http://m/v1", "small"),
+                                      post=lambda url, headers, body: next(answers))
+    store.model_classifier = worker.lookup
+    store.data_action_rows(["session:s1"])
+    assert worker.drain_once() == 1
+    store.data_action_rows(["session:s1"])
+    assert worker.drain_once() == 0  # outside the closed set: not asked again soon
+    store.close()
+
+
+def test_the_worker_outlives_a_failing_write(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    reply = {"choices": [{"message": {"content": json.dumps({"actions": ["read"], "reason": "r"})}}]}
+    worker = cm.ModelClassifierWorker(store, cm.ModelSettings("http://m/v1", "small"),
+                                      post=lambda url, headers, body: reply)
+    store.model_classifier = worker.lookup
+    original = type(store).record_model_answer
+    failures = iter([True])
+
+    def flaky(self, *args):
+        if next(failures, False):
+            raise RuntimeError("database is locked")
+        return original(self, *args)
+
+    monkeypatch.setattr(type(store), "record_model_answer", flaky)
+    store.data_action_rows(["session:s1"])
+    worker.run_one()  # the write fails; the worker carries on
+    store.data_action_rows(["session:s1"])  # queued again: the key was unmarked
+    worker.run_one()
+    [row] = store.data_action_rows(["session:s1"])
+    assert row["actions"] == ["read"]
+    store.close()
