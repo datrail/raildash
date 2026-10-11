@@ -375,3 +375,56 @@ def test_the_routes_need_the_token_and_answer_as_the_store_does(tmp_path, monkey
     assert client.post(f"{path}/data-actions/dismiss", json={}, headers=auth).status_code == 409
     assert client.post("/api/guardrails/nope/data-actions", json={}, headers=auth).status_code == 404
     db.close()
+
+
+# ---------------------------------------------------------- M2c not offered
+
+
+def _due_now(store):
+    store._db.execute("UPDATE data_action_pending SET due_at = '2000-01-01T00:00:00.000000Z'")
+    store._db.commit()
+
+
+def test_a_tool_the_endpoint_never_listed_is_not_offered_after_the_delay(store):
+    ref, _ = with_data_actions(store, rule([{"tool": f"mcp@{ENDPOINT}__*", "actions":
+                                             ["read", "upload", "update", "delete", "execute", "unclassified"]}]))
+    live(store)
+    send(store, listed(), call("export_all", {}))
+    # Queued, not judged yet: a listing may still arrive.
+    assert not any(key[0] == "data_actions" for key in rows(store, ref))
+    _due_now(store)
+    live(store)  # a heartbeat runs the queue
+    item = f"mcp@{ENDPOINT}__export_all · not offered by {ENDPOINT}"
+    row = rows(store, ref)[("data_actions", item)]
+    assert row["counts"] and row["evidence_class"] == "observed"
+    store.allow_guardrail_row(row["row_id"])
+    assert not rows(store, ref)[("data_actions", item)]["counts"]
+
+
+def test_a_listing_that_arrives_within_the_delay_clears_the_call(store):
+    ref, _ = with_data_actions(store, rule([{"tool": f"mcp@{ENDPOINT}__*", "actions": ["read", "unclassified"]}]))
+    live(store)
+    send(store, listed(), call("export_all", {}))
+    later = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+        *LISTING["result"]["tools"], {"name": "export_all", "inputSchema": READ_SCHEMA}]}}
+    send(store, mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, later))
+    _due_now(store)
+    live(store)
+    assert not any("not offered" in key[1] for key in rows(store, ref))
+
+
+def test_an_endpoint_that_never_listed_its_tools_is_not_judged(store):
+    ref, _ = with_data_actions(store, rule(unclassified="allow"))
+    live(store)
+    send(store, call("anything", {}))
+    assert store._db.execute("SELECT count(*) FROM data_action_pending").fetchone()[0] == 0
+
+
+def test_an_allowed_not_offered_tool_is_not_a_row(store):
+    ref, _ = with_data_actions(store, rule([{"tool": f"mcp@{ENDPOINT}__*", "actions":
+                                             ["read", "unclassified", "not_offered"]}]))
+    live(store)
+    send(store, listed(), call("export_all", {}))
+    _due_now(store)
+    live(store)
+    assert not any("not offered" in key[1] for key in rows(store, ref))

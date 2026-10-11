@@ -1620,6 +1620,9 @@ class Store(GuardrailCustody, DataActionsStore):
         with self._lock:
             # DR-184 M2: only an authenticated capture can affect a guardrail
             # (design §4.1), so only such a batch reads the active ones.
+            if authenticated:
+                # DR-205: calls queued as "not offered" whose delay passed.
+                self._run_not_offered_guarded()
             active = self._active_guardrails() if authenticated else []
             # DR-205: calls are classified for judging only when some active
             # version has the data_actions rule.
@@ -1689,6 +1692,20 @@ class Store(GuardrailCustody, DataActionsStore):
                 )
             self._db.commit()
         return inserted
+
+    def _run_not_offered_guarded(self) -> None:
+        """`_run_not_offered_locked` in a savepoint: a failure is reported
+        and marks the check failed; the caller's write still happens."""
+        self._db.execute("SAVEPOINT not_offered_run")
+        try:
+            self._run_not_offered_locked()
+        except Exception as exc:  # noqa: BLE001 - evidence must still be stored
+            self._db.execute("ROLLBACK TO not_offered_run")
+            self._db.execute("RELEASE not_offered_run")
+            print(f"raildash: not-offered check failed: {exc!r}", file=sys.stderr)
+            self._mark(*EVERY_AGENT, MARK_CHECK_FAILED, self._receive_time())
+            return
+        self._db.execute("RELEASE not_offered_run")
 
     def _record_capture_tools(
         self, interaction: dict[str, Any], *, at: str | None = None, judge: bool = False,
@@ -1837,6 +1854,9 @@ class Store(GuardrailCustody, DataActionsStore):
             "sent_at": sent_at,
         }
         with self._write_transaction():
+            # DR-205: a heartbeat arrives every minute while a tap is
+            # attached, so queued "not offered" checks run even when quiet.
+            self._run_not_offered_guarded()
             self._db.execute(
                 """INSERT INTO collector_heartbeats
                        (collector_id, last_heartbeat_at, taps_attached, sent_at)

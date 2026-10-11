@@ -35,6 +35,11 @@ MAX_ROWS_PER_CAPTURE = 2000
 # Rows past the bound, without destination values, before the overflow row.
 MAX_ROWS_SLACK = 500
 SCHEMA_WINDOW = timedelta(days=30)
+# §4.4: an observed call is judged "not offered" this long after it arrives,
+# against the endpoint's newest listing and every listing of the last day.
+NOT_OFFERED_DELAY = timedelta(seconds=60)
+NOT_OFFERED_LISTING_WINDOW = timedelta(hours=24)
+MAX_PENDING = 5000
 BACKFILL_WINDOW = timedelta(hours=24)
 BACKFILL_SETTING = "data_actions_backfilled_v1"
 MAX_DESTINATION_VALUE_CHARS = 200
@@ -66,6 +71,19 @@ CREATE TABLE IF NOT EXISTS data_action_calls (
     PRIMARY KEY (capture_ref, class, tool, endpoint, destination)
 );
 CREATE INDEX IF NOT EXISTS tool_schemas_endpoint ON tool_schemas(source, endpoint, tool);
+-- DR-205 §4.4: observed calls whose endpoint's listings don't have the tool,
+-- judged "not offered" once NOT_OFFERED_DELAY has passed (a listing may
+-- reach RailDash in a later batch).
+CREATE TABLE IF NOT EXISTS data_action_pending (
+    pending_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity_kind   TEXT NOT NULL,
+    identity_value  TEXT NOT NULL,
+    interaction_id  TEXT,
+    tool            TEXT NOT NULL,
+    wire_tool       TEXT NOT NULL,
+    endpoint        TEXT NOT NULL,
+    due_at          TEXT NOT NULL
+);
 """
 
 
@@ -220,6 +238,25 @@ class DataActionsStore:
              _union_json(existing["undeclared"], undeclared), int(bool(call["streamed"])),
              int(bool(call["schema_known"])), interaction_id, *key),
         )
+
+    def _offered_locked(self, endpoint: str, tool: str, now: datetime) -> bool | None:
+        """Whether an endpoint offers a tool (§4.4): it is in the endpoint's
+        newest `tools/list` reply, whatever its age, or in any listing of the
+        last 24 hours. None when no listing was ever captured from the
+        endpoint: there is nothing to compare, and the check doesn't fire."""
+        newest = self._db.execute(
+            "SELECT interaction_id FROM tool_schemas WHERE source = ? AND endpoint = ? "
+            "ORDER BY last_seen DESC LIMIT 1",
+            (ts.SOURCE_MCP_TOOLS_LIST, endpoint),
+        ).fetchone()
+        if newest is None:
+            return None
+        cutoff = self._receive_time(now - NOT_OFFERED_LISTING_WINDOW)
+        return self._db.execute(
+            "SELECT 1 FROM tool_schemas WHERE source = ? AND endpoint = ? AND tool = ? "
+            "AND (interaction_id IS ? OR last_seen >= ?) LIMIT 1",
+            (ts.SOURCE_MCP_TOOLS_LIST, endpoint, tool, newest[0], cutoff),
+        ).fetchone() is not None
 
     def _known_mcp_endpoints(self) -> set[str]:
         """Endpoints that answered `tools/list`, plus every declared MCP
@@ -455,6 +492,7 @@ class DataActionsStore:
                 "bytes": int(call.get("arguments_bytes") or 0),
                 "content_kinds": list(call.get("content_kinds") or []),
                 "endpoint": call["endpoint"] or None,
+                "wire_tool": call["tool"],
                 "not_offered": False,
             })
         return out

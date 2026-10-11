@@ -614,6 +614,8 @@ class GuardrailCustody:
         if when < _instant(version["activated_at"]):
             return
         contract = json.loads(version["contract_json"])
+        if g.DATA_ACTIONS in contract["rules"]:
+            self._queue_not_offered_locked(kind, value, interaction, calls, now)
         result = g.evaluate_request(contract, interaction)
         if not result["tool_calls"]["readable"]:
             self._mark(kind, value, MARK_TOOL_CALLS_UNREADABLE, now)
@@ -781,6 +783,67 @@ class GuardrailCustody:
         return mine
 
     # ------------------------------------------------------ data actions
+
+    def _queue_not_offered_locked(
+        self, kind: str, value: str, interaction: Mapping[str, Any],
+        calls: Sequence[Mapping[str, Any]], now: str,
+    ) -> None:
+        """§4.4 G5: an observed MCP call the endpoint's listings don't have
+        is queued, and judged once the delay has passed (`_run_not_offered`).
+        A call to an endpoint that never listed its tools isn't queued."""
+        due = self._receive_time(_instant(now) + das.NOT_OFFERED_DELAY)
+        for call in calls:
+            endpoint, wire = call.get("endpoint"), call.get("wire_tool")
+            if call.get("class") != g.OBSERVED or call.get("unreadable") or not endpoint or not wire:
+                continue
+            if self._offered_locked(endpoint, wire, _instant(now)) is not False:
+                continue
+            if self._db.execute("SELECT count(*) FROM data_action_pending").fetchone()[0] >= das.MAX_PENDING:
+                # Past the bound the call is judged now rather than dropped.
+                self._judge_not_offered_locked(kind, value, interaction.get("interaction_id"),
+                                               call["tool"], wire, endpoint, now)
+                continue
+            self._db.execute(
+                """INSERT INTO data_action_pending
+                       (identity_kind, identity_value, interaction_id, tool, wire_tool, endpoint, due_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (kind, value, interaction.get("interaction_id"), call["tool"], wire, endpoint, due),
+            )
+
+    def _run_not_offered_locked(self, now: str | None = None) -> None:
+        """Judge every queued call whose delay has passed. Run from the
+        write paths that arrive anyway: a capture batch and a heartbeat."""
+        current = now or self._receive_time()
+        due = self._db.execute(
+            "SELECT * FROM data_action_pending WHERE due_at <= ? ORDER BY pending_id LIMIT 500",
+            (current,),
+        ).fetchall()
+        for row in due:
+            self._db.execute("DELETE FROM data_action_pending WHERE pending_id = ?", (row["pending_id"],))
+            self._judge_not_offered_locked(
+                row["identity_kind"], row["identity_value"], row["interaction_id"],
+                row["tool"], row["wire_tool"], row["endpoint"], current,
+            )
+
+    def _judge_not_offered_locked(
+        self, kind: str, value: str, interaction_id: Any, tool: str, wire: str, endpoint: str, now: str,
+    ) -> None:
+        if self._offered_locked(endpoint, wire, _instant(now)) is not False:
+            return
+        active = self._active_guardrail_row(kind, value)
+        if active is None:
+            return
+        rule = json.loads(active["contract_json"])["rules"].get(g.DATA_ACTIONS)
+        if rule is None or g.data_action_allowed(rule, tool, "not_offered"):
+            return
+        violation = g._violation(
+            g.DATA_ACTIONS, g.data_action_item(tool, "not_offered", endpoint), g.OBSERVED,
+            {"kind": "interaction", "id": interaction_id},
+            kind="data_action", tool=tool, action="not_offered", endpoint=endpoint, wire_tool=wire,
+            from_undeclared=False, undeclared=[],
+        )
+        with self._hook_guard("not offered"):
+            self._record_violations(kind, value, active["guardrail_version_id"], [violation], now)
 
     def _data_actions_dismissed_key(self, kind: str, value: str) -> str:
         return f"data_actions_offer_dismissed:{kind}:{value}"
@@ -1229,3 +1292,4 @@ class GuardrailCustody:
 # method above runs, all three modules are complete, whichever was imported
 # first.
 from . import guardrail as g  # noqa: E402
+from . import data_actions_store as das  # noqa: E402
