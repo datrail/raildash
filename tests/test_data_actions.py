@@ -159,7 +159,7 @@ def test_the_model_is_asked_only_when_nothing_else_fired_and_only_closed_answers
     result = da.classify("frobnicate", [schema("Frobnicates.")], model_classifier=model)
     assert result["actions"] == ["read"] and result["weak_read"]
     assert result["sources"] == {"read": ["model"]}
-    assert result["reasons"] == ["model m1: fetches"]
+    assert result["reasons"] == ["m1: fetches"]
     da.classify("upload_file", [schema()], model_classifier=model)
     assert len(asked) == 1  # a tool the rules classify never reaches the model
     for bad in (None, {"actions": []}, {"actions": ["exfiltrate"]}, {"actions": ["read", "steal"]}, "read"):
@@ -189,3 +189,72 @@ def test_classify_all_groups_by_tool_and_applies_overrides():
     result = da.classify_all(rows, overrides={"a_read": ["delete"]})
     assert result["a_read"]["actions"] == ["delete"]
     assert result["b_upload"]["actions"] == ["upload"]
+
+
+# ------------------------------------------------------- review round 1
+
+
+@pytest.mark.parametrize("tool,expected", [
+    ("get_commit", ["read"]), ("get_workflow_run", ["read"]), ("read_message", ["read"]),
+    ("get_comment", ["read"]), ("list_add_ons", ["read"]),
+    ("create_or_update_file", ["upload", "update"]), ("read_and_delete", ["read", "delete"]),
+    ("slack_post_message", ["upload"]),
+])
+def test_only_the_leading_verb_phrase_counts(tool, expected):
+    assert actions(tool) == expected
+
+
+def test_prefixes_split_from_the_left_and_acronyms_split():
+    assert da.tool_part("mcp__srv__upload__blob") == "upload__blob"
+    assert actions("mcp__srv__upload__blob") == ["upload"]
+    assert da.tool_part("mcp@docs.example.com/a__b__upload_x") == "b__upload_x"
+    assert da.words("XMLExport") == ["xml", "export"]
+    assert da.words("doSQLDelete") == ["do", "sql", "delete"]
+    assert da.words("getURLContent") == ["get", "url", "content"]
+
+
+def test_overrides_are_validated():
+    for bad in ([], ["exfil"], "upload", {"upload"}):
+        result = da.classify("upload_file", [schema()], override=bad)
+        assert result["actions"] == [] and result["unclassified"], bad
+
+
+def test_a_failing_model_leaves_the_tool_unclassified_and_each_schema_is_asked():
+    def boom(_schema):
+        raise TimeoutError("down")
+
+    assert da.classify("frobnicate", [schema()], model_classifier=boom)["unclassified"]
+    seen = []
+
+    def model(tool_schema):
+        seen.append(tool_schema["description"])
+        return {"actions": ["read", "upload"] if tool_schema["description"] == "b" else ["read"],
+                "reason": "r", "model": "m"}
+
+    result = da.classify("frobnicate", [schema("a"), schema("b")], model_classifier=model)
+    assert seen == ["a", "b"]
+    assert result["actions"] == ["read", "upload"]
+    # A model's read is weak even beside another action.
+    assert result["weak_read"]
+    no_name = da.classify("frobnicate", [schema()],
+                          model_classifier=lambda _s: {"actions": ["read"], "reason": "r"})
+    assert no_name["reasons"] == ["model: r"]
+
+
+def test_a_huge_schema_classifies_quickly_with_bounded_reasons():
+    import time
+
+    props = {f"p{i}": {"type": "string", "format": "byte"} for i in range(100_000)}
+    started = time.monotonic()
+    result = da.classify("sync", [schema(properties=props)])
+    assert time.monotonic() - started < 10
+    assert result["actions"] == ["upload"]
+    assert len(result["reasons"]) <= da.MAX_REASONS
+
+
+def test_hostile_shapes_do_not_raise():
+    odd = [None, "x", {"description": 5, "input_schema": {"properties": {1: {}, "content": "x"}},
+                       "annotations": "no"}]
+    result = da.classify("sync", odd)
+    assert result["actions"] == ["upload"]
+    assert da.classify(None, [schema()])["unclassified"]

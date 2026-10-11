@@ -8,7 +8,10 @@ every signal that fires adds actions from a closed set with a reason:
 2. MCP annotations: `destructiveHint` adds `delete` and `update`;
    `readOnlyHint` adds a *weak* `read`, and only when nothing below adds
    another action; `openWorldHint` adds nothing and is reported;
-3. verbs in the tool's own name, else in its description's first sentence;
+3. the leading verb phrase of the tool's own name, else of its
+   description's first sentence: the first word in the verb table, and any
+   joined to it by `or`/`and` (`create_or_update_file` is `upload` and
+   `update`; `get_commit` is only `read`, its `commit` a noun);
 4. arguments: a data-carrying argument, or an explicitly loose schema, adds
    `upload`; a destination-hint argument is reported and adds nothing;
 5. an opt-in model, asked only when 1-4 found nothing; its `read` is weak;
@@ -74,17 +77,22 @@ DESTINATION_NAMES = frozenset(
 )
 
 _WORD_SPLIT = re.compile(r"[_\-.\s/]+")
-_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
+# A case change: `createIssue`, and the end of an acronym, `XMLExport`.
+_CAMEL = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _SENTENCE_END = re.compile(r"[.!?\n]")
 _LETTERS = re.compile(r"[a-z]+")
 
 
 def tool_part(name: str) -> str:
-    """The tool's own name without an MCP prefix: `mcp__<server>__<tool>`,
-    `provider-mcp__<server>__<tool>` and `mcp@<endpoint>__<tool>` all name
-    their tool after the last `__`."""
-    if name.startswith(("mcp__", "provider-mcp__", "mcp@")) and "__" in name:
-        return name.rsplit("__", 1)[1]
+    """The tool's own name without an MCP prefix. `mcp__<server>__<tool>`
+    and `provider-mcp__<server>__<tool>` name their tool after the second
+    `__` (server names never contain `__` once normalized), so a tool named
+    `upload__blob` keeps its verb; `mcp@<endpoint>__<tool>` after the first."""
+    if name.startswith(("mcp__", "provider-mcp__")):
+        parts = name.split("__", 2)
+        return parts[2] if len(parts) == 3 else name
+    if name.startswith("mcp@") and "__" in name:
+        return name.split("__", 1)[1]
     return name
 
 
@@ -98,16 +106,25 @@ def words(text: str) -> list[str]:
 
 
 def _verb_actions(text: str) -> list[tuple[str, str]]:
+    """The leading verb phrase: the first word in `VERBS`, then each further
+    one joined to it by `or`/`and`. Later table words are nouns or objects
+    (`get_commit`, `read_message`, `get_workflow_run`)."""
+    tokens = words(text)
     found: list[tuple[str, str]] = []
-    for word in words(text):
-        action = VERBS.get(word)
-        if action is not None and (action, word) not in found:
-            found.append((action, word))
+    for index, word in enumerate(tokens):
+        if word in VERBS:
+            found.append((VERBS[word], word))
+            rest = tokens[index + 1:]
+            while len(rest) >= 2 and rest[0] in ("or", "and") and rest[1] in VERBS:
+                if (VERBS[rest[1]], rest[1]) not in found:
+                    found.append((VERBS[rest[1]], rest[1]))
+                rest = rest[2:]
+            break
     return found
 
 
-def first_sentence(description: str | None) -> str:
-    if not description:
+def first_sentence(description: Any) -> str:
+    if not isinstance(description, str) or not description:
         return ""
     return _SENTENCE_END.split(description.strip(), 1)[0]
 
@@ -134,7 +151,7 @@ def data_carrying(name: str, spec: Any) -> str | None:
             return f'argument "{name}" is {spec["contentEncoding"]}'
         if spec.get("contentMediaType"):
             return f'argument "{name}" has media type {spec["contentMediaType"]}'
-    if name.lower() in DATA_CARRYING_NAMES:
+    if isinstance(name, str) and name.lower() in DATA_CARRYING_NAMES:
         return f'argument "{name}"'
     return None
 
@@ -143,6 +160,8 @@ def destination_hints(schema: Mapping[str, Any]) -> list[str]:
     """Arguments that say where data goes (Terms: destination hint)."""
     hints = []
     for name, spec in _properties(schema).items():
+        if not isinstance(name, str):
+            continue
         if name.lower() in DESTINATION_NAMES or (
             isinstance(spec, dict) and spec.get("format") in ("uri", "url", "uri-reference")
         ):
@@ -153,13 +172,13 @@ def destination_hints(schema: Mapping[str, Any]) -> list[str]:
 def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
     """Steps 2-4 for one schema."""
     actions: dict[str, set[str]] = {}
-    reasons: list[str] = []
+    reasons: dict[str, None] = {}  # ordered and O(1) to de-duplicate
     notes: list[str] = []
 
     def add(action: str, source: str, reason: str) -> None:
         actions.setdefault(action, set()).add(source)
-        if reason not in reasons:
-            reasons.append(reason)
+        if len(reasons) < MAX_REASONS:
+            reasons.setdefault(reason, None)
 
     annotations = schema.get("annotations") if isinstance(schema.get("annotations"), dict) else {}
     if annotations.get("destructiveHint") is True:
@@ -168,7 +187,7 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
     if annotations.get("openWorldHint") is True:
         notes.append("reaches outside its own service (openWorldHint)")
 
-    verbs = _verb_actions(tool_part(tool))
+    verbs = _verb_actions(tool_part(tool)) if isinstance(tool, str) else []
     where = "name"
     if not verbs:
         verbs = _verb_actions(first_sentence(schema.get("description")))
@@ -178,6 +197,8 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
 
     input_schema = schema.get("input_schema") if isinstance(schema.get("input_schema"), dict) else {}
     for name, spec in _properties(input_schema).items():
+        if not isinstance(name, str):
+            continue
         why = data_carrying(name, spec)
         if why:
             add(UPLOAD, SOURCE_RULE, why)
@@ -186,9 +207,13 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
 
     if annotations.get("readOnlyHint") is True and not actions:
         add(READ, SOURCE_ANNOTATION, "annotation readOnlyHint")
-    return {"actions": actions, "reasons": reasons, "notes": notes,
+    return {"actions": actions, "reasons": list(reasons), "notes": notes,
             "destinations": destination_hints(input_schema)}
 
+
+# A schema with thousands of data-carrying arguments has thousands of
+# identical-looking reasons; a reader needs the first few.
+MAX_REASONS = 20
 
 ModelClassifier = Callable[[Mapping[str, Any]], "Mapping[str, Any] | None"]
 
@@ -213,49 +238,64 @@ def classify(
         "classifier_version": CLASSIFIER_VERSION,
     }
     if override is not None:
-        chosen = [action for action in ACTIONS if action in set(override)]
+        # An override is a list of actions from the closed set, or
+        # `unclassified`. Anything else, or nothing, leaves the tool
+        # unclassified rather than silently judged by nothing.
+        values = set(override) if isinstance(override, (list, tuple)) else set()
+        chosen = [action for action in ACTIONS if action in values]
         result.update(
             actions=chosen, sources={action: [SOURCE_USER] for action in chosen},
-            reasons=["set by the user"], unclassified=not chosen and UNCLASSIFIED in override,
+            reasons=["set by the user"], unclassified=not chosen,
         )
         return result
 
     sources: dict[str, set[str]] = {}
-    reasons: list[str] = []
-    notes: list[str] = []
+    reasons: dict[str, None] = {}
+    notes: dict[str, None] = {}
     destinations: set[str] = set()
-    for schema in schemas:
-        signals = _schema_signals(tool, schema)
+    valid = [item for item in schemas if isinstance(item, Mapping)]
+    for item in valid:
+        signals = _schema_signals(tool, item)
         for action, from_ in signals["actions"].items():
             sources.setdefault(action, set()).update(from_)
-        reasons.extend(r for r in signals["reasons"] if r not in reasons)
-        notes.extend(n for n in signals["notes"] if n not in notes)
+        for reason in signals["reasons"]:
+            if len(reasons) < MAX_REASONS:
+                reasons.setdefault(reason, None)
+        for note in signals["notes"]:
+            notes.setdefault(note, None)
         destinations.update(signals["destinations"])
 
     # A weak read is dropped when any schema found a real action.
     if READ in sources and sources[READ] == {SOURCE_ANNOTATION} and set(sources) != {READ}:
         del sources[READ]
-        reasons = [r for r in reasons if r != "annotation readOnlyHint"]
+        reasons.pop("annotation readOnlyHint", None)
 
-    if not sources and model_classifier is not None and schemas:
-        answer = model_classifier(schemas[0])
-        chosen = _model_actions(answer)
-        if chosen:
+    if not sources and model_classifier is not None:
+        # Each distinct schema is asked on its own and the answers unioned,
+        # so a doctored newest schema can't speak for the others.
+        for item in valid:
+            try:
+                answer = model_classifier(item)
+            except Exception:  # noqa: BLE001 - §5: a failure leaves unclassified
+                continue
+            chosen = _model_actions(answer)
             for action in chosen:
                 sources.setdefault(action, set()).add(SOURCE_MODEL)
-            reason = answer.get("reason") if isinstance(answer, Mapping) else None
-            name = answer.get("model") if isinstance(answer, Mapping) else None
-            reasons.append(f"model {name or ''}: {reason or 'no reason given'}".replace("  ", " "))
+            if chosen and len(reasons) < MAX_REASONS:
+                name = answer.get("model") or "model"
+                reasons.setdefault(f"{name}: {answer.get('reason') or 'no reason given'}", None)
 
     actions = [action for action in ACTIONS if action in sources]
     result.update(
         actions=actions,
         sources={action: sorted(sources[action]) for action in actions},
-        reasons=reasons,
-        notes=notes,
+        reasons=list(reasons),
+        notes=list(notes),
         destinations=sorted(destinations),
         unclassified=not actions,
-        weak_read=actions == [READ] and SOURCE_RULE not in sources[READ] and SOURCE_USER not in sources[READ],
+        # §4.2: a read only a hint or a model gave is weak, whatever else
+        # the tool does.
+        weak_read=READ in sources and sources[READ] <= {SOURCE_ANNOTATION, SOURCE_MODEL},
     )
     return result
 
