@@ -66,8 +66,10 @@ Where the design is silent this module chooses:
   row ids the page showed, not "every row of the rule", so it allows exactly
   what the user saw: a row that arrived since isn't allowed unseen. It is
   all or nothing: if any id isn't a counting row of this agent's rule that
-  Allow this could allow, nothing is created. Each row reports whether one
-  click can allow it (`allowable`), so the page offers only those.
+  Allow this could allow, nothing is created. Each counting row reports
+  whether Allow this alone would succeed on it (`allowable`, the version it
+  would make checked against the contract too), so the page offers only
+  those.
 - A hook that fails is rolled back to a savepoint, so the evidence it was
   judging is still stored and drift still runs. It fails closed: which agent
   the evidence belonged to may be what failed, so every rule of every agent
@@ -212,15 +214,30 @@ def _instant(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _one_click_allowable(rules: Mapping[str, Any] | None, row: Mapping[str, Any]) -> bool:
-    """Whether **Allow this** on `row` would succeed against the version in
-    force (`rules`; None with no guardrail): the server's own answer, so the
-    page needn't mirror every refusal, an upload over a size cap included.
-    **Allow all** (DR-202) offers exactly these rows."""
-    if rules is None or row["overflow"] or row["allowed_by"] is not None:
+def _allowed_by_one_click(contract: Mapping[str, Any], row: Mapping[str, Any]) -> dict[str, Any]:
+    """The rules **Allow this** on `row` would store in a version made from
+    `contract`, checked as that version would be. Raises `ValueError` where
+    Allow this refuses the row, and `GuardrailValidationError` (a
+    `ValueError` too) where the version it made would break the contract:
+    a captured Host header is the agent's own text, and one too long or
+    with a `/` or a space in it can't be listed."""
+    rules = g.with_item_allowed(contract["rules"], row)
+    g.validate_guardrail({**contract, "rules": rules})
+    return rules
+
+
+def _one_click_allowable(contract: Mapping[str, Any] | None, row: Mapping[str, Any]) -> bool:
+    """Whether a counting row is one **Allow all** can take (DR-202): Allow
+    this on it alone would succeed against the version in force (`contract`;
+    None with no guardrail). The server's own answer, so the page needn't
+    mirror every refusal, an upload over a size cap or an unlistable host
+    included. False for a row that doesn't count (acknowledged, already
+    allowed, no guardrail), which Allow all never takes, so a poll checks
+    only the rows it could offer."""
+    if contract is None or not row["counts"] or row["overflow"]:
         return False
     try:
-        g.with_item_allowed(rules, row)
+        _allowed_by_one_click(contract, row)
     except ValueError:
         return False
     return True
@@ -877,10 +894,11 @@ class GuardrailCustody:
                     raise ValueError(f"row {row_id} no longer counts; reload to see what is left")
                 try:
                     # Refused exactly where Allow this on the version in
-                    # force refuses; then folded into the version being
-                    # built, skipping an item an earlier row already covers
-                    # so no entry is listed twice.
-                    g.with_item_allowed(contract["rules"], view)
+                    # force refuses, an unlistable host included, so the
+                    # refusal names the row; then folded into the version
+                    # being built, skipping an item an earlier row already
+                    # covers so no entry is listed twice.
+                    _allowed_by_one_click(contract, view)
                     if not g.item_allowed({"rules": rules}, view):
                         rules = g.with_item_allowed(rules, view)
                 except ValueError as exc:
@@ -1027,7 +1045,7 @@ class GuardrailCustody:
         with self._lock:
             kind, value = self._resolve_agent_ref(ref)
             summary, active, rows = self._state_locked(kind, value, now)
-            in_force = json.loads(active["contract_json"])["rules"] if active is not None else None
+            in_force = json.loads(active["contract_json"]) if active is not None else None
             for row in rows:
                 row["allowable"] = _one_click_allowable(in_force, row)
             versions = [

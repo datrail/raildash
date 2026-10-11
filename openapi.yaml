@@ -295,6 +295,9 @@ paths:
       description: |
         Token-gated (DR-184): the rows name hosts, paths and ports. Carries the
         §4.4 proposal while the agent has a baseline and no guardrail.
+        Each row says whether it `counts`, which version allows it
+        (`allowed_by`), and whether it is a counting row Allow this alone
+        could allow (`allowable`), the rows Allow all takes (DR-202).
       parameters:
         - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
         - {$ref: '#/components/parameters/RailDashToken'}
@@ -431,7 +434,7 @@ paths:
                 row_ids:
                   type: array
                   minItems: 1
-                  uniqueItems: true
+                  description: Distinct row ids; a repeated id is refused with 409
                   items: {type: integer, minimum: 1, maximum: 9223372036854775807}
       responses:
         '201': {description: The new version, now active}

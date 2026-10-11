@@ -407,13 +407,17 @@ def test_allow_all_allows_one_rules_rows_in_one_version(store):
 
 def test_allow_all_is_all_or_nothing(store):
     ref, _ = _adopted(store)
-    send(store, request("a.example.net"), request("b.example.net"), request(None), request("*.com"))
+    send(store, request("a.example.net"), request("b.example.net"), request(None), request("*.com"),
+         request("x/y.example"))
     # A second agent, adopted after the captures so they stay this one's.
     other_ref, _ = _adopted(store, asp(deployment="other-agent"))
     assert other_ref != ref
     found = rows(store, ref)
     assert not found[("uploads", "(unknown host)")]["allowable"]
     assert not found[("uploads", "*.com")]["allowable"]
+    # A Host header no version can list: Allow this alone would be refused.
+    assert found[("uploads", "x/y.example")]["counts"]
+    assert not found[("uploads", "x/y.example")]["allowable"]
     assert found[("uploads", "a.example.net")]["allowable"]
     good = _ids(found, "uploads", "a.example.net", "b.example.net")
     listener = found[("service_ports", "tcp/127.0.0.1/8443")]["row_id"]
@@ -421,6 +425,7 @@ def test_allow_all_is_all_or_nothing(store):
     refused = [
         ([*good, *_ids(found, "uploads", "(unknown host)")], "no host"),
         ([*good, *_ids(found, "uploads", "*.com")], "wildcard"),
+        ([*good, *_ids(found, "uploads", "x/y.example")], r"row \d+ \(x/y\.example\)"),
         ([*good, listener], "one rule"),
         ([*good, other_listener], "not one of this agent"),
         ([*good, 10_000], "not one of this agent"),
