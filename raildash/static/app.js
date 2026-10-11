@@ -14,7 +14,10 @@ const state = {
   sessionId: null,
   host: null,
   offset: 0,
-  limit: 100,
+  // The interaction log's page. A demo agent calls every 30 s, so 100 rows
+  // filled within the hour and made the log alone ~3,400 px tall (DR-203);
+  // Previous/Next page through the rest.
+  limit: 25,
   total: 0,
   driftLeft: null,
   driftRight: null,

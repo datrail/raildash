@@ -691,6 +691,14 @@ def test_a_long_profile_file_list_is_capped_with_everything_one_click_away(tmp_p
                     "body": {"model": "claude-sonnet-5", "messages": []}},
         "response": {"status_code": 200, "body": {"content": blocks}},
     })])
+    # Half an hour of a demo agent calling every 30 s: more than a log page.
+    store.add_interactions("work", [normalise({
+        "interaction_id": f"poll{index:02d}",
+        "request": {"method": "POST", "path": "/v1/messages",
+                    "headers": {"host": "api.anthropic.com"},
+                    "body": {"model": "claude-sonnet-5", "messages": []}},
+        "response": {"status_code": 200, "body": {"content": []}},
+    }) for index in range(59)])
     store.load_asp(encode(bundle("bnd-browser-many", files)))
     store.close()
 
@@ -734,6 +742,13 @@ def test_a_long_profile_file_list_is_capped_with_everything_one_click_away(tmp_p
                 "/app/out.log", "/tmp/state.json", "/usr/bin/python3.12 (image layer)",
             ]
             assert kernel.get_by_role("button", name="Show all 300 files (280 more)").count() == 1
+            # The long kernel paths get the panel's width, not one 180 px
+            # column whose wrapping set the whole row's height.
+            grid_width = page.locator("#profile-grid").bounding_box()["width"]
+            assert kernel.bounding_box()["width"] > grid_width * 0.9
+            # The interaction log shows one page of 25, the rest a click away.
+            page.wait_for_selector("#pager-text:has-text('1–25 of 60')")
+            assert page.locator("#log > tr").count() == 25
             # The same button, whatever it says.
             toggle = kernel.locator("button.profile-more")
             assert toggle.get_attribute("aria-expanded") == "false"

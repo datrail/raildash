@@ -596,9 +596,11 @@ code { font-family: var(--mono); }
 }
 .profile-summary dt { color: var(--ink-faint); }
 .profile-summary dd { overflow-wrap: anywhere; }
-/* DR-154: kernel-observed files sit beside the asked ones, with a
-   provenance line per sandbox. */
-.profile-files-kernel { display: grid; gap: 6px; align-content: start; }
+/* DR-154: kernel-observed files, with a provenance line per sandbox. Their
+   paths are long (/usr/local/lib/python3.13/...): in a 180 px column twenty
+   of them wrapped to ~1,300 px and set the height of the whole row, so they
+   span the panel, one line each (DR-203). */
+.profile-files-kernel { display: grid; grid-column: 1 / -1; gap: 6px; align-content: start; }
 .profile-files-kernel h3 { margin-bottom: 0; }
 .kernel-file-source { display: grid; gap: 5px; }
 .kernel-file-source .asp-subject { margin: 0; overflow-wrap: anywhere; }
