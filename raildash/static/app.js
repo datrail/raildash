@@ -1814,7 +1814,7 @@ function profileFiles(title, items, className, noun = "files") {
   });
 }
 
-// DR-154: what the kernel saw the sandbox open, beside what the model asked
+// DR-154: what the kernel saw the sandbox open, after what the model asked
 // for. It comes from RailMon's ASPs, not this capture, so it carries its own
 // provenance (which sandbox, which ASP, when) and its evidence class, and is
 // never merged into the asked list above it.
@@ -2025,9 +2025,11 @@ async function loadProfile() {
   view.append(profileValues("Uploaded content", observed.content_kinds || [], "kinds"));
   view.append(profileValues("Request content types", observed.request_media_types || [], "content types"));
   view.append(profileUploads("Bytes sent per host", observed.upload_bytes || []));
-  view.append(profileFiles("Files · asked", observed.file_access || [], "profile-files-asked"));
-  view.append(profileKernelFiles(kernelFiles, kernelError));
   view.append(profileFiles("File types", observed.file_types || [], undefined, "file types"));
+  view.append(profileFiles("Files · asked", observed.file_access || [], "profile-files-asked"));
+  // Last, and right after the asked files (DR-154): it spans the grid
+  // (DR-203), so anywhere earlier it would leave a short row behind it.
+  view.append(profileKernelFiles(kernelFiles, kernelError));
   grid.replaceChildren(view);
   if (focused) {
     const target = [...grid.querySelectorAll("button[data-key]")]
