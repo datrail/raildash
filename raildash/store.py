@@ -2350,6 +2350,8 @@ class Store(GuardrailCustody, DataActionsStore):
             entry["actions"] = [a for a in ("read", "upload", "update", "delete", "execute")
                                 if a in {*entry["actions"], *row["actions"]}]
             entry["unclassified"] = entry["unclassified"] and row["unclassified"]
+            # A read is weak only if every row behind the entry reads weakly.
+            entry["weak_read"] = entry["weak_read"] and bool(classification.get("weak_read"))
             entry["count"] += row["count"]
             entry["bytes"] = {
                 "last": row["bytes"]["last"] if row["last_seen"] > entry["last_seen"] else entry["bytes"]["last"],
