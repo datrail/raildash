@@ -580,6 +580,13 @@ code { font-family: var(--mono); }
   border-left: 0;
   border-top: 1px solid var(--line);
 }
+/* DR-203: the show-all button under a capped list sits at its start. */
+.profile-more {
+  justify-self: start;
+  margin-top: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+}
 .profile-summary {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);

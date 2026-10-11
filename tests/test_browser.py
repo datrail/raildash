@@ -651,6 +651,140 @@ def test_a_demo_like_capture_says_why_its_profile_is_mostly_empty(tmp_path):
             process.wait(timeout=5)
 
 
+def test_a_long_profile_file_list_is_capped_with_everything_one_click_away(tmp_path):
+    """DR-203: a Python agent's kernel-observed files are hundreds of stdlib
+    reads, and drawn in full they made the page about 8,800 px tall. Each
+    profile list shows its first 20 chips, written and run files first, and
+    a keyboard-usable button shows the rest; the choice survives the poll's
+    redraw, keeping focus, and Show fewer puts the cap back."""
+    from raildash.ingest import normalise
+    from raildash.store import Store
+    from test_kernel_file_access import bundle, encode
+
+    stdlib = [
+        {"path": f"/usr/lib/python3.12/mod{index:03d}.py", "read": True, "write": False,
+         "exec": False, "layer": True}
+        for index in range(297)
+    ]
+    interesting = [
+        {"path": "/app/out.log", "read": False, "write": True, "exec": False, "layer": False},
+        {"path": "/usr/bin/python3.12", "read": True, "write": False, "exec": True, "layer": True},
+        {"path": "/tmp/state.json", "read": True, "write": True, "exec": False, "layer": False},
+    ]
+    # The interesting ones last in the ASP, so only the ordering can lift them.
+    files = stdlib + interesting
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    store.upsert_session("work", agent="agent", source="test")
+    # 25 files asked of tools, one written: the asked list is capped too.
+    blocks = [
+        {"type": "tool_use", "id": f"t{index}", "name": "Read",
+         "input": {"file_path": f"/workspace/read{index:02d}.md"}}
+        for index in range(24)
+    ] + [{"type": "tool_use", "id": "tw", "name": "Write",
+          "input": {"file_path": "/workspace/zz-written.md", "content": "x"}}]
+    store.add_interactions("work", [normalise({
+        "interaction_id": "w1",
+        "request": {"method": "POST", "path": "/v1/messages",
+                    "headers": {"host": "api.anthropic.com"},
+                    "body": {"model": "claude-sonnet-5", "messages": []}},
+        "response": {"status_code": 200, "body": {"content": blocks}},
+    })])
+    store.load_asp(encode(bundle("bnd-browser-many", files)))
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database), "serve",
+         "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1400, "height": 1000})
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on(
+                "console",
+                lambda message: errors.append(message.text) if message.type == "error" else None,
+            )
+            page.goto(url, wait_until="networkidle")
+
+            def group(title: str):
+                return page.locator(".profile-group").filter(
+                    has=page.get_by_role("heading", name=title, exact=True)
+                )
+
+            kernel = group("Files · kernel-observed")
+            chips = kernel.locator(".kernel-file-chip")
+            chips.first.wait_for()
+            visible = kernel.locator(".kernel-file-chip:visible .profile-value")
+            # Every file is in the page; only the first 20 show.
+            assert chips.count() == 300
+            assert visible.count() == 20
+            # Written and run files first, so the cap hides only reads.
+            assert visible.all_inner_texts()[:3] == [
+                "/app/out.log", "/tmp/state.json", "/usr/bin/python3.12 (image layer)",
+            ]
+            assert kernel.get_by_role("button", name="Show all 300 files (280 more)").count() == 1
+            # The same button, whatever it says.
+            toggle = kernel.locator("button.profile-more")
+            assert toggle.get_attribute("aria-expanded") == "false"
+            controlled = toggle.get_attribute("aria-controls")
+            assert kernel.locator(f"#{controlled}").locator(".kernel-file-chip").count() == 300
+            collapsed_height = page.evaluate("document.documentElement.scrollHeight")
+
+            # Keyboard: focus the button and press Enter.
+            toggle.focus()
+            page.keyboard.press("Enter")
+            assert visible.count() == 300
+            assert toggle.get_attribute("aria-expanded") == "true"
+            assert toggle.inner_text() == "Show fewer"
+            assert page.evaluate("document.documentElement.scrollHeight") > collapsed_height
+
+            # The poll redraws the grid; the list stays open and the button
+            # keeps focus. (A script click on Refresh moves no focus.)
+            page.evaluate("document.activeElement.dataset.drawnBefore = 'yes'")
+            page.evaluate("document.getElementById('refresh').click()")
+            # A new button, drawn by the redraw, has focus.
+            page.wait_for_function(
+                "document.activeElement && document.activeElement.classList.contains('profile-more')"
+                " && !document.activeElement.dataset.drawnBefore"
+            )
+            assert visible.count() == 300
+            assert page.evaluate("document.activeElement.textContent") == "Show fewer"
+            page.keyboard.press("Space")
+            assert visible.count() == 20
+            assert toggle.get_attribute("aria-expanded") == "false"
+            assert toggle.inner_text() == "Show all 300 files (280 more)"
+
+            # The asked list gets the same treatment; the server already puts
+            # the written file first.
+            asked = group("Files · asked")
+            asked_visible = asked.locator(".profile-chip:visible .profile-value")
+            assert asked.locator(".profile-chip").count() == 25
+            assert asked_visible.count() == 20
+            assert asked_visible.first.inner_text() == "/workspace/zz-written.md"
+            asked.get_by_role("button", name="Show all 25 files (5 more)").click()
+            assert asked_visible.count() == 25
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def test_a_capture_with_model_calls_has_no_empty_profile_note(tmp_path):
     """DR-180: the note is only for captures with no model API traffic."""
     from raildash.ingest import normalise
