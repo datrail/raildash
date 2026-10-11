@@ -2296,7 +2296,13 @@ class Store(GuardrailCustody, DataActionsStore):
         """DR-205: the session's data-action rows for the observed profile.
         With `agent_key`, only that agent's attributed captures, as for the
         rest of the profile. Destination-hint values stay out of this
-        token-free route (design §5); the guardrail's detail route has them."""
+        token-free route (design §5); the guardrail's detail route has them.
+
+        Scope: an identified agent's rows are keyed by the agent, not the
+        session (they are what its guardrail judges), so its entries count
+        that agent's calls across all its captures, and say `scope:
+        "agent"`. Unattributed calls are this session's (`scope:
+        "session"`)."""
         query = (
             "SELECT DISTINCT agent_host_id, sandbox_name, agent_key FROM interactions "
             "WHERE session_id = ? AND attribution_state = 'attributed' "
@@ -2313,27 +2319,54 @@ class Store(GuardrailCustody, DataActionsStore):
         ]
         if not agent_key:
             refs.append(f"session:{session_id}")
-        out = []
+        # One entry per (class, tool, endpoint): the rows behind it differ
+        # only by agent or destination, and destinations stay off this route.
+        merged: dict[tuple[str, str, Any], dict[str, Any]] = {}
         for row in self.data_action_rows(refs):
             classification = row["classification"] or {}
-            out.append({
-                "tool": row["tool"],
-                "class": row["class"],
-                "endpoint": row["endpoint"],
-                "actions": row["actions"],
-                "weak_read": bool(classification.get("weak_read")),
-                "unclassified": row["unclassified"],
-                "unreadable": row["unreadable"],
-                "count": row["count"],
-                "bytes": row["bytes"],
-                "content_kinds": row["content_kinds"],
-                "undeclared": row["undeclared"],
-                "streamed": row["streamed"],
-                "reasons": classification.get("reasons", []),
-                "notes": classification.get("notes", []),
-                "last_seen": row["last_seen"],
-            })
-        return out
+            key = (row["class"], row["tool"], row["endpoint"])
+            scope = "agent" if row["capture_ref"].startswith("agent:") else "session"
+            entry = merged.get(key)
+            if entry is None:
+                merged[key] = {
+                    "tool": row["tool"],
+                    "class": row["class"],
+                    "endpoint": row["endpoint"],
+                    "scope": scope,
+                    "actions": list(row["actions"]),
+                    "weak_read": bool(classification.get("weak_read")),
+                    "unclassified": row["unclassified"],
+                    "unreadable": row["unreadable"],
+                    "count": row["count"],
+                    "bytes": dict(row["bytes"]),
+                    "content_kinds": list(row["content_kinds"]),
+                    "undeclared": list(row["undeclared"]),
+                    "streamed": row["streamed"],
+                    "reasons": list(classification.get("reasons", [])),
+                    "notes": list(classification.get("notes", [])),
+                    "last_seen": row["last_seen"],
+                }
+                continue
+            entry["actions"] = [a for a in ("read", "upload", "update", "delete", "execute")
+                                if a in {*entry["actions"], *row["actions"]}]
+            entry["unclassified"] = entry["unclassified"] and row["unclassified"]
+            entry["count"] += row["count"]
+            entry["bytes"] = {
+                "last": row["bytes"]["last"] if row["last_seen"] > entry["last_seen"] else entry["bytes"]["last"],
+                "max": max(entry["bytes"]["max"], row["bytes"]["max"]),
+                "total": entry["bytes"]["total"] + row["bytes"]["total"],
+            }
+            for field in ("content_kinds", "undeclared"):
+                entry[field] = sorted({*entry[field], *row[field]})
+            entry["streamed"] = entry["streamed"] or row["streamed"]
+            entry["reasons"] += [r for r in classification.get("reasons", []) if r not in entry["reasons"]]
+            entry["notes"] += [n for n in classification.get("notes", []) if n not in entry["notes"]]
+            entry["last_seen"] = max(entry["last_seen"], row["last_seen"])
+            if scope == "agent":
+                entry["scope"] = "agent"
+        # Newest first, then (stable) uploads and unreadable calls ahead.
+        entries = sorted(merged.values(), key=lambda item: item["last_seen"], reverse=True)
+        return sorted(entries, key=lambda item: not ("upload" in item["actions"] or item["unreadable"]))
 
     def interactions(
         self,

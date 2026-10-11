@@ -1778,12 +1778,15 @@ function profileGroup(title, items, {
     chip.append(el("span", "profile-value", item.value));
     chip.append(el("span", "profile-count", count(item)));
     if (describe) {
-      // Reasons ride on the chip as its accessible description too, so
-      // hover and a screen reader both get why.
+      // Why, shown under the chip on hover and on keyboard focus (the chip
+      // takes focus only when it has a reason), and read as its description.
       const why = describe(item);
       if (why) {
-        chip.title = why;
-        chip.setAttribute("aria-description", why);
+        const line = el("span", "profile-why", why);
+        line.id = `profile-why-${++profileListSerial}`;
+        chip.append(line);
+        chip.tabIndex = 0;
+        chip.setAttribute("aria-describedby", line.id);
       }
     }
     return chip;
@@ -1814,7 +1817,8 @@ function profileDataActions(items) {
   return profileGroup("Data actions", items.map((item) => ({ ...item, value: item.tool })), {
     noun: "tools",
     chipClass: "profile-chip profile-chip-stacked",
-    note: "What each tool call does with data, read from the schema the agent was given.",
+    note: "What each tool call does with data, read from the schema the agent was given. " +
+      "An identified agent's calls are counted across all its captures.",
     count: (item) => {
       const parts = [dataActionsLabel(item), `${fmtInt(item.count)} ${item.class}`];
       if (item.bytes && item.bytes.total) parts.push(fmtBytes(item.bytes.total));

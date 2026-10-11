@@ -333,17 +333,22 @@ class DataActionsStore:
             rows = [dict(row) for row in self._db.execute(
                 f"SELECT * FROM data_action_calls WHERE capture_ref IN ({marks})", refs
             )]
+            endpoints = sorted({row["endpoint"] for row in rows if row["class"] == tc.OBSERVED and row["endpoint"]})
+            listed: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            if endpoints:
+                # One query for every observed row's endpoint listing.
+                for item in self._db.execute(
+                    f"SELECT * FROM tool_schemas WHERE source = ? AND endpoint IN "
+                    f"({','.join('?' * len(endpoints))})",
+                    (ts.SOURCE_MCP_TOOLS_LIST, *endpoints),
+                ):
+                    listed.setdefault((item["endpoint"], item["tool"]), []).append({
+                        **dict(item), "input_schema": json.loads(item["input_schema"]),
+                        "annotations": json.loads(item["annotations"]) if item["annotations"] else None,
+                    })
             for row in rows:
                 if row["class"] == tc.OBSERVED and row["endpoint"]:
-                    listed = self._db.execute(
-                        "SELECT * FROM tool_schemas WHERE source = ? AND endpoint = ? AND tool = ?",
-                        (ts.SOURCE_MCP_TOOLS_LIST, row["endpoint"], row["tool"]),
-                    ).fetchall()
-                    row["_schemas"] = [
-                        {**dict(item), "input_schema": json.loads(item["input_schema"]),
-                         "annotations": json.loads(item["annotations"]) if item["annotations"] else None}
-                        for item in listed
-                    ]
+                    row["_schemas"] = listed.get((row["endpoint"], row["tool"]), [])
                 else:
                     row["_schemas"] = schemas.get(row["tool"], [])
         out = []

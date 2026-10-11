@@ -906,7 +906,16 @@ def test_the_data_actions_group_shows_uploads_first_with_their_reasons(tmp_path)
             assert first.locator(".profile-value").inner_text() == "upload_file"
             assert first.locator(".profile-count").inner_text().startswith("upload · 1 observed")
             assert "image" in first.locator(".profile-count").inner_text()
-            assert 'argument "content" is base64' in first.get_attribute("title")
+            why = first.locator(".profile-why")
+            assert not why.is_visible()
+            # Keyboard: the chip takes focus, and its reason shows and is its
+            # description.
+            first.focus()
+            page.keyboard.press("Tab")
+            page.keyboard.press("Shift+Tab")
+            assert why.is_visible()
+            assert 'argument "content" is base64' in why.inner_text()
+            assert first.get_attribute("aria-describedby") == why.get_attribute("id")
             assert chips.nth(1).locator(".profile-count").inner_text().startswith("read · 1 observed")
             assert errors == []
             browser.close()
