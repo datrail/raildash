@@ -230,13 +230,25 @@ def extract_tool_calls(
             schema = endpoint_schema(endpoint, tool) if (endpoint_schema and tool) else None
             add(OBSERVED, tool, params.get("arguments"), schema=schema,
                 schema_known=schema is not None, streamed=chunked, at=endpoint)
-        return out
+        if not ts._is_model_request(body):
+            return out
+        # A model request with a stray `jsonrpc` key (a self-hosted endpoint
+        # accepts it) still has its reply's calls read below.
 
     # A body the capture cut or lost: missing, text, or kept as `{"raw": …}`
     # because it didn't parse.
     body_lost = body is None or isinstance(body, str) or (
         isinstance(body, dict) and set(body) == {"raw"}
     )
+    if body_lost and is_post:
+        # A POST whose body the capture cut or lost. Reported whatever its
+        # reply looks like: a server the agent talks to could answer like a
+        # model to make a large upload vanish. The caller records it only
+        # for a known MCP endpoint.
+        size = interaction.get("request_size")
+        out["mcp_post_unreadable"] = {
+            "endpoint": endpoint, "request_size": size if isinstance(size, int) else None,
+        }
     if ts._is_model_request(body) or (body_lost and _replies_like_a_model(exchange)):
         # Requested: the model's reply, against this request's own tools,
         # or the newest known schema when the request couldn't be read.
@@ -260,7 +272,7 @@ def extract_tool_calls(
                     schema_known=schema is not None, schema_fallback=True, streamed=streamed)
         return out
 
-    if is_post:
+    if is_post and out["mcp_post_unreadable"] is None:
         size = interaction.get("request_size")
         out["mcp_post_unreadable"] = {
             "endpoint": endpoint, "request_size": size if isinstance(size, int) else None,

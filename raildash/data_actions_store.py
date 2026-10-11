@@ -204,12 +204,17 @@ class DataActionsStore:
     def _fallback_schema(self, capture_ref: str, tool: str) -> dict[str, Any] | None:
         """The newest model-side schema of a tool for this capture, when the
         request a call came from couldn't be read (§4.3)."""
-        row = self._db.execute(
-            "SELECT input_schema FROM tool_schemas WHERE capture_ref = ? AND tool = ? "
-            "AND source IN (?, ?) ORDER BY last_seen DESC LIMIT 1",
+        trusted = self._trusted_model_hosts()
+        for row in self._db.execute(
+            "SELECT input_schema, host FROM tool_schemas WHERE capture_ref = ? AND tool = ? "
+            "AND source IN (?, ?) ORDER BY last_seen DESC",
             (capture_ref, tool, ts.SOURCE_MODEL_REQUEST, ts.SOURCE_PROVIDER_MCP_LIST),
-        ).fetchone()
-        return json.loads(row[0]) if row is not None else None
+        ):
+            # Only a list the agent sent to a trusted host (§4.1): a doctored
+            # one sent elsewhere must not become the schema a call is held to.
+            if g.host_allowed(row[1] or None, trusted):
+                return json.loads(row[0])
+        return None
 
     def _backfill_data_actions(self) -> None:
         """Once per database: the last 24 hours of stored authenticated
@@ -228,14 +233,27 @@ class DataActionsStore:
             ).fetchall()
             if not rows:
                 break
+            now = datetime.now(timezone.utc)
             for row in rows:
                 stored = dict(row)
                 last_id = stored["id"]
-                self._record_capture_tools(stored, at=stored["timestamp"])
+                self._record_capture_tools(stored, at=self._capture_time(stored["timestamp"], now))
         self._db.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             (BACKFILL_SETTING, self._receive_time()),
         )
+
+    def _capture_time(self, value: Any, now: datetime) -> str:
+        """A capture's own timestamp in `_receive_time`'s fixed-width form, so
+        it sorts with the rest, and never later than now (a future or
+        unparsable value would otherwise pin `last_seen` for good)."""
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            parsed = now
+        return self._receive_time(min(parsed, now))
 
     # ------------------------------------------------------------- reading
 

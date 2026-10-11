@@ -222,7 +222,8 @@ def test_the_first_open_backfills_the_last_day_once(tmp_path):
     store = Store(database)
     [row] = store.data_action_rows(["session:s1"])
     stamp = sqlite3.connect(database).execute("SELECT timestamp FROM interactions").fetchone()[0]
-    assert row["first_seen"] == stamp  # the capture's own time, not the open's
+    # The capture's own time, not the open's, in the store's fixed-width form.
+    assert row["first_seen"] == stamp.replace("Z", ".000000Z")
     store.close()
     store = Store(database)  # not again
     assert store.data_action_rows(["session:s1"])[0]["count"] == 1
@@ -317,4 +318,38 @@ def test_a_declared_server_url_is_a_known_endpoint_for_unreadable_calls(tmp_path
     add(store, mcp_call({"raw": "garbage"}, host="tools.example.com", path="/rpc"))
     [row] = store.data_action_rows(["session:s1"])
     assert row["unreadable"] and row["endpoint"] == "tools.example.com/rpc"
+    store.close()
+
+
+# ------------------------------------------------------- review round 2
+
+
+def test_a_model_request_with_a_stray_jsonrpc_key_keeps_its_requested_calls():
+    item = model_turn({"content": [{"type": "tool_use", "name": "mcp__docs__read_doc", "input": {"doc_id": "a"}}]})
+    item["request"]["body"]["jsonrpc"] = "2.0"
+    [call] = tc.extract_tool_calls(stored(item))["calls"]
+    assert call["class"] == tc.REQUESTED
+
+
+def test_a_lost_body_post_is_reported_even_if_its_reply_looks_like_a_model(tmp_path):
+    store = new_store(tmp_path)
+    listed(store)
+    item = mcp_call({"raw": '{"jsonrpc": "2.0", "method": "tools/call", ... cut'})
+    item["response"]["body"] = {"content": []}
+    add(store, item)
+    assert any(r["unreadable"] for r in store.data_action_rows(["session:s1"]))
+    store.close()
+
+
+def test_the_fallback_schema_never_comes_from_an_untrusted_host(tmp_path):
+    store = new_store(tmp_path)
+    add(store, exchange("evil.example", "/v1/messages", {"model": "m", "messages": [], "tools": [
+        {"name": "get_status", "input_schema": {"type": "object", "properties": {"notes": {}}}}]}))
+    add(store, exchange("api.anthropic.com", "/v1/messages", {"model": "m", "messages": [], "tools": [
+        {"name": "get_status", "input_schema": {"type": "object", "properties": {}}}]}))
+    lost = model_turn({"content": [{"type": "tool_use", "name": "get_status", "input": {"notes": "x" * 50}}]})
+    lost["request"]["body"] = {"raw": "cut"}
+    add(store, lost)
+    [row] = [r for r in store.data_action_rows(["session:s1"]) if r["tool"] == "get_status"]
+    assert row["undeclared"] == ["notes"] and "upload" in row["actions"]
     store.close()
