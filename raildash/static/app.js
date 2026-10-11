@@ -1764,7 +1764,7 @@ function cappedChips(values, chips, key, noun) {
 // One profile dimension: a heading, an optional note, and a chip per value
 // with its count, or "None observed".
 function profileGroup(title, items, {
-  className, note, chipClass = "profile-chip", count, noun = "values",
+  className, note, chipClass = "profile-chip", count, noun = "values", describe,
 }) {
   const group = el("section", className ? `profile-group ${className}` : "profile-group");
   group.append(el("h3", null, title));
@@ -1777,6 +1777,15 @@ function profileGroup(title, items, {
     const chip = el("span", chipClass);
     chip.append(el("span", "profile-value", item.value));
     chip.append(el("span", "profile-count", count(item)));
+    if (describe) {
+      // Reasons ride on the chip as its accessible description too, so
+      // hover and a screen reader both get why.
+      const why = describe(item);
+      if (why) {
+        chip.title = why;
+        chip.setAttribute("aria-description", why);
+      }
+    }
     return chip;
   });
   const toggle = cappedChips(values, chips, `group:${title}`, noun);
@@ -1787,6 +1796,34 @@ function profileGroup(title, items, {
 
 function profileValues(title, items, noun) {
   return profileGroup(title, items, { count: (item) => item.count, noun });
+}
+
+// DR-205: what each tool call did with data, as classified from the schema
+// the agent was given. Upload rows come first (the server orders them).
+// A read only a server's hint or a model gave is marked, since the
+// guardrail never trusts it on its own.
+function dataActionsLabel(item) {
+  if (item.unreadable) return "unreadable call";
+  if (!item.actions.length) return "unclassified";
+  return item.actions
+    .map((action) => (action === "read" && item.weak_read ? "read (hint)" : action))
+    .join(" + ");
+}
+
+function profileDataActions(items) {
+  return profileGroup("Data actions", items.map((item) => ({ ...item, value: item.tool })), {
+    noun: "tools",
+    chipClass: "profile-chip profile-chip-stacked",
+    note: "What each tool call does with data, read from the schema the agent was given.",
+    count: (item) => {
+      const parts = [dataActionsLabel(item), `${fmtInt(item.count)} ${item.class}`];
+      if (item.bytes && item.bytes.total) parts.push(fmtBytes(item.bytes.total));
+      if (item.content_kinds.length) parts.push(item.content_kinds.join(", "));
+      if (item.undeclared.length) parts.push(`undeclared: ${item.undeclared.join(", ")}`);
+      return parts.join(" · ");
+    },
+    describe: (item) => [...(item.reasons || []), ...(item.notes || [])].join("; "),
+  });
 }
 
 function profileUploads(title, items) {
@@ -2021,6 +2058,7 @@ async function loadProfile() {
   view.append(profileValues("Hosts", observed.hosts || [], "hosts"));
   view.append(profileValues("Methods", observed.methods || [], "methods"));
   view.append(profileValues("Tools", observed.tool_names || [], "tools"));
+  view.append(profileDataActions(observed.data_actions || []));
   view.append(profileValues("Models", observed.models || [], "models"));
   view.append(profileValues("Uploaded content", observed.content_kinds || [], "kinds"));
   view.append(profileValues("Request content types", observed.request_media_types || [], "content types"));

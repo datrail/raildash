@@ -2215,6 +2215,10 @@ class Store(GuardrailCustody, DataActionsStore):
         interaction_count = int(totals["interactions"])
         error_count = int(totals["errors"])
         ticket_count = int(totals["ticket_interactions"])
+        data_actions = self._profile_data_actions(session_id, agent_key)
+        if len(data_actions) > MAX_PROFILE_DIMENSION_VALUES:
+            mark_truncated("data_actions")
+            data_actions = data_actions[:MAX_PROFILE_DIMENSION_VALUES]
         return {
             "schema_version": "1.0",
             "source": "raildash-observed",
@@ -2268,6 +2272,7 @@ class Store(GuardrailCustody, DataActionsStore):
                 ],
                 "file_access": file_access,
                 "file_types": file_types,
+                "data_actions": data_actions,
                 "truncated_dimensions": [
                     label
                     for label in (
@@ -2280,11 +2285,55 @@ class Store(GuardrailCustody, DataActionsStore):
                         "file_access",
                         "file_writes",
                         "file_types",
+                        "data_actions",
                     )
                     if label in truncated_dimensions
                 ],
             },
         }
+
+    def _profile_data_actions(self, session_id: str, agent_key: str | None) -> list[dict[str, Any]]:
+        """DR-205: the session's data-action rows for the observed profile.
+        With `agent_key`, only that agent's attributed captures, as for the
+        rest of the profile. Destination-hint values stay out of this
+        token-free route (design §5); the guardrail's detail route has them."""
+        query = (
+            "SELECT DISTINCT agent_host_id, sandbox_name, agent_key FROM interactions "
+            "WHERE session_id = ? AND attribution_state = 'attributed' "
+            "AND agent_host_id IS NOT NULL AND sandbox_name IS NOT NULL AND agent_key IS NOT NULL"
+        )
+        params: list[Any] = [session_id]
+        if agent_key:
+            query += " AND agent_key = ?"
+            params.append(agent_key)
+        refs = [
+            _capture_ref({"attribution_state": "attributed", "agent_host_id": row[0],
+                          "sandbox_name": row[1], "agent_key": row[2], "session_id": session_id})
+            for row in self._db.execute(query, params)
+        ]
+        if not agent_key:
+            refs.append(f"session:{session_id}")
+        out = []
+        for row in self.data_action_rows(refs):
+            classification = row["classification"] or {}
+            out.append({
+                "tool": row["tool"],
+                "class": row["class"],
+                "endpoint": row["endpoint"],
+                "actions": row["actions"],
+                "weak_read": bool(classification.get("weak_read")),
+                "unclassified": row["unclassified"],
+                "unreadable": row["unreadable"],
+                "count": row["count"],
+                "bytes": row["bytes"],
+                "content_kinds": row["content_kinds"],
+                "undeclared": row["undeclared"],
+                "streamed": row["streamed"],
+                "reasons": classification.get("reasons", []),
+                "notes": classification.get("notes", []),
+                "last_seen": row["last_seen"],
+            })
+        return out
 
     def interactions(
         self,

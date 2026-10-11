@@ -353,3 +353,37 @@ def test_the_fallback_schema_never_comes_from_an_untrusted_host(tmp_path):
     [row] = [r for r in store.data_action_rows(["session:s1"]) if r["tool"] == "get_status"]
     assert row["undeclared"] == ["notes"] and "upload" in row["actions"]
     store.close()
+
+
+# ------------------------------------------------------------ profile (M1c)
+
+
+def test_the_observed_profile_lists_data_actions_without_destination_values(tmp_path):
+    store = new_store(tmp_path)
+    listed(store)
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "read_doc", "arguments": {"doc_id": "a"}}}))
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": {"name": "upload_file", "arguments": {"content": PNG, "repo": "pub/x"}}}))
+    profile = store.observed_profile("s1")
+    actions = profile["observed"]["data_actions"]
+    assert [item["tool"] for item in actions] == ["upload_file", "read_doc"]
+    upload = actions[0]
+    assert upload["actions"] == ["upload"] and upload["content_kinds"] == ["image"]
+    assert upload["reasons"] and "destination" not in upload
+    assert "pub/x" not in json.dumps(profile)
+    # Another agent's view of the session has none of the unattributed rows.
+    assert store.observed_profile("s1", agent_key="other")["observed"]["data_actions"] == []
+    store.close()
+
+
+def test_an_attributed_agents_profile_shows_its_own_rows(tmp_path):
+    store = new_store(tmp_path)
+    item = mcp_call({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                     "params": {"name": "read_doc", "arguments": {"doc_id": "a"}}})
+    item.update({"runtime_identity_version": 1, "attribution": {"state": "attributed", "method": "cgroup"},
+                 "agent_ref": {"host_id": "h", "sandbox_name": "b", "agent_key": "writer"}})
+    add(store, item)
+    assert [a["tool"] for a in store.observed_profile("s1", agent_key="writer")["observed"]["data_actions"]] == ["read_doc"]
+    assert [a["tool"] for a in store.observed_profile("s1")["observed"]["data_actions"]] == ["read_doc"]
+    store.close()
