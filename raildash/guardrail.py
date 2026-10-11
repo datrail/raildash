@@ -29,6 +29,9 @@ The API, in the order a caller meets it:
   at all now (collector heartbeat, unattributed traffic).
 - `rule_states(asp_result, request_status)`: the four rules' latest results
   in one map, multi-agent applied.
+- `shown_rule_states(rule_results, counting_rules)`: each rule's state as
+  the panel and `/api/guardrails` show it, from the same rows the agent's
+  state counts.
 - `item_allowed(guardrail, violation)` and `row_counts(guardrail, row)`:
   whether a version allows a stored row's item, and so whether the row
   counts toward the state under the version in force.
@@ -1120,6 +1123,46 @@ def agent_state(
         if not result or result.get("state") not in (HELD, VIOLATED) or result.get("reason"):
             return STATE_UNVERIFIED
     return STATE_HELD
+
+
+def shown_rule_states(
+    rule_results: Mapping[str, Mapping[str, Any]],
+    counting_rules: Iterable[str],
+    *,
+    overflow_rule: str | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Each rule's state as it is shown beside its rows, read the way
+    `agent_state` reads the same results and rows, so the two never
+    disagree: `violated` while the rule has a counting row; otherwise
+    `held` when its latest evidence was verified (`held` or `violated` with
+    no reason) and `unverified` when it wasn't. A `reason` is kept wherever
+    the result had one, so a counting row on unverified evidence reads
+    "violated — stale".
+
+    The latest results alone can't be shown: the request rules' result is
+    only their liveness (`request_rules_status`), so their violations are
+    in their rows and nowhere else, and an ASP rule's result stays
+    `violated` after its rows are acknowledged or allowed.
+
+    The overflow row (`overflow_rule`) names no rule, and an item past the
+    row cap is recorded only there. So while it counts, a rule whose latest
+    result is `violated` is shown violated too: its item may be one of the
+    "N more"."""
+    counting = set(counting_rules)
+    overflowing = overflow_rule in counting
+    shown: dict[str, dict[str, Any]] = {}
+    for rule in RULES:
+        result = rule_results.get(rule) or {}
+        reason = result.get("reason")
+        if rule in counting or (overflowing and result.get("state") == VIOLATED):
+            state = VIOLATED
+        elif result.get("state") in (HELD, VIOLATED) and not reason:
+            state = HELD
+        else:
+            state = UNVERIFIED
+            reason = reason or NOT_COLLECTED
+        shown[rule] = {"state": state, "reason": reason}
+    return shown
 
 
 def item_allowed(guardrail: Mapping[str, Any], violation: Mapping[str, Any]) -> bool:

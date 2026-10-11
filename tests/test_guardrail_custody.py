@@ -181,6 +181,37 @@ def test_allow_this_on_the_listener_holds_once_every_rule_is_verified(store):
     assert stale["rules"]["service_ports"]["reason"] == g.STALE
 
 
+def test_each_rules_shown_state_agrees_with_its_rows(store):
+    """DR-200: the README's walk ended Violated with counting uploads and
+    out_of_spec_calls rows while both rules read "held", since a request
+    rule's result is only its liveness. Each rule's shown state is read
+    from the same rows as the agent's, in the detail and in the list."""
+    alignment, ref = baseline(store, asp(files=[_file("/app/agent.log")]))
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    store.allow_guardrail_row(rows(store, ref)[("service_ports", "tcp/127.0.0.1/8443")]["row_id"])
+    live(store)
+    held = {rule: {"state": "held", "reason": None} for rule in g.RULES}
+    assert store.guardrail_detail(ref)["rules"] == held
+
+    send(store, request("exfil.attacker.net"))
+    load(store, asp(listeners=[DEMO_LISTENER, PORT_9000], files=[_file("/app/agent.log")]))
+    detail = store.guardrail_detail(ref)
+    counting = {row["rule"] for row in detail["rows"] if row["counts"]}
+    assert counting == {"uploads", "out_of_spec_calls", "service_ports"}
+    assert detail["state"] == g.STATE_VIOLATED
+    assert detail["rules"] == dict(held, **{rule: {"state": "violated", "reason": None} for rule in counting})
+    [agent] = store.guardrail_agents()
+    assert agent["rules"] == detail["rules"]
+
+    # Acknowledged, the ASP rule's latest result is still `violated`, but
+    # nothing of it counts: it reads held, as the agent's state does.
+    store.acknowledge_guardrail_row(rows(store, ref)[("service_ports", "tcp/0.0.0.0/9000")]["row_id"])
+    for item in ("uploads", "out_of_spec_calls"):
+        store.acknowledge_guardrail_row(rows(store, ref)[(item, "exfil.attacker.net")]["row_id"])
+    detail = store.guardrail_detail(ref)
+    assert detail["state"] == g.STATE_HELD and detail["rules"] == held
+
+
 def test_a_hit_after_acknowledge_reopens_the_row(store):
     alignment, ref = baseline(store)
     store.adopt_guardrail(alignment["alignment_version_id"])

@@ -122,6 +122,13 @@ def test_the_guardrail_panel_drives_every_action(tmp_path):
             expect(panel).not_to_contain_text("forged.example")
             rows = card.locator("tr", has_text="exfil.example")
             expect(rows).to_have_count(2)  # an upload and an out-of-spec call
+            # Each rule's line agrees with its rows (DR-200): the two request
+            # rules with a counting row read violated, the others held.
+            rule_line = card.locator(".guardrail-rules")
+            for rule in ("uploads", "out_of_spec_calls"):
+                expect(rule_line.locator(f".guardrail-rule-violated[data-rule={rule}]")).to_have_count(1)
+            for rule in ("service_ports", "saved_files"):
+                expect(rule_line.locator(f".guardrail-rule-held[data-rule={rule}]")).to_have_count(1)
 
             # Acknowledge both → Held; the same upload again re-opens its row.
             for _ in range(2):
