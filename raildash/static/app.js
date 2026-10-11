@@ -1184,7 +1184,32 @@ function renderGuardrailRow(row, refresh, hasActive) {
   return tr;
 }
 
-function renderGuardrailRows(rows, refresh, hasActive) {
+// **Allow all** (DR-202) on one rule's rows: one new version that allows
+// every counting row of the rule that Allow this could allow, so nine rows
+// are one click and one version, not nine. It sends the ids shown here, so
+// it allows exactly what the user saw; if any changed since (allowed or
+// acknowledged meanwhile) the server refuses them all and creates nothing.
+// `row.allowable` is the server's own answer, which also knows an upload
+// over a size cap. Rows it can't allow stay, and the note says how many.
+function renderAllowAll(rule, inRule, refresh, hasActive, agentRef) {
+  const counting = inRule.filter((row) => row.counts);
+  const allowable = counting.filter((row) => row.allowable && guardrailRowAllowable(row, hasActive));
+  if (!agentRef || allowable.length < 2) return null;
+  const wrap = el("div", "guardrail-allow-all");
+  wrap.append(guardrailButton(`Allow all ${allowable.length}`, async () => {
+    await postJSON(`/api/guardrails/${encodeURIComponent(agentRef)}/allow-rows`,
+      { row_ids: allowable.map((row) => row.row_id) });
+    refresh();
+  }, { quiet: true, key: `allow-all:${rule}` }));
+  const left = counting.length - allowable.length;
+  if (left) {
+    wrap.append(el("span", "muted",
+      `${left} counting row${left === 1 ? "" : "s"} can't be allowed with one click and will stay.`));
+  }
+  return wrap;
+}
+
+function renderGuardrailRows(rows, refresh, hasActive, agentRef = null) {
   const wrap = el("div", "guardrail-rows");
   if (!rows.length) {
     wrap.append(el("p", "muted", "No violations recorded."));
@@ -1196,6 +1221,8 @@ function renderGuardrailRows(rows, refresh, hasActive) {
     if (!inRule.length) return;
     const label = GUARDRAIL_RULE_LABELS[rule] || "Past the row cap";
     wrap.append(el("h5", null, label));
+    const allowAll = renderAllowAll(rule, inRule, refresh, hasActive, agentRef);
+    if (allowAll) wrap.append(allowAll);
     if (rule === "(overflow)") {
       wrap.append(el("p", "muted",
         "Items past the open-row cap are counted here, not listed one by one, so a version " +
@@ -1318,6 +1345,12 @@ function renderGuardrailHistory(events) {
     const words = [event.action.replaceAll("_", " ")];
     if (event.detail.version) words.push(event.detail.version);
     if (event.detail.item) words.push(event.detail.item);
+    // Allow all records every item it added (DR-202).
+    if (Array.isArray(event.detail.items)) {
+      const shown = event.detail.items.slice(0, 5).join(", ");
+      const more = event.detail.items.length > 5 ? `, and ${event.detail.items.length - 5} more` : "";
+      words.push(`(${event.detail.items.length} items: ${shown}${more})`);
+    }
     list.append(el("li", null, `${fmtDateTime(event.at)} — ${words.join(" ")}`));
   });
   details.append(list);
@@ -1447,7 +1480,7 @@ async function loadGuardrails(focusKey = null) {
         "Uploads and out-of-spec calls are judged on the TLS requests the collector captured; " +
         "plain TCP, DNS or a stdio MCP server isn't seen."));
       if (detail.offers.length) card.append(renderGuardrailOffers(detail.agent_ref, detail.active, detail.offers, refresh));
-      card.append(renderGuardrailRows(detail.rows, refresh, true));
+      card.append(renderGuardrailRows(detail.rows, refresh, true, detail.agent_ref));
       const policy = el("details", "guardrail-active-policy");
       policy.dataset.key = "policy";
       policy.append(el("summary", null, `What ${detail.active.guardrail.version} allows`));

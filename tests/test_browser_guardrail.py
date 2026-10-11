@@ -9,7 +9,8 @@ the store's hooks, the routes and the panel work together.
 It walks the design's §6 step 3 list: each of the four states, propose →
 adopt, Allow this, Acknowledge followed by a re-opening hit, a *declared
 since gN* offer then Dismiss and no second offer after a switch, Turn off,
-and the token on every write the panel makes.
+and the token on every write the panel makes. A second test clicks Allow
+all (DR-202): one rule's rows allowed in one version.
 """
 
 from __future__ import annotations
@@ -189,4 +190,70 @@ def test_the_guardrail_panel_drives_every_action(tmp_path):
 
     panel_writes = [(target, sent) for target, sent in writes if "/api/" in target]
     assert panel_writes, "the panel made no writes"
+    assert all(sent == token for _, sent in panel_writes), panel_writes
+
+
+def test_allow_all_allows_a_rules_rows_in_one_version(tmp_path):
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    asp_id = store.load_asp(json.dumps(asp(listeners=[DEMO_LISTENER])).encode())["asp_id"]
+    made = store.make_baseline(asp_id, "v1.0")
+    store.adopt_guardrail(made["alignment_version"]["alignment_version_id"])
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    writes: list[tuple[str, str | None]] = []
+    try:
+        _wait_until_ready(url, process)
+        token = Path(f"{database}.token").read_text().strip()
+        hosts = ("a.example", "b.example", "c.example")
+        for n, host in enumerate((*hosts, "*.com")):
+            _capture(url, token, host, f"allow-all-{n}")
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.on("request", lambda req: writes.append(
+                (req.url, req.headers.get("x-raildash-token"))
+            ) if req.method == "POST" else None)
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            expect(card.locator(".asp-state")).to_have_text("Violated", timeout=TIMEOUT)
+
+            # The uploads rule: three hosts one click can allow, and a
+            # wildcard Host header it can't, which is left and said so.
+            group = card.locator(".guardrail-allow-all").filter(
+                has=page.locator('button[data-key="allow-all:uploads"]'))
+            button = group.get_by_role("button")
+            expect(button).to_have_text("Allow all 3", timeout=TIMEOUT)
+            expect(group).to_contain_text("1 counting row can't be allowed with one click")
+            button.click()
+
+            uploads = card.locator("table").nth(1)  # service ports, then uploads
+            for host in hosts:
+                expect(uploads.locator("tr", has_text=host)).to_contain_text(
+                    "allowed by g2", timeout=TIMEOUT)
+            expect(uploads.locator("tr", has_text="*.com")).to_contain_text("counts")
+            expect(page.locator('button[data-key="allow-all:uploads"]')).to_have_count(0)
+            # The same hosts' out-of-spec rows are another rule's and still count.
+            expect(page.locator('button[data-key="allow-all:out_of_spec_calls"]')).to_have_text(
+                "Allow all 3")
+            picker = card.get_by_label("Guardrail version")
+            expect(picker.locator("option")).to_have_count(2)
+            history = card.locator(".guardrail-history")
+            history.locator("summary").click()
+            # In the order the page listed them: newest first.
+            expect(history).to_contain_text("allow rows g2 (3 items: c.example, b.example, a.example)")
+            browser.close()
+    finally:
+        process.terminate()
+        process.communicate(timeout=10)
+
+    panel_writes = [(target, sent) for target, sent in writes if "/api/" in target]
+    assert [target.rsplit("/", 1)[1] for target, _ in panel_writes] == ["allow-rows"]
     assert all(sent == token for _, sent in panel_writes), panel_writes

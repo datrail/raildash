@@ -1023,9 +1023,9 @@ async def ingest_evidence_bundle(
 # §4.5). Thin wrappers over the `Store` methods in `raildash.guardrail_store`,
 # which the store's own ingest hooks feed. Every route needs the local write
 # token: the writes (adopt, edit, switch, turn off, acknowledge, allow,
-# dismiss) like lock and switch, and the two reads because the design adds
-# no unauthenticated route (§5) -- the list carries states and identities
-# only, and hosts, paths and ports come from the detail.
+# allow all, dismiss) like lock and switch, and the two reads because the
+# design adds no unauthenticated route (§5) -- the list carries states and
+# identities only, and hosts, paths and ports come from the detail.
 
 
 async def _guardrail_rules(request: Request, *, required: bool) -> dict[str, Any] | None:
@@ -1130,6 +1130,27 @@ def api_acknowledge_guardrail_row(row_id: int = GUARDRAIL_ROW_ID) -> dict[str, A
 def api_allow_guardrail_row(row_id: int = GUARDRAIL_ROW_ID) -> dict[str, Any]:
     """**Allow this** on one row: a new version with its item allowed."""
     return _guardrail_call(get_store().allow_guardrail_row, row_id)
+
+
+@app.post(
+    "/api/guardrails/{agent_ref}/allow-rows",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_allow_guardrail_rows(agent_ref: str, request: Request) -> dict[str, Any]:
+    """**Allow all** (DR-202): one new version that allows every listed row
+    of one rule, as Allow this would one by one. Body `{"row_ids": [...]}`,
+    the rows the page showed. All or nothing: 409 and no version if any
+    can't be allowed. The list is bounded by the guardrail body size."""
+    body = await _json_body(request, max_bytes=MAX_GUARDRAIL_BODY_BYTES)
+    row_ids = body.get("row_ids") if isinstance(body, dict) else None
+    if (
+        not isinstance(row_ids, list)
+        or not row_ids
+        or not all(type(row_id) is int and 1 <= row_id <= 2**63 - 1 for row_id in row_ids)
+    ):
+        raise HTTPException(422, "row_ids must be a non-empty list of row ids")
+    return _guardrail_call(get_store().allow_guardrail_rows, agent_ref, row_ids)
 
 
 async def _offer(request: Request) -> tuple[str, str]:

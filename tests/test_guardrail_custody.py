@@ -373,6 +373,107 @@ def test_allow_this_refuses_what_one_click_cant_allow(store):
         store.allow_guardrail_row(10_000)
 
 
+# ------------------------------------------------- Allow all (DR-202)
+
+
+def _ids(found: dict, rule: str, *items: str) -> list[int]:
+    return [found[(rule, item)]["row_id"] for item in items]
+
+
+def test_allow_all_allows_one_rules_rows_in_one_version(store):
+    ref, _ = _adopted(store)
+    paths = [f"/data/out-{n}.zip" for n in range(3)]
+    load(store, asp(files=[_file(path) for path in paths]))
+    found = rows(store, ref)
+    assert all(found[("saved_files", path)]["counts"] and found[("saved_files", path)]["allowable"]
+               for path in paths)
+    allowed = store.allow_guardrail_rows(ref, _ids(found, "saved_files", *paths))
+    assert allowed["guardrail"]["version"] == "g2" and allowed["created_by"] == "allow_rows"
+    assert allowed["guardrail"]["rules"]["saved_files"]["allowed"][-3:] == [
+        {"path": path, "literal": True} for path in paths
+    ]
+    detail = store.guardrail_detail(ref)
+    assert [v["guardrail"]["version"] for v in detail["versions"]] == ["g2", "g1"]
+    after = rows(store, ref)
+    assert all(not after[("saved_files", p)]["counts"] and after[("saved_files", p)]["allowed_by"] == "g2"
+               for p in paths)
+    # The listener of another rule is untouched and still counts.
+    assert after[("service_ports", "tcp/127.0.0.1/8443")]["counts"]
+    event = detail["events"][0]
+    assert event["action"] == "allow_rows"
+    assert event["detail"] == {"version": "g2", "rule": "saved_files",
+                               "row_ids": _ids(found, "saved_files", *paths), "items": paths}
+
+
+def test_allow_all_is_all_or_nothing(store):
+    ref, _ = _adopted(store)
+    send(store, request("a.example.net"), request("b.example.net"), request(None), request("*.com"),
+         request("x/y.example"))
+    # A second agent, adopted after the captures so they stay this one's.
+    other_ref, _ = _adopted(store, asp(deployment="other-agent"))
+    assert other_ref != ref
+    found = rows(store, ref)
+    assert not found[("uploads", "(unknown host)")]["allowable"]
+    assert not found[("uploads", "*.com")]["allowable"]
+    # A Host header no version can list: Allow this alone would be refused.
+    assert found[("uploads", "x/y.example")]["counts"]
+    assert not found[("uploads", "x/y.example")]["allowable"]
+    assert found[("uploads", "a.example.net")]["allowable"]
+    good = _ids(found, "uploads", "a.example.net", "b.example.net")
+    listener = found[("service_ports", "tcp/127.0.0.1/8443")]["row_id"]
+    other_listener = rows(store, other_ref)[("service_ports", "tcp/127.0.0.1/8443")]["row_id"]
+    refused = [
+        ([*good, *_ids(found, "uploads", "(unknown host)")], "no host"),
+        ([*good, *_ids(found, "uploads", "*.com")], "wildcard"),
+        ([*good, *_ids(found, "uploads", "x/y.example")], r"row \d+ \(x/y\.example\)"),
+        ([*good, listener], "one rule"),
+        ([*good, other_listener], "not one of this agent"),
+        ([*good, 10_000], "not one of this agent"),
+        ([good[0], good[0]], "more than once"),
+        ([], "no rows"),
+    ]
+    for row_ids, message in refused:
+        with pytest.raises(ValueError, match=message):
+            store.allow_guardrail_rows(ref, row_ids)
+    store.acknowledge_guardrail_row(good[1])
+    with pytest.raises(ValueError, match="no longer counts"):
+        store.allow_guardrail_rows(ref, good)
+    # Nothing above created a version or recorded an allow.
+    detail = store.guardrail_detail(ref)
+    assert len(detail["versions"]) == 1
+    assert "allow_rows" not in [event["action"] for event in detail["events"]]
+    with pytest.raises(KeyError):
+        store.allow_guardrail_rows("agt-nobody", good)
+    store.turn_off_guardrail(ref)
+    with pytest.raises(ValueError, match="no active guardrail"):
+        store.allow_guardrail_rows(ref, good[:1])
+
+
+def test_allow_all_folds_rows_that_share_an_entry_once(store):
+    ref, _ = _adopted(store)
+    send(store, request("a.example.net"), request("b.example.net"))
+    found = rows(store, ref)
+    allowed = store.allow_guardrail_rows(
+        ref, _ids(found, "out_of_spec_calls", "a.example.net", "b.example.net"))
+    hosts = allowed["guardrail"]["rules"]["out_of_spec_calls"]["allowed_hosts"]
+    assert hosts.count("a.example.net") == 1 and hosts.count("b.example.net") == 1
+    # The same hosts' upload rows are another rule's, and still count.
+    assert rows(store, ref)[("uploads", "a.example.net")]["counts"]
+
+
+def test_an_upload_over_a_size_cap_is_not_offered_to_allow_all(store):
+    ref, _ = _adopted(store)
+    send(store, request("big.example.net", size=50_000))
+    rules = copy.deepcopy(store.guardrail_detail(ref)["active"]["guardrail"]["rules"])
+    rules["uploads"]["allowed_hosts"].append("big.example.net")
+    rules["uploads"]["max_request_bytes"] = {"big.example.net": 1_000}
+    store.edit_guardrail(store.guardrail_detail(ref)["active"]["guardrail"]["guardrail_version_id"], rules)
+    row = rows(store, ref)[("uploads", "big.example.net")]
+    assert row["counts"] and not row["allowable"]
+    with pytest.raises(ValueError, match="size cap"):
+        store.allow_guardrail_rows(ref, [row["row_id"]])
+
+
 # ------------------------------------------------------------------ offers
 
 
