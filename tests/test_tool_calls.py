@@ -118,7 +118,7 @@ def test_observed_tools_call_and_a_non_jsonrpc_post_is_reported():
     assert result["mcp_post_unreadable"] == {"endpoint": "docs.example.com/mcp", "request_size": 4_000_000}
     # The transport's own GET carries no call and isn't reported.
     get = exchange("docs.example.com", "/mcp", None, method="GET")
-    assert tc.extract_tool_calls(stored(get)) == {"calls": [], "mcp_post_unreadable": None}
+    assert tc.extract_tool_calls(stored(get)) == {"calls": [], "mcp_post_unreadable": None, "truncated": False}
 
 
 def test_hostile_shapes_do_not_raise():
@@ -220,8 +220,101 @@ def test_the_first_open_backfills_the_last_day_once(tmp_path):
     db.commit()
     db.close()
     store = Store(database)
-    assert len(store.data_action_rows(["session:s1"])) == 1
+    [row] = store.data_action_rows(["session:s1"])
+    stamp = sqlite3.connect(database).execute("SELECT timestamp FROM interactions").fetchone()[0]
+    assert row["first_seen"] == stamp  # the capture's own time, not the open's
     store.close()
     store = Store(database)  # not again
     assert store.data_action_rows(["session:s1"])[0]["count"] == 1
+    store.close()
+
+
+# ------------------------------------------------------- review round 1
+
+
+def listed(store):
+    add(store, exchange("docs.example.com", "/mcp",
+                        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, LISTING))
+
+
+def test_each_call_in_a_batch_is_checked_with_its_own_arguments(tmp_path):
+    store = new_store(tmp_path)
+    listed(store)
+    add(store, mcp_call([
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "read_doc", "arguments": {"doc_id": "a"}}},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+         "params": {"name": "read_doc", "arguments": {"doc_id": "b", "secret": "x"}}},
+    ]))
+    [row] = [r for r in store.data_action_rows(["session:s1"]) if r["tool"] == "read_doc"]
+    assert row["undeclared"] == ["secret"] and "upload" in row["actions"]
+    store.close()
+
+
+def test_a_large_batch_is_read_once(tmp_path):
+    import time
+
+    store = new_store(tmp_path)
+    listed(store)
+    padding = "A" * 20_000
+    batch = [{"jsonrpc": "2.0", "id": i, "method": "tools/call",
+              "params": {"name": "read_doc", "arguments": {"doc_id": padding}}} for i in range(300)]
+    started = time.monotonic()
+    add(store, mcp_call(batch))
+    assert time.monotonic() - started < 20
+    tools = {r["tool"]: r for r in store.data_action_rows(["session:s1"])}
+    # Past MAX_CALLS the rest is marked, and that fails closed.
+    assert tools["(more calls)"]["unreadable"]
+    store.close()
+
+
+def test_a_jsonrpc_call_dressed_as_a_model_request_is_still_a_call():
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "model": "m", "messages": [],
+            "params": {"name": "upload_file", "arguments": {"content": PNG}}}
+    [call] = tc.extract_tool_calls(stored(mcp_call(body)))["calls"]
+    assert call["class"] == tc.OBSERVED and call["tool"] == "upload_file"
+
+
+def test_a_lost_request_body_falls_back_to_the_newest_known_schema(tmp_path):
+    store = new_store(tmp_path)
+    add(store, model_turn({"content": []}))  # the tool list, once
+    lost = model_turn({"content": [{"type": "tool_use", "name": "mcp__docs__read_doc",
+                                    "input": {"doc_id": "a", "extra": 1}}]})
+    lost["request"]["body"] = {"raw": '{"model": "m", "messages": [ ... cut'}
+    add(store, lost)
+    [row] = store.data_action_rows(["session:s1"])
+    assert row["tool"] == "mcp__docs__read_doc" and row["undeclared"] == ["extra"]
+    assert row["schema_known"]
+    store.close()
+
+
+def test_past_the_row_bound_a_tool_keeps_its_own_row(tmp_path, monkeypatch):
+    from raildash import data_actions_store as das
+
+    monkeypatch.setattr(das, "MAX_ROWS_PER_CAPTURE", 3)
+    monkeypatch.setattr(das, "MAX_ROWS_SLACK", 1)
+    store = new_store(tmp_path)
+    listed(store)
+    for repo in ("a", "b", "c", "d", "e"):
+        add(store, mcp_call({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                             "params": {"name": "read_doc", "arguments": {"doc_id": "x", "repo": repo}}}))
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": "upload_file", "arguments": {"content": PNG}}}))
+    add(store, mcp_call({"raw": "garbage"}))
+    tools = [r["tool"] for r in store.data_action_rows(["session:s1"])]
+    assert "(unreadable call)" in tools
+    # The upload either keeps its row or lands in the overflow row, which
+    # counts as unreadable; it never reads as nothing.
+    rows = store.data_action_rows(["session:s1"])
+    assert any(r["tool"] == "upload_file" and r["actions"] == ["upload"] for r in rows) or any(
+        r["tool"] == "(more calls)" and r["unreadable"] for r in rows)
+    store.close()
+
+
+def test_a_declared_server_url_is_a_known_endpoint_for_unreadable_calls(tmp_path, monkeypatch):
+    store = new_store(tmp_path)
+    monkeypatch.setattr(type(store), "_asp_facts",
+                        lambda self: {"inference_hosts": set(), "mcp_endpoints": {"tools.example.com/rpc"}})
+    add(store, mcp_call({"raw": "garbage"}, host="tools.example.com", path="/rpc"))
+    [row] = store.data_action_rows(["session:s1"])
+    assert row["unreadable"] and row["endpoint"] == "tools.example.com/rpc"
     store.close()

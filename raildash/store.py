@@ -1690,14 +1690,15 @@ class Store(GuardrailCustody, DataActionsStore):
             self._db.commit()
         return inserted
 
-    def _record_capture_tools(self, interaction: dict[str, Any]) -> None:
+    def _record_capture_tools(self, interaction: dict[str, Any], *, at: str | None = None) -> None:
         """DR-205: the tool schemas (M0) and tool calls (M1) one stored
-        authenticated request carries."""
+        authenticated request carries. `at` is the time to record them at
+        (the capture's own, when backfilling)."""
         if _tool_schemas.may_carry_tools(interaction.get("raw")):
-            self._record_tool_schemas(interaction)
-        self._record_tool_calls(interaction, _capture_ref(interaction))
+            self._record_tool_schemas(interaction, at=at)
+        self._record_tool_calls(interaction, _capture_ref(interaction), at=at)
 
-    def _record_tool_schemas(self, interaction: dict[str, Any]) -> None:
+    def _record_tool_schemas(self, interaction: dict[str, Any], *, at: str | None = None) -> None:
         """DR-205 M0: the tool schemas one newly stored authenticated
         request carries, upserted in the transaction that stores it. A
         failure is reported and rolled back to its savepoint; the capture is
@@ -1707,7 +1708,7 @@ class Store(GuardrailCustody, DataActionsStore):
             found = _tool_schemas.extract_tool_schemas(interaction)["schemas"]
             if found:
                 ref = _capture_ref(interaction)
-                now = self._receive_time()
+                now = at or self._receive_time()
                 for item in found:
                     self._db.execute(
                         """
@@ -1717,7 +1718,7 @@ class Store(GuardrailCustody, DataActionsStore):
                             first_seen, last_seen, interaction_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT (capture_ref, source, endpoint, tool, schema_hash, host)
-                        DO UPDATE SET last_seen = excluded.last_seen,
+                        DO UPDATE SET last_seen = max(last_seen, excluded.last_seen),
                                       interaction_id = excluded.interaction_id
                         """,
                         (

@@ -29,7 +29,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-from typing import Any, Iterator, Mapping
+from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlsplit
 
 from . import guardrail as g
@@ -160,14 +160,30 @@ def _magic_kind(value: str) -> str | None:
     return None
 
 
-def extract_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
-    """`{calls: [...], mcp_post_unreadable: {endpoint, request_size} | None}`.
+def extract_tool_calls(
+    interaction: Mapping[str, Any],
+    *,
+    endpoint_schema: Callable[[str, str], Any] | None = None,
+    fallback_schema: Callable[[str], Any] | None = None,
+) -> dict[str, Any]:
+    """`{calls, mcp_post_unreadable, truncated}` for one stored exchange.
 
     A call is `{class, tool, endpoint, arguments_bytes, undeclared,
-    content_kinds, streamed, schema_known}`; `endpoint` is set for an
-    observed call. `undeclared` is filled for requested calls only.
+    content_kinds, destination, streamed, schema_known, schema_fallback}`.
+    The schema a call is checked against (§4.3):
+
+    - requested: the tool list in the same request; when the request body
+      couldn't be read (cut at the capture's bound, or missing),
+      `fallback_schema(tool)`, the newest the caller holds, and the call says
+      `schema_fallback`;
+    - observed: `endpoint_schema(endpoint, tool)`, the endpoint's newest
+      `tools/list` entry.
+
+    Each call is checked with its own arguments, read once. `truncated`
+    says calls past `MAX_CALLS` were left out; the caller must not treat
+    that as nothing.
     """
-    out: dict[str, Any] = {"calls": [], "mcp_post_unreadable": None}
+    out: dict[str, Any] = {"calls": [], "mcp_post_unreadable": None, "truncated": False}
     raw = g._stored_raw(interaction)
     if raw is None:
         return out
@@ -175,16 +191,17 @@ def extract_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
     request = exchange.get("request") if isinstance(exchange, dict) else None
     if not isinstance(request, dict):
         return out
-    raw_host, raw_path = _split_host_path(request)
-    host = g.normalize_host(raw_host)
-    path = urlsplit(raw_path).path if isinstance(raw_path, str) else ""
-    endpoint = f"{host or g.UNKNOWN_HOST}{path or '/'}"
+    endpoint = endpoint_key(request)
     body = ts._json_body(request.get("body"))
     chunked = (_header(request.get("headers"), "transfer-encoding") or "").lower() == "chunked"
 
     def add(cls: str, tool: str | None, arguments: Any, *, schema: Any = None,
-            schema_known: bool = False, streamed: bool = False, at: str | None = None) -> None:
-        if tool is None or len(out["calls"]) >= MAX_CALLS:
+            schema_known: bool = False, schema_fallback: bool = False, streamed: bool = False,
+            at: str | None = None) -> None:
+        if tool is None:
+            return
+        if len(out["calls"]) >= MAX_CALLS:
+            out["truncated"] = True
             return
         out["calls"].append({
             "class": cls, "tool": tool, "endpoint": at,
@@ -194,38 +211,83 @@ def extract_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
             "destination": destination(arguments, schema),
             "streamed": streamed,
             "schema_known": schema_known,
+            "schema_fallback": schema_fallback,
         })
 
-    # Requested: the model's reply, checked against this request's tools.
-    if ts._is_model_request(body):
-        given = {
-            item["tool"]: item["input_schema"]
-            for item in ts.extract_tool_schemas(interaction)["schemas"]
-            if item["source"] in (ts.SOURCE_MODEL_REQUEST, ts.SOURCE_PROVIDER_MCP_LIST)
-        }
-        streamed = _response_is_stream(exchange)
-        for kind, name, server, arguments in _requested(exchange):
-            tool = call_name(kind, name, server)
-            add(REQUESTED, tool, _arguments(arguments), schema=given.get(tool or ""),
-                schema_known=(tool in given), streamed=streamed)
+    messages = body if isinstance(body, list) else [body]
+    jsonrpc = [m for m in messages if isinstance(m, dict) and m.get("jsonrpc") == "2.0"]
+    is_post = (request.get("method") or "").upper() == "POST"
 
-    # Observed: JSON-RPC `tools/call` on the wire.
-    if (request.get("method") or "").upper() == "POST" and not ts._is_model_request(body):
-        messages = body if isinstance(body, list) else [body]
-        jsonrpc = [m for m in messages if isinstance(m, dict) and m.get("jsonrpc") == "2.0"]
+    if jsonrpc:
+        # Observed: JSON-RPC `tools/call` on the wire. Checked first, so a
+        # message dressed with `model` and `messages` is still a call.
         for message in jsonrpc:
             if message.get("method") != "tools/call":
                 continue
             params = message.get("params")
             params = params if isinstance(params, dict) else {}
-            add(OBSERVED, call_name("mcp", params.get("name")), params.get("arguments"),
-                streamed=chunked, at=endpoint)
-        if not jsonrpc:
-            size = interaction.get("request_size")
-            out["mcp_post_unreadable"] = {
-                "endpoint": endpoint, "request_size": size if isinstance(size, int) else None,
-            }
+            tool = call_name("mcp", params.get("name"))
+            schema = endpoint_schema(endpoint, tool) if (endpoint_schema and tool) else None
+            add(OBSERVED, tool, params.get("arguments"), schema=schema,
+                schema_known=schema is not None, streamed=chunked, at=endpoint)
+        return out
+
+    # A body the capture cut or lost: missing, text, or kept as `{"raw": …}`
+    # because it didn't parse.
+    body_lost = body is None or isinstance(body, str) or (
+        isinstance(body, dict) and set(body) == {"raw"}
+    )
+    if ts._is_model_request(body) or (body_lost and _replies_like_a_model(exchange)):
+        # Requested: the model's reply, against this request's own tools,
+        # or the newest known schema when the request couldn't be read.
+        readable = ts._is_model_request(body)
+        given = {
+            item["tool"]: item["input_schema"]
+            for item in ts.extract_tool_schemas(interaction)["schemas"]
+            if item["source"] in (ts.SOURCE_MODEL_REQUEST, ts.SOURCE_PROVIDER_MCP_LIST)
+        } if readable else {}
+        streamed = _response_is_stream(exchange)
+        for kind, name, server, arguments in _requested(exchange):
+            tool = call_name(kind, name, server)
+            if tool is None:
+                continue
+            if readable or tool in given:
+                add(REQUESTED, tool, _arguments(arguments), schema=given.get(tool),
+                    schema_known=tool in given, streamed=streamed)
+            else:
+                schema = fallback_schema(tool) if fallback_schema else None
+                add(REQUESTED, tool, _arguments(arguments), schema=schema,
+                    schema_known=schema is not None, schema_fallback=True, streamed=streamed)
+        return out
+
+    if is_post:
+        size = interaction.get("request_size")
+        out["mcp_post_unreadable"] = {
+            "endpoint": endpoint, "request_size": size if isinstance(size, int) else None,
+        }
     return out
+
+
+def endpoint_key(request: Mapping[str, Any]) -> str:
+    """`<host><path>`, as `tool_schemas` keys an MCP endpoint."""
+    raw_host, raw_path = _split_host_path(dict(request))
+    host = g.normalize_host(raw_host)
+    path = urlsplit(raw_path).path if isinstance(raw_path, str) else ""
+    return f"{host or g.UNKNOWN_HOST}{path or '/'}"
+
+
+def _replies_like_a_model(exchange: Mapping[str, Any]) -> bool:
+    """Whether the reply has a model's shape, for a request whose body was
+    lost: Anthropic content blocks, Chat choices, Responses output, or one
+    of their stream events."""
+    for value in ts._response_messages(exchange):
+        if isinstance(value, dict) and (
+            isinstance(value.get("content"), list) or isinstance(value.get("choices"), list)
+            or isinstance(value.get("output"), list)
+            or value.get("type") in ("content_block_start", "message_start", "response.output_item.done")
+        ):
+            return True
+    return False
 
 
 def _response_is_stream(exchange: Mapping[str, Any]) -> bool:
@@ -276,6 +338,7 @@ def _requested(exchange: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any, Any
             if isinstance(item, dict):
                 yield from _responses_item(item)
         for position, choice in enumerate(ts._dicts(value.get("choices"))):
+            position = choice.get("index") if isinstance(choice.get("index"), int) else position
             delta = choice.get("delta")
             for call in ts._dicts(delta.get("tool_calls") if isinstance(delta, dict) else None):
                 call_index = call.get("index") if isinstance(call.get("index"), int) else 0

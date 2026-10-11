@@ -21,6 +21,7 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Mapping
+from urllib.parse import urlsplit
 
 from . import data_actions as da
 from . import guardrail as g
@@ -31,6 +32,8 @@ from .asp import parse_bundle
 UNREADABLE_TOOL = "(unreadable call)"
 OVERFLOW_TOOL = "(more calls)"
 MAX_ROWS_PER_CAPTURE = 2000
+# Rows past the bound, without destination values, before the overflow row.
+MAX_ROWS_SLACK = 500
 SCHEMA_WINDOW = timedelta(days=30)
 BACKFILL_WINDOW = timedelta(hours=24)
 BACKFILL_SETTING = "data_actions_backfilled_v1"
@@ -62,6 +65,7 @@ CREATE TABLE IF NOT EXISTS data_action_calls (
     last_interaction_id TEXT,
     PRIMARY KEY (capture_ref, class, tool, endpoint, destination)
 );
+CREATE INDEX IF NOT EXISTS tool_schemas_endpoint ON tool_schemas(source, endpoint, tool);
 """
 
 
@@ -82,36 +86,43 @@ class DataActionsStore:
 
     # ------------------------------------------------------------- writing
 
-    def _record_tool_calls(self, interaction: dict[str, Any], capture_ref: str) -> None:
-        """The calls one newly stored authenticated request carries."""
+    def _record_tool_calls(
+        self, interaction: dict[str, Any], capture_ref: str, *, at: str | None = None
+    ) -> None:
+        """The calls one newly stored authenticated request carries. `at` is
+        the time to record (the capture's own, when backfilling)."""
         raw = interaction.get("raw")
         known = self._known_mcp_endpoints()
         if isinstance(raw, str) and not any(m in raw for m in _CALL_MARKERS):
-            host = g.normalize_host(interaction.get("host"))
-            path = (interaction.get("path") or "/").split("?", 1)[0]
-            if (interaction.get("method") or "").upper() != "POST" or f"{host}{path}" not in known:
+            request = {"headers": {"host": interaction.get("host")}, "path": interaction.get("path")}
+            if (interaction.get("method") or "").upper() != "POST" or tc.endpoint_key(request) not in known:
                 return
         self._db.execute("SAVEPOINT tool_calls_hook")
         try:
-            found = tc.extract_tool_calls(interaction)
-            now = self._receive_time()
+            found = tc.extract_tool_calls(
+                interaction,
+                endpoint_schema=self._endpoint_schema,
+                fallback_schema=lambda tool: self._fallback_schema(capture_ref, tool),
+            )
+            now = at or self._receive_time()
+            interaction_id = interaction.get("interaction_id")
             for call in found["calls"]:
-                undeclared = call["undeclared"]
-                if call["class"] == tc.OBSERVED:
-                    listing = self._endpoint_schema(call["endpoint"], call["tool"])
-                    if listing is not None:
-                        call["schema_known"] = True
-                        undeclared = tc.undeclared_arguments(
-                            self._call_arguments(interaction, call), listing
-                        )
-                self._upsert_call(capture_ref, call, undeclared, now, interaction.get("interaction_id"))
+                self._upsert_call(capture_ref, call, now, interaction_id)
             unreadable = found["mcp_post_unreadable"]
             if unreadable and unreadable["endpoint"] in known:
                 self._upsert_call(capture_ref, {
                     "class": tc.OBSERVED, "tool": UNREADABLE_TOOL, "endpoint": unreadable["endpoint"],
                     "arguments_bytes": unreadable["request_size"] or 0, "content_kinds": [],
+                    "undeclared": [], "streamed": False, "schema_known": False, "destination": {},
+                }, now, interaction_id)
+            if found["truncated"]:
+                # Calls past the cap weren't read; that must not read as
+                # nothing (fails closed, like an unreadable call).
+                self._upsert_call(capture_ref, {
+                    "class": tc.OBSERVED, "tool": OVERFLOW_TOOL, "endpoint": "",
+                    "arguments_bytes": 0, "content_kinds": [], "undeclared": [],
                     "streamed": False, "schema_known": False, "destination": {},
-                }, [], now, interaction.get("interaction_id"))
+                }, now, interaction_id)
         except Exception as exc:  # noqa: BLE001 - evidence must still be stored
             self._db.execute("ROLLBACK TO tool_calls_hook")
             self._db.execute("RELEASE tool_calls_hook")
@@ -119,42 +130,34 @@ class DataActionsStore:
             return
         self._db.execute("RELEASE tool_calls_hook")
 
-    @staticmethod
-    def _call_arguments(interaction: Mapping[str, Any], call: Mapping[str, Any]) -> Any:
-        """An observed call's arguments, read again for the endpoint's schema."""
-        raw = g._stored_raw(interaction)
-        if raw is None:
-            return None
-        request = (g.legacy_exchange(raw) or {}).get("request") or {}
-        body = ts._json_body(request.get("body") if isinstance(request, dict) else None)
-        for message in body if isinstance(body, list) else [body]:
-            if isinstance(message, dict) and message.get("method") == "tools/call":
-                params = message.get("params")
-                if isinstance(params, dict) and params.get("name") == call["tool"]:
-                    return params.get("arguments")
-        return None
-
     def _upsert_call(
-        self, capture_ref: str, call: Mapping[str, Any], undeclared: list[str], now: str,
-        interaction_id: Any,
+        self, capture_ref: str, call: Mapping[str, Any], now: str, interaction_id: Any,
     ) -> None:
         destination = destination_values(call.get("destination") or {})
-        key = (capture_ref, call["class"], call["tool"], call["endpoint"] or "", destination)
-        existing = self._db.execute(
-            "SELECT * FROM data_action_calls WHERE capture_ref = ? AND class = ? AND tool = ? "
-            "AND endpoint = ? AND destination = ?", key,
-        ).fetchone()
-        size = int(call["arguments_bytes"] or 0)
+        endpoint = call["endpoint"] or ""
+        key = [capture_ref, call["class"], call["tool"], endpoint, destination]
+        where = ("WHERE capture_ref = ? AND class = ? AND tool = ? AND endpoint = ? "
+                 "AND destination = ?")
+        existing = self._db.execute(f"SELECT * FROM data_action_calls {where}", key).fetchone()
         if existing is None:
             rows = self._db.execute(
                 "SELECT count(*) FROM data_action_calls WHERE capture_ref = ?", (capture_ref,)
             ).fetchone()[0]
-            if rows >= MAX_ROWS_PER_CAPTURE and call["tool"] != OVERFLOW_TOOL:
-                # Past the bound, new distinct calls count in one row.
+            if rows >= MAX_ROWS_PER_CAPTURE and destination:
+                # Past the bound, a new destination value joins its tool's
+                # row without one, so the tool and its actions stay visible.
+                key[4] = ""
+                existing = self._db.execute(f"SELECT * FROM data_action_calls {where}", key).fetchone()
+            if existing is None and rows >= MAX_ROWS_PER_CAPTURE + MAX_ROWS_SLACK and call["tool"] not in (
+                UNREADABLE_TOOL, OVERFLOW_TOOL
+            ):
                 self._upsert_call(capture_ref, {
                     **call, "tool": OVERFLOW_TOOL, "endpoint": "", "destination": {},
-                }, undeclared, now, interaction_id)
+                }, now, interaction_id)
                 return
+        size = int(call["arguments_bytes"] or 0)
+        undeclared = call.get("undeclared") or []
+        if existing is None:
             self._db.execute(
                 """INSERT INTO data_action_calls (
                        capture_ref, class, tool, endpoint, destination, first_seen, last_seen,
@@ -167,30 +170,30 @@ class DataActionsStore:
             )
             return
         self._db.execute(
-            """UPDATE data_action_calls SET
-                   last_seen = ?, count = count + 1, bytes_last = ?,
+            f"""UPDATE data_action_calls SET
+                   last_seen = max(last_seen, ?), count = count + 1, bytes_last = ?,
                    bytes_max = max(bytes_max, ?), bytes_total = bytes_total + ?,
                    kinds = ?, undeclared = ?, streamed = max(streamed, ?),
                    schema_known = max(schema_known, ?), last_interaction_id = ?
-               WHERE capture_ref = ? AND class = ? AND tool = ? AND endpoint = ?
-                 AND destination = ?""",
+               {where}""",
             (now, size, size, size, _union_json(existing["kinds"], call["content_kinds"]),
              _union_json(existing["undeclared"], undeclared), int(bool(call["streamed"])),
              int(bool(call["schema_known"])), interaction_id, *key),
         )
 
     def _known_mcp_endpoints(self) -> set[str]:
-        return {
+        """Endpoints that answered `tools/list`, plus every declared MCP
+        server `url` in an agent's newest ASP (§4.3)."""
+        listed = {
             row[0] for row in self._db.execute(
                 "SELECT DISTINCT endpoint FROM tool_schemas WHERE source = ?",
                 (ts.SOURCE_MCP_TOOLS_LIST,),
             )
         }
+        return listed | self._asp_facts()["mcp_endpoints"]
 
-    def _endpoint_schema(self, endpoint: str | None, tool: str) -> dict[str, Any] | None:
+    def _endpoint_schema(self, endpoint: str, tool: str) -> dict[str, Any] | None:
         """The endpoint's newest `tools/list` entry for a tool (§4.3)."""
-        if not endpoint:
-            return None
         row = self._db.execute(
             "SELECT input_schema FROM tool_schemas WHERE source = ? AND endpoint = ? AND tool = ? "
             "ORDER BY last_seen DESC LIMIT 1",
@@ -198,10 +201,21 @@ class DataActionsStore:
         ).fetchone()
         return json.loads(row[0]) if row is not None else None
 
+    def _fallback_schema(self, capture_ref: str, tool: str) -> dict[str, Any] | None:
+        """The newest model-side schema of a tool for this capture, when the
+        request a call came from couldn't be read (§4.3)."""
+        row = self._db.execute(
+            "SELECT input_schema FROM tool_schemas WHERE capture_ref = ? AND tool = ? "
+            "AND source IN (?, ?) ORDER BY last_seen DESC LIMIT 1",
+            (capture_ref, tool, ts.SOURCE_MODEL_REQUEST, ts.SOURCE_PROVIDER_MCP_LIST),
+        ).fetchone()
+        return json.loads(row[0]) if row is not None else None
+
     def _backfill_data_actions(self) -> None:
         """Once per database: the last 24 hours of stored authenticated
-        captures get their schemas and calls recorded, so the Data actions
-        group and the guardrail's first offer have data from the start."""
+        captures get their schemas and calls recorded, at their own capture
+        times, so the Data actions group and the guardrail's first offer
+        have data from the start."""
         if self._db.execute("SELECT 1 FROM settings WHERE key = ?", (BACKFILL_SETTING,)).fetchone():
             return
         cutoff = (datetime.now(timezone.utc) - BACKFILL_WINDOW).strftime("%Y-%m-%dT%H:%M:%S")
@@ -209,7 +223,7 @@ class DataActionsStore:
         while True:
             rows = self._db.execute(
                 "SELECT * FROM interactions WHERE authenticated = 1 AND id > ? "
-                "AND (timestamp IS NULL OR timestamp >= ?) ORDER BY id LIMIT 200",
+                "AND timestamp >= ? ORDER BY id LIMIT 200",
                 (last_id, cutoff),
             ).fetchall()
             if not rows:
@@ -217,7 +231,7 @@ class DataActionsStore:
             for row in rows:
                 stored = dict(row)
                 last_id = stored["id"]
-                self._record_capture_tools(stored)
+                self._record_capture_tools(stored, at=stored["timestamp"])
         self._db.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             (BACKFILL_SETTING, self._receive_time()),
@@ -225,26 +239,52 @@ class DataActionsStore:
 
     # ------------------------------------------------------------- reading
 
-    def _trusted_model_hosts(self) -> tuple[str, ...]:
-        """Known providers plus every agent's `inference_endpoint` host in its
-        newest ASP (design §4.1): a tool list sent anywhere else is stored but
-        never classified."""
-        hosts = set(ts.KNOWN_MODEL_HOSTS)
+    def _asp_facts(self) -> dict[str, Any]:
+        """What the newest ASP of every agent says that data actions use:
+        inference-endpoint hosts (trusted for tool lists, §4.1) and declared
+        MCP server endpoints (known for unreadable calls, §4.3). Cached until
+        the ASP table changes."""
+        stamp = tuple(self._db.execute("SELECT max(rowid), count(*) FROM asps").fetchone())
+        cached = getattr(self, "_asp_facts_cache", None)
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        hosts: set[str] = set()
+        endpoints: set[str] = set()
         for row in self._db.execute(
             """SELECT exact_bundle FROM asps a WHERE stored_at = (
                    SELECT max(stored_at) FROM asps b
                    WHERE b.identity_kind = a.identity_kind AND b.identity_value = a.identity_value)"""
         ):
             try:
-                attributes = g._attributes(parse_bundle(bytes(row[0])))
-            except Exception:  # noqa: BLE001 - an unreadable ASP adds no host
+                bundle = parse_bundle(bytes(row[0]))
+                if g.is_multi_agent(bundle):
+                    continue
+                attributes = g._attributes(bundle)
+                endpoint = attributes.get("inference_endpoint") or {}
+                if endpoint.get("status") == "ANSWERED":
+                    host = g._url_host(endpoint.get("value"))
+                    if host:
+                        hosts.add(host)
+                servers = attributes.get("mcp_servers_declared") or {}
+                if servers.get("status") == "ANSWERED" and isinstance(servers.get("value"), list):
+                    for server in servers["value"]:
+                        url = server.get("url") if isinstance(server, dict) else None
+                        if isinstance(url, str) and url:
+                            parts = urlsplit(url)
+                            endpoints.add(tc.endpoint_key(
+                                {"headers": {"host": parts.netloc}, "path": parts.path or "/"}
+                            ))
+            except Exception:  # noqa: BLE001 - an unreadable ASP adds nothing
                 continue
-            endpoint = attributes.get("inference_endpoint") or {}
-            if endpoint.get("status") == "ANSWERED":
-                host = g._url_host(endpoint.get("value"))
-                if host:
-                    hosts.add(host)
-        return tuple(sorted(hosts))
+        facts = {"inference_hosts": hosts, "mcp_endpoints": endpoints}
+        self._asp_facts_cache = (stamp, facts)
+        return facts
+
+    def _trusted_model_hosts(self) -> tuple[str, ...]:
+        """Known providers plus every agent's `inference_endpoint` host
+        (design §4.1): a tool list sent anywhere else is stored but never
+        classified. Single-user: any agent's endpoint is trusted for all."""
+        return tuple(sorted(set(ts.KNOWN_MODEL_HOSTS) | self._asp_facts()["inference_hosts"]))
 
     def _trusted_schemas(self, capture_refs: list[str], trusted: tuple[str, ...]) -> dict[str, list[dict[str, Any]]]:
         cutoff = (datetime.now(timezone.utc) - SCHEMA_WINDOW).strftime("%Y-%m-%dT%H:%M:%S")
@@ -315,11 +355,12 @@ class DataActionsStore:
                 "schema_known": bool(row["schema_known"]),
                 "actions": actions,
                 "unclassified": bool(classification and classification["unclassified"] and not undeclared),
-                "unreadable": row["tool"] == UNREADABLE_TOOL,
+                # Calls past a bound weren't read either: both fail closed.
+                "unreadable": row["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL),
                 "classification": classification,
             })
         uploads = [item for item in out if da.UPLOAD in item["actions"] or item["unreadable"]]
-        others = [item for item in out if item not in uploads]
+        others = [item for item in out if not (da.UPLOAD in item["actions"] or item["unreadable"])]
         uploads.sort(key=lambda item: item["last_seen"], reverse=True)
         others.sort(key=lambda item: item["last_seen"], reverse=True)
         return uploads + others
