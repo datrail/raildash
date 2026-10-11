@@ -54,6 +54,7 @@ from .asp import (
 )
 from .guardrail_store import GUARDRAIL_SCHEMA, GuardrailCustody
 from . import tool_schemas as _tool_schemas
+from .data_actions_store import DATA_ACTIONS_SCHEMA, DataActionsStore
 
 CREDENTIAL_REDACTION_SCHEMA_VERSION = 1
 MIGRATION_BATCH_ROWS = 16
@@ -299,7 +300,7 @@ BEGIN SELECT RAISE(ABORT, 'alignment versions are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS alignment_versions_immutable_delete
 BEFORE DELETE ON alignment_versions
 BEGIN SELECT RAISE(ABORT, 'alignment versions are immutable'); END;
-""" + GUARDRAIL_SCHEMA
+""" + GUARDRAIL_SCHEMA + DATA_ACTIONS_SCHEMA
 
 SCHEMA_TABLES = frozenset(re.findall(r"CREATE TABLE IF NOT EXISTS (\w+)", SCHEMA))
 # Columns `_ensure_multi_agent_columns`/`_ensure_content_columns` add to a
@@ -383,7 +384,7 @@ def _session_scope(session_id: str, agent_key: str | None) -> tuple[str, list[st
     return scope, params
 
 
-class Store(GuardrailCustody):
+class Store(GuardrailCustody, DataActionsStore):
     """A SQLite-backed store. Safe to share across FastAPI's threadpool.
 
     `check_same_thread=False` plus one lock rather than a connection pool:
@@ -453,6 +454,7 @@ class Store(GuardrailCustody):
         self._ensure_content_columns()
         self._ensure_authenticated_columns()
         self._migrate()
+        self._backfill_data_actions()
         self._db.commit()
         if upgrading:
             # Back to NORMAL; SQLite releases the lock on the next access.
@@ -1650,8 +1652,7 @@ class Store(GuardrailCustody):
                 )
                 inserted += cur.rowcount
                 if authenticated and cur.rowcount and row.get("interaction_id"):
-                    if _tool_schemas.may_carry_tools(row.get("raw")):
-                        self._record_tool_schemas({**row, "session_id": session_id})
+                    self._record_capture_tools({**row, "session_id": session_id})
                     if active:
                         stored = self._db.execute(
                             "SELECT * FROM interactions WHERE session_id = ? AND interaction_id = ?",
@@ -1689,7 +1690,15 @@ class Store(GuardrailCustody):
             self._db.commit()
         return inserted
 
-    def _record_tool_schemas(self, interaction: dict[str, Any]) -> None:
+    def _record_capture_tools(self, interaction: dict[str, Any], *, at: str | None = None) -> None:
+        """DR-205: the tool schemas (M0) and tool calls (M1) one stored
+        authenticated request carries. `at` is the time to record them at
+        (the capture's own, when backfilling)."""
+        if _tool_schemas.may_carry_tools(interaction.get("raw")):
+            self._record_tool_schemas(interaction, at=at)
+        self._record_tool_calls(interaction, _capture_ref(interaction), at=at)
+
+    def _record_tool_schemas(self, interaction: dict[str, Any], *, at: str | None = None) -> None:
         """DR-205 M0: the tool schemas one newly stored authenticated
         request carries, upserted in the transaction that stores it. A
         failure is reported and rolled back to its savepoint; the capture is
@@ -1699,7 +1708,7 @@ class Store(GuardrailCustody):
             found = _tool_schemas.extract_tool_schemas(interaction)["schemas"]
             if found:
                 ref = _capture_ref(interaction)
-                now = self._receive_time()
+                now = at or self._receive_time()
                 for item in found:
                     self._db.execute(
                         """
@@ -1709,7 +1718,7 @@ class Store(GuardrailCustody):
                             first_seen, last_seen, interaction_id)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT (capture_ref, source, endpoint, tool, schema_hash, host)
-                        DO UPDATE SET last_seen = excluded.last_seen,
+                        DO UPDATE SET last_seen = max(last_seen, excluded.last_seen),
                                       interaction_id = excluded.interaction_id
                         """,
                         (
