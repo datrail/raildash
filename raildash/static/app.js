@@ -1126,7 +1126,7 @@ function renderGuardrailPolicy(rules) {
   const egress = rules.egress_containment;
   if (egress) {
     add("Egress", egress.require === "allow_list_enforced"
-      ? "must be an enforced allow-list (an OpenShell sandbox)"
+      ? "must be an enforced allow-list (recognized by OpenShell's labels and its network shape)"
       : "must be contained (an enforced allow-list, no network, or internal networks only)");
   }
   return dl;
@@ -1135,9 +1135,10 @@ function renderGuardrailPolicy(rules) {
 // DR-207 §4.4: the newest ASP's egress containment in words, with the
 // declared proxy beside it. Never "Contained" on partial or missing evidence.
 const EGRESS_WORDS = {
-  allow_list_enforced: ["Contained", "OpenShell enforces an allow-list (its contents aren't visible to datRail)"],
-  no_network: ["Contained", "no network at all"],
-  internal_network: ["Contained", "internal networks only"],
+  allow_list_enforced: ["Contained",
+    "it can't open connections to outside hosts itself; OpenShell enforces an allow-list (its contents aren't visible to datRail)"],
+  no_network: ["Contained", "it can't open connections to outside hosts itself; no network at all"],
+  internal_network: ["Contained", "it can't open connections to outside hosts itself; internal networks only"],
   open: ["Open", "this agent can reach any host"],
   host_network: ["Open", "on the host's network"],
   host_process: ["Open", "a host process, not in a container"],
@@ -1164,13 +1165,17 @@ function renderEgressLine(egress) {
       line.append(document.createTextNode(reading.gateway_peers && reading.gateway_peers.length
         ? `, reaching outside only through ${reading.gateway_peers.join(", ")}` : ", with no way out"));
     }
-    if (reading.via) line.append(el("span", "muted", ` (the network of ${reading.via.replace(/^container:/, "")})`));
-    line.append(el("span", "muted", " — observed"));
+    if (typeof reading.via === "string") {
+      line.append(el("span", "muted", ` (the network of ${reading.via.replace(/^container:/, "")})`));
+    }
+    line.append(el("span", "muted", reading.stale ? " — observed, but the newest ASP is stale" : " — observed"));
   }
   const proxy = egress.proxy_declared;
   if (proxy && Object.keys(proxy).length) {
     const names = Object.keys(proxy).filter((name) => name !== "NO_PROXY");
-    const note = reading.contained ? "" : ", but the network doesn't force traffic through it";
+    // Only a known open level says the network doesn't force the proxy.
+    const note = reading.level && !reading.contained && reading.status === "ANSWERED"
+      ? ", but the network doesn't force traffic through it" : "";
     line.append(el("span", "muted",
       ` · declares a proxy (${names.map((name) => `${name}=${proxy[name]}`).join(", ") || "NO_PROXY only"})${note} — declared`));
   }
@@ -1182,7 +1187,7 @@ function renderEgressLine(egress) {
 function renderRequireContainment(agentRef, egress, refresh) {
   const section = el("div", "guardrail-require-egress");
   const reading = (egress && egress.reading) || {};
-  if (reading.status === "ANSWERED" && !reading.contained) {
+  if (reading.status === "ANSWERED" && reading.level && !reading.contained && !reading.multi_agent) {
     section.append(el("p", "hint", "This agent isn't contained now, so a version that requires it starts Violated."));
   }
   section.append(guardrailButton("Require containment", async () => {

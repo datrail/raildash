@@ -6,7 +6,9 @@ every captured request of that agent is checked against. It is policy the
 operator approved, kept apart from the alignment version (the baseline), so
 the alignment contract and every locked baseline stay as they are. The design
 is railxia/docs `design/2026-10-07-data-guardrail/data-guardrail-design.md`;
-section numbers below are its.
+section numbers below are its. Later versions add optional rules: v2
+`data_actions` (DR-205) and v3 `egress_containment` (DR-207,
+`design/2026-10-11-egress-containment`).
 
 Like `raildash.asp`, this module has no database, HTTP or UI dependency and
 never reads the clock: every time it needs is an argument. Storage and the
@@ -19,15 +21,15 @@ The API, in the order a caller meets it:
 - `propose_guardrail(...)`: the §4.4 first guardrail from a locked baseline
   and the agent's requests from the 24 h before the lock, with what would be
   a violation and why a declared list is empty.
-- `evaluate_asp(guardrail, bundle, ...)`: `service_ports` and `saved_files`
-  against one parsed ASP, staleness included.
+- `evaluate_asp(guardrail, bundle, ...)`: `service_ports`, `saved_files`
+  and `egress_containment` against one parsed ASP, staleness included.
 - `request_owner(interaction, guardrails, ...)`: which active guardrail one
   captured request belongs to, if any (§4.3).
 - `evaluate_request(guardrail, interaction, ...)`: `uploads` and
   `out_of_spec_calls` against one captured request.
 - `request_rules_status(...)`: whether the two request rules can be verified
   at all now (collector heartbeat, unattributed traffic).
-- `rule_states(asp_result, request_status)`: the four rules' latest results
+- `rule_states(asp_result, request_status)`: every rule's latest results
   in one map, multi-agent applied.
 - `shown_rule_states(rule_results, counting_rules)`: each rule's state as
   the panel and `/api/guardrails` show it, from the same rows the agent's
@@ -1006,7 +1008,8 @@ def evaluate_asp(
     now: datetime | str,
     newest_received_at: datetime | str | None = None,
 ) -> dict[str, Any]:
-    """`service_ports` and `saved_files` against the newest parsed ASP.
+    """`service_ports`, `saved_files` and, where the version has it,
+    `egress_containment` (DR-207) against the newest parsed ASP.
 
     Staleness is judged on `newest_received_at` when the caller knows it,
     else on the bundle's own `collected_at`; `previous_collected_at` is then
@@ -1017,8 +1020,8 @@ def evaluate_asp(
     `bundle` is what `raildash.asp.parse_bundle` returns for the stored
     bytes; the caller has matched its identity to the guardrail's.
     Returns `{"multi_agent": bool, "stale": bool, "rules": {...}}`. A
-    multi-agent bundle evaluates nothing and makes all four rules
-    Unverified; `rule_states` carries that over the request rules.
+    multi-agent bundle evaluates nothing and makes every rule the version
+    has Unverified; `rule_states` carries that over the request rules.
 
     Per rule, from the attribute's status: `ANSWERED` and `ABSENT` are
     verified; `PARTIAL` is violated when a listed item breaks the rule (a
@@ -1076,17 +1079,23 @@ def egress_reading(attribute: Any) -> dict[str, Any] | None:
     value = attribute.get("value")
     reading: dict[str, Any] = {"status": status, "level": None, "contained": None}
     if status in ("ANSWERED", "PARTIAL") and isinstance(value, dict) and value.get("level") in EGRESS_LEVELS:
+        # The bundle schemas close this value (v1's own, v2's held to it in
+        # `raildash.asp`), but a reading is never where a bad one crashes.
         observations = value.get("observations") if isinstance(value.get("observations"), dict) else {}
-        networks = [n for n in observations.get("networks") or [] if isinstance(n, dict)]
+        networks = [n for n in _list(observations.get("networks")) if isinstance(n, dict)]
         reading.update(
             level=value["level"],
             contained=value["level"] in CONTAINED_LEVELS and status == "ANSWERED",
-            enforcer=value.get("enforcer"),
-            via=value.get("via"),
-            gateway_peers=sorted({str(p) for n in networks for p in n.get("gateway_peers") or []}),
-            reasons=[str(r) for r in value.get("reasons") or []],
+            enforcer=value.get("enforcer") if isinstance(value.get("enforcer"), str) else None,
+            via=value.get("via") if isinstance(value.get("via"), str) else None,
+            gateway_peers=sorted({str(p) for n in networks for p in _list(n.get("gateway_peers"))}),
+            reasons=[str(r) for r in _list(value.get("reasons"))],
         )
     return reading
+
+
+def _list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else []
 
 
 def _egress_rule(
@@ -1115,7 +1124,7 @@ def _egress_rule(
     violation = _violation(
         EGRESS, level, OBSERVED, source,
         level=level, require=rule["require"],
-        reasons=[str(r) for r in value.get("reasons") or []][:16],
+        reasons=[str(r) for r in _list(value.get("reasons"))][:16],
     )
     return {"state": VIOLATED, "reason": reason, "violations": [violation]}
 
@@ -1200,7 +1209,7 @@ def rule_states(
     asp_result: Mapping[str, Any] | None, request_status: Mapping[str, Mapping[str, Any]],
     rules: Iterable[str] = RULES,
 ) -> dict[str, dict[str, Any]]:
-    """All four rules' latest results: the ASP rules from `evaluate_asp`
+    """Every rule's latest results: the ASP rules from `evaluate_asp`
     (Unverified `NOT_COLLECTED` when no ASP has been evaluated) and the
     request rules from `request_rules_status`, except that a multi-agent ASP
     makes every rule Unverified (multi-agent)."""

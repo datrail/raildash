@@ -194,6 +194,10 @@ BEGIN SELECT RAISE(ABORT, 'guardrail versions are immutable'); END;
 """
 
 
+# `egress_containment.require`'s values (guardrail-version-v3's enum).
+EGRESS_REQUIRES = ("contained", "allow_list_enforced")
+
+
 def agent_ref(identity_kind: str, identity_value: str) -> str:
     """The opaque, stable name routes use for one agent identity."""
     digest = hashlib.sha256(f"{identity_kind}\0{identity_value}".encode()).hexdigest()
@@ -951,10 +955,21 @@ class GuardrailCustody:
         if not newest:
             return None
         bundle = parse_bundle(bytes(newest[0]["exact_bundle"]))
-        attributes = dict((bundle.get("sandbox") or {}).get("attributes") or {}) if (
-            bundle.get("bundle_version") == g.BUNDLE_VERSION_V2
-        ) else dict(bundle.get("attributes") or {})
+        # The same view the rule and the proposal read (`g._attributes`).
+        attributes = g._attributes(bundle)
         reading = g.egress_reading(attributes.get(g.EGRESS_ATTRIBUTE))
+        if reading is not None:
+            # The rule's own stale window, so the line never shows an old
+            # "contained" as current once scans stop (design §5).
+            received = self._mark_at(kind, value, MARK_ASP_RECEIVED.format(newest[0]["asp_id"]))
+            if received is not None:
+                previous = self._mark_at(kind, value, MARK_ASP_RECEIVED_BEFORE.format(newest[0]["asp_id"]))
+            else:
+                previous = newest[1]["collected_at"] if len(newest) > 1 else None
+            reading["stale"] = g.asp_is_stale(
+                received or bundle["collected_at"], previous, self._receive_time()
+            )
+            reading["multi_agent"] = g.is_multi_agent(bundle)
         proxy = attributes.get(g.EGRESS_PROXY_ATTRIBUTE)
         declared = proxy.get("value") if isinstance(proxy, dict) and proxy.get("status") == "ANSWERED" else None
         return {
@@ -968,8 +983,8 @@ class GuardrailCustody:
         user's explicit choice, so it's made even when the newest ASP
         doesn't meet it; the answer says whether the version starts
         Violated, which the panel warns about before asking."""
-        if require not in ("contained", "allow_list_enforced"):
-            raise ValueError("require must be contained or allow_list_enforced")
+        if require not in EGRESS_REQUIRES:
+            raise g.GuardrailValidationError(["require must be contained or allow_list_enforced"])
         with self._write_transaction():
             kind, value = self._resolve_agent_ref(ref)
             active = self._active_guardrail_row(kind, value)
@@ -983,12 +998,13 @@ class GuardrailCustody:
                 kind, value, rules, derived_from=contract["derived_from"]["alignment_version_id"],
                 created_by="require_containment", detail={"require": require},
             )
-            egress = self._egress_locked(kind, value)
-            reading = (egress or {}).get("reading") or {}
+            # What the re-check actually recorded, not the raw reading: a
+            # multi-agent sandbox, an unreadable level or a stale ASP isn't
+            # a violation, and a row already acknowledged stays so.
+            summary, _, _ = self._state_locked(kind, value, None)
             return {
                 **self._version_view(created, active=True),
-                "starts_violated": reading.get("status") == "ANSWERED"
-                and not g.egress_meets(reading.get("level"), require),
+                "starts_violated": summary["rules"][g.EGRESS]["state"] == g.VIOLATED,
             }
 
     def propose_guardrail(self, alignment_version_id: str) -> dict[str, Any]:

@@ -233,7 +233,7 @@ def test_require_containment_on_an_open_agent_says_it_starts_violated(store):
     assert g.EGRESS not in detail["rules"]
     assert detail["egress"] == {
         "reading": {"status": "ANSWERED", "level": "open", "contained": False, "enforcer": None, "via": None,
-                    "gateway_peers": [], "reasons": ["why open"]},
+                    "gateway_peers": [], "reasons": ["why open"], "stale": False, "multi_agent": False},
         "proxy_declared": {"HTTPS_PROXY": "http://proxy.corp:3128"},
     }
     made = store.require_containment(ref)
@@ -246,7 +246,7 @@ def test_require_containment_on_an_open_agent_says_it_starts_violated(store):
     assert rows(store, ref)[(g.EGRESS, "open")]["counts"]
     with pytest.raises(ValueError, match="already requires"):
         store.require_containment(ref)
-    with pytest.raises(ValueError, match="require must be"):
+    with pytest.raises(g.GuardrailValidationError, match="require must be"):
         store.require_containment(ref, "sort_of")
     # Switching back to the version without the rule stops the row.
     store.switch_guardrail(adopted["guardrail"]["guardrail_version_id"])
@@ -275,4 +275,50 @@ def test_the_route_is_token_gated_and_answers_201(store, monkeypatch):
     assert answer.status_code == 201, answer.text
     assert answer.json()["starts_violated"] is True
     assert client.post(path, json={"require": 1}, headers=headers).status_code == 422
+    assert client.post(path, json={"require": "sort_of"}, headers=headers).status_code == 422
     assert client.post(path, json={"require": "allow_list_enforced"}, headers=headers).status_code == 409
+
+
+def test_a_v2_bundle_holds_its_egress_value_to_the_published_shape(store):
+    """Rail-review (82): v2's attributes have no per-attribute shape, so a
+    malformed egress value in either scope is refused at ingest, as v1's is."""
+    from raildash.asp import BundleValidationError, parse_bundle
+    from test_guardrail import _single_agent_v2
+
+    value = _single_agent_v2([], [])
+    good = egress("internal_network", peers=["squid"])
+    value["sandbox"]["attributes"]["egress_containment"] = good
+    assert parse_bundle(json.dumps(value).encode())
+    for scope in ("sandbox", "agent"):
+        for mutate in (lambda v: v.update(reasons=5),
+                       lambda v: v["observations"]["networks"][0].update(gateway_peers=5),
+                       lambda v: v.update(via={"x": 1})):
+            broken = copy.deepcopy(value)
+            bad = copy.deepcopy(good)
+            mutate(bad["value"])
+            target = broken["sandbox"]["attributes"] if scope == "sandbox" else broken["agents"][0]["attributes"]
+            target["egress_containment"] = bad
+            with pytest.raises(BundleValidationError, match="egress_containment"):
+                parse_bundle(json.dumps(broken).encode())
+
+
+def test_a_bad_value_handed_to_the_reading_is_never_a_crash():
+    bad = egress("internal_network")
+    bad["value"].update(reasons=5, via={"x": 1})
+    bad["value"]["observations"]["networks"] = [{"gateway_peers": 5}, "x"]
+    reading = g.egress_reading(bad)
+    assert (reading["reasons"], reading["via"], reading["gateway_peers"]) == ([], None, [])
+
+
+def test_starts_violated_follows_what_the_recheck_recorded(store):
+    """A stale newest ASP fails the rule but isn't a counted violation, so
+    the new version doesn't start Violated."""
+    from datetime import datetime, timedelta, timezone
+
+    value = asp(egress_containment=egress("open"))
+    value["collected_at"] = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat().replace("+00:00", "Z")
+    alignment, ref = baseline(store, value)
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    made = store.require_containment(ref)
+    rule = store.guardrail_detail(ref)["rules"][g.EGRESS]
+    assert made["starts_violated"] is (rule["state"] == g.VIOLATED)

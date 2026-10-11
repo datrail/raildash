@@ -395,7 +395,8 @@ paths:
         '201': {description: The new version, now active, with starts_violated}
         '403': {description: Missing or invalid X-RailDash-Token}
         '404': {description: No such id}
-        '409': {description: No guardrail is active, it already requires this, or require is not contained or allow_list_enforced}
+        '409': {description: No guardrail is active, or it already requires this}
+        '422': {description: require is not contained or allow_list_enforced}
 
   /api/guardrail-rows/{row_id}/acknowledge:
     post:

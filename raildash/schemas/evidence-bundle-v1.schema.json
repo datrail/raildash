@@ -352,6 +352,10 @@
           "properties": {
             "network_mode": {
               "$comment": "a string, or null for a host process",
+              "type": [
+                "string",
+                "null"
+              ],
               "maxLength": 256
             },
             "networks": {
@@ -409,6 +413,10 @@
         },
         "via": {
           "$comment": "container:<name> when the network namespace is another container's, else null",
+          "type": [
+            "string",
+            "null"
+          ],
           "maxLength": 300
         },
         "allow_list": {

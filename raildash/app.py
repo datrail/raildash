@@ -1249,6 +1249,7 @@ async def api_require_containment(agent_ref: str, request: Request) -> dict[str,
     require = body.get("require", "contained")
     if not isinstance(require, str):
         raise HTTPException(422, "require must be a string")
+    # An unknown value is a 422 from the store's own check (`_guardrail_call`).
     return _guardrail_call(get_store().require_containment, agent_ref, require)
 
 
