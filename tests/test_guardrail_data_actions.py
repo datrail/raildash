@@ -128,7 +128,7 @@ def test_unclassified_flags_unless_allowed_and_unreadable_calls_fail_closed():
     unreadable = [{"tool": f"mcp@{ENDPOINT}", "class": "observed", "unreadable": True,
                    "classified": [], "undeclared": [], "bytes": 4_000_000, "endpoint": ENDPOINT}]
     found = evaluate(rule(), unreadable)
-    assert set(found) == {f"mcp@{ENDPOINT} · unreadable"}
+    assert set(found) == {f"{ENDPOINT} · unreadable call"}
     assert evaluate(rule([{"tool": f"mcp@{ENDPOINT}", "actions": ["unreadable"]}]), unreadable) == {}
 
 
@@ -202,3 +202,56 @@ def test_switching_back_to_a_v1_version_stops_the_rule(store):
     row = next(r for r in detail["rows"] if r["rule"] == "data_actions")
     assert not row["counts"]
     assert "data_actions" not in detail["rules"]
+
+
+# ------------------------------------------------------- review round 1
+
+
+def test_an_undeclared_upload_survives_a_later_override_and_rows_name_like_the_design():
+    first = rule(overrides={"mcp__docs__sync": ["upload"]})
+    [violation] = g.evaluate_data_actions({"rules": {"data_actions": first}},
+                                          calls(("mcp__docs__sync", ["upload"], ["blob"])), {})
+    assert violation["detail"]["from_undeclared"]
+    later = rule(overrides={"mcp__docs__sync": ["read"]})
+    assert not g.item_allowed({"rules": {"data_actions": later}}, violation)
+    assert g.data_action_item("t", "not_offered", "e/mcp") == "t · not offered by e/mcp"
+
+
+def test_allow_this_refuses_a_glob_like_name_and_calls_past_the_cap():
+    rules = {"data_actions": rule()}
+    star = {"rule": "data_actions", "item": "x", "detail": {"tool": "mcp@evil/mcp__*", "action": "upload"}}
+    with pytest.raises(ValueError):
+        g.with_item_allowed(rules, star)
+    past = {"rule": "data_actions", "item": "x", "detail": {"tool": "mcp@(more calls)", "action": "unreadable",
+                                                            "endpoint": None}}
+    with pytest.raises(ValueError):
+        g.with_item_allowed(rules, past)
+
+
+def test_a_failure_to_classify_calls_makes_the_rule_unverified(store, monkeypatch):
+    ref, _ = with_data_actions(store, rule())
+    live(store)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(type(store), "_calls_for_rule", broken)
+    send(store, listed(), call("upload_file", {"content": PNG}))
+    detail = store.guardrail_detail(ref)
+    assert detail["rules"]["data_actions"]["state"] == "unverified"
+    assert detail["state"] in ("unverified", "violated")
+
+
+def test_calls_are_classified_for_judging_only_under_a_v2_version(store, monkeypatch):
+    seen = []
+    original = type(store)._calls_for_rule
+
+    def spy(self, ref, calls):
+        seen.append(ref)
+        return original(self, ref, calls)
+
+    monkeypatch.setattr(type(store), "_calls_for_rule", spy)
+    _adopted(store)  # v1 only
+    live(store)
+    send(store, listed(), call("read_doc", {"doc_id": "d"}))
+    assert seen == []

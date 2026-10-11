@@ -1297,11 +1297,23 @@ def data_action_row_allowed(rule: Mapping[str, Any], detail: Mapping[str, Any]) 
     if data_action_allowed(rule, tool, action):
         return True
     override = (rule.get("overrides") or {}).get(tool)
-    if override is not None and action in DATA_ACTION_KINDS and not detail.get("from_undeclared"):
+    # An upload the call's undeclared arguments made stays, whatever an
+    # override says about the tool (§4.3).
+    from_undeclared = detail.get("from_undeclared") or (action == "upload" and detail.get("undeclared"))
+    if override is not None and action in DATA_ACTION_KINDS and not from_undeclared:
         return action not in override
     if override is not None and action == "unclassified":
         return bool(override)
     return False
+
+
+def data_action_item(tool: str, action: str, endpoint: str | None) -> str:
+    """A row's item, as the design names it (§4.4)."""
+    if action == "unreadable":
+        return f"{endpoint or '(unknown endpoint)'} · unreadable call"
+    if action == "not_offered":
+        return f"{tool} · not offered by {endpoint or '(unknown endpoint)'}"
+    return f"{tool} · {action}"
 
 
 def judged_tool(tool: str) -> bool:
@@ -1344,8 +1356,12 @@ def evaluate_data_actions(
         for action, from_undeclared in actions:
             if data_action_allowed(rule, tool, action):
                 continue
-            item = f"{tool} · {action}"
+            from_undeclared = from_undeclared or (action == "upload" and bool(call.get("undeclared")))
+            item = data_action_item(tool, action, call.get("endpoint"))
             if item in found:
+                # Observed evidence outranks the model asking (§4.3).
+                if call.get("class") == OBSERVED:
+                    found[item]["evidence_class"] = OBSERVED
                 continue
             found[item] = _violation(
                 DATA_ACTIONS, item, call.get("class") or OBSERVED, source,
@@ -1669,6 +1685,13 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
         tool, action = detail.get("tool"), detail.get("action")
         if not isinstance(tool, str) or action not in (*DATA_ACTION_KINDS, *DATA_ACTION_PSEUDO):
             raise ValueError("this data-action row can't be read back into a tool and action")
+        if "*" in tool:
+            # The name is the agent's own; as an entry it would be a glob.
+            raise ValueError("a tool name with * can only be allowed by an edit")
+        if action == "unreadable" and not detail.get("endpoint"):
+            # Calls past the cap name no endpoint: allowing them would allow
+            # them everywhere.
+            raise ValueError("calls past the cap name no endpoint; acknowledge them instead")
         allowed = updated[DATA_ACTIONS]["allowed"]
         # Exactly this tool and action: an entry for the same literal tool
         # gains the action; a glob entry is the user's to edit.

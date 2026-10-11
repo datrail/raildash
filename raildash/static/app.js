@@ -999,6 +999,8 @@ const GUARDRAIL_RULE_LABELS = {
   saved_files: "Saved files",
   uploads: "Uploads",
   out_of_spec_calls: "Out-of-spec calls",
+  // DR-205: only a v2 version has it; a v1 version's line list skips it.
+  data_actions: "Data actions",
 };
 const GUARDRAIL_REASONS = {
   NO_HEARTBEAT: "no collector heartbeat in the last 3 minutes",
@@ -1068,6 +1070,7 @@ function guardrailButton(label, action, { quiet = false, key = label } = {}) {
 function renderGuardrailRules(rules) {
   const list = el("ul", "guardrail-rules");
   Object.entries(GUARDRAIL_RULE_LABELS).forEach(([rule, label]) => {
+    if (rule === "data_actions" && !(rules || {})[rule]) return;
     const result = (rules || {})[rule] || {};
     const item = el("li", `guardrail-rule guardrail-rule-${result.state || "unverified"}`);
     item.dataset.rule = rule;
@@ -1150,6 +1153,11 @@ function guardrailRowAllowable(row, hasActive) {
     || (row.rule === "out_of_spec_calls" && row.detail.kind !== "mcp_server");
   if (hostRow && row.item.includes("*")) return false;
   if (row.detail.kind === "mcp_server" && !row.detail.server) return false;
+  // A tool name is the agent's own: with a * it would allow as a glob, and
+  // calls past the cap name no endpoint to allow them at.
+  if (row.rule === "data_actions"
+    && ((row.detail.tool || "").includes("*")
+      || (row.detail.action === "unreadable" && !row.detail.endpoint))) return false;
   return true;
 }
 

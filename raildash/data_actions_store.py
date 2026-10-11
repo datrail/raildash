@@ -97,10 +97,11 @@ class DataActionsStore:
 
     def _record_tool_calls(
         self, interaction: dict[str, Any], capture_ref: str, *, at: str | None = None
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | None:
         """The calls one newly stored authenticated request carries, and
-        returns them as recorded (for the `data_actions` rule). `at` is the
-        time to record (the capture's own, when backfilling)."""
+        returns them as recorded (for the `data_actions` rule), or None when
+        reading them failed. `at` is the time to record (the capture's own,
+        when backfilling)."""
         raw = interaction.get("raw")
         known = self._known_mcp_endpoints()
         if isinstance(raw, str) and not any(m in raw for m in _CALL_MARKERS):
@@ -145,7 +146,7 @@ class DataActionsStore:
             self._db.execute("ROLLBACK TO tool_calls_hook")
             self._db.execute("RELEASE tool_calls_hook")
             print(f"raildash: tool call extraction failed: {exc!r}", file=sys.stderr)
-            return []
+            return None
         self._db.execute("RELEASE tool_calls_hook")
         return recorded
 
@@ -335,14 +336,21 @@ class DataActionsStore:
         classified. Single-user: any agent's endpoint is trusted for all."""
         return tuple(sorted(set(ts.KNOWN_MODEL_HOSTS) | self._asp_facts()["inference_hosts"]))
 
-    def _trusted_schemas(self, capture_refs: list[str], trusted: tuple[str, ...]) -> dict[str, list[dict[str, Any]]]:
+    def _trusted_schemas(
+        self, capture_refs: list[str], trusted: tuple[str, ...], tools: Iterable[str] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
         cutoff = (datetime.now(timezone.utc) - SCHEMA_WINDOW).strftime("%Y-%m-%dT%H:%M:%S")
         marks = ",".join("?" * len(capture_refs))
+        query = f"SELECT * FROM tool_schemas WHERE capture_ref IN ({marks}) AND last_seen >= ?"
+        params: list[Any] = [*capture_refs, cutoff]
+        if tools is not None:
+            names = sorted(set(tools))
+            if not names:
+                return {}
+            query += f" AND tool IN ({','.join('?' * len(names))})"
+            params.extend(names)
         out: dict[str, list[dict[str, Any]]] = {}
-        for row in self._db.execute(
-            f"SELECT * FROM tool_schemas WHERE capture_ref IN ({marks}) AND last_seen >= ?",
-            (*capture_refs, cutoff),
-        ):
+        for row in self._db.execute(query, params):
             item = dict(row)
             if item["source"] != ts.SOURCE_MCP_TOOLS_LIST and not g.host_allowed(item["host"] or None, trusted):
                 continue
@@ -405,7 +413,12 @@ class DataActionsStore:
         classified actions and the rest. The caller holds the transaction."""
         if not calls:
             return []
-        schemas = self._trusted_schemas([capture_ref], self._trusted_model_hosts())
+        servers = self._asp_facts()["servers"]
+        needed = {call["tool"] for call in calls}
+        needed |= {f"mcp__{servers[call['endpoint']]}__{call['tool']}" for call in calls
+                   if call["class"] == tc.OBSERVED and call.get("endpoint") in servers}
+        # Only the schemas these calls need, not the capture's every one.
+        schemas = self._trusted_schemas([capture_ref], self._trusted_model_hosts(), needed)
         rows = [{"class": call["class"], "tool": call["tool"], "endpoint": call["endpoint"] or ""}
                 for call in calls]
         self._name_and_schemas(rows, schemas)
@@ -414,7 +427,7 @@ class DataActionsStore:
             special = call["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL)
             classification = None if special else da.classify(row["_name"], row["_schemas"])
             out.append({
-                "tool": row["_name"] if not special else f"mcp@{call['endpoint'] or '(unknown)'}",
+                "tool": row["_name"] if not special else f"mcp@{call['endpoint'] or '(more calls)'}",
                 "class": call["class"],
                 "classified": list(classification["actions"]) if classification else [],
                 "undeclared": list(call.get("undeclared") or []),
