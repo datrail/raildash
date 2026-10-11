@@ -91,6 +91,14 @@ CREATE TABLE IF NOT EXISTS data_action_pending (
 );
 CREATE INDEX IF NOT EXISTS data_action_pending_identity
     ON data_action_pending(identity_kind, identity_value);
+-- DR-205: the opt-in model's answers, by schema (raildash/classifier_model.py).
+-- `answer` is NULL for a failed ask, retried after a while.
+CREATE TABLE IF NOT EXISTS tool_model_answers (
+    schema_key TEXT PRIMARY KEY,
+    model      TEXT NOT NULL,
+    answer     TEXT,
+    asked_at   TEXT NOT NULL
+);
 """
 
 
@@ -131,6 +139,44 @@ def _mcp_server_of(tool: str) -> str | None:
 
 class DataActionsStore:
     """Mixed into `Store`; uses its `_db`, `_lock`, `_receive_time`."""
+
+    # The opt-in model step's cache-only lookup, set by
+    # `classifier_model.start_from_env` when a model is configured.
+    model_classifier: Any = None
+
+    def _model_answer_locked(self, key: str) -> tuple[datetime, dict[str, Any] | None] | None:
+        row = self._db.execute(
+            "SELECT answer, asked_at FROM tool_model_answers WHERE schema_key = ?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        asked = datetime.fromisoformat(row[1].replace("Z", "+00:00"))
+        return asked, (json.loads(row[0]) if row[0] else None)
+
+    def model_answer_fresh(self, key: str) -> bool:
+        """Whether a usable answer is already stored (the worker skips it)."""
+        with self._lock:
+            found = self._model_answer_locked(key)
+        return found is not None and found[1] is not None and not found[1].get("_invalid")
+
+    def record_model_answer(self, key: str, model: str, answer: Mapping[str, Any] | None) -> None:
+        """Store the model's answer for one schema (None: the ask failed)."""
+        with self._write_transaction():
+            self._db.execute(
+                """INSERT INTO tool_model_answers (schema_key, model, answer, asked_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT (schema_key) DO UPDATE SET
+                       answer = excluded.answer, asked_at = excluded.asked_at""",
+                (key, model, json.dumps(answer) if answer is not None else None, self._receive_time()),
+            )
+
+    def _classify(self, tool: str, schemas: list[Mapping[str, Any]]) -> dict[str, Any]:
+        """`data_actions.classify` with the model step when one is configured
+        (answers from the cache only; see `classifier_model`)."""
+        lookup = self.model_classifier
+        if lookup is None:
+            return da.classify(tool, schemas)
+        return da.classify(tool, schemas, model_classifier=lambda schema: lookup({**schema, "tool": tool}))
 
     # ------------------------------------------------------------- writing
 
@@ -490,7 +536,7 @@ class DataActionsStore:
         out = []
         for row, call in zip(rows, calls):
             special = call["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL)
-            classification = None if special else da.classify(row["_name"], row["_schemas"])
+            classification = None if special else self._classify(row["_name"], row["_schemas"])
             out.append({
                 "tool": row["_name"] if not special else f"mcp@{call['endpoint'] or '(more calls)'}",
                 "class": call["class"],
@@ -568,7 +614,7 @@ class DataActionsStore:
         for tool in sorted(declared):
             if tool in called:
                 continue
-            result = da.classify(tool, declared[tool])
+            result = self._classify(tool, declared[tool])
             if result["actions"] == [da.READ] and not result["weak_read"]:
                 called[tool] = {da.READ}
                 continue
@@ -604,8 +650,12 @@ class DataActionsStore:
             )]
             rows = [row for row in self._data_action_rows_locked(refs, keep_schemas=True)
                     if row["tool"] == name]
-        if not rows:
-            return None
+            if not rows:
+                return None
+            # Classified under the lock: the model step reads its cache.
+            return self._tool_view_locked(name, rows)
+
+    def _tool_view_locked(self, name: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         schemas: dict[str, dict[str, Any]] = {}
         for row in rows:
             for item in row.get("schemas") or []:
@@ -616,7 +666,7 @@ class DataActionsStore:
                     "input_schema": item.get("input_schema"), "annotations": item.get("annotations"),
                     "last_seen": item.get("last_seen"),
                 })
-        classification = da.classify(name, [
+        classification = self._classify(name, [
             {"description": s["description"], "input_schema": s["input_schema"], "annotations": s["annotations"]}
             for s in schemas.values()
         ])
@@ -646,7 +696,7 @@ class DataActionsStore:
             special = row["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL)
             name = row.pop("_name", row["tool"])
             used = row.pop("_schemas", [])
-            classification = None if special else da.classify(name, used)
+            classification = None if special else self._classify(name, used)
             undeclared = json.loads(row["undeclared"])
             actions = list(classification["actions"]) if classification else []
             if undeclared and da.UPLOAD not in actions:

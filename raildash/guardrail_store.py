@@ -739,6 +739,8 @@ class GuardrailCustody:
                 ).fetchone()),
                 self._db.execute("SELECT count(*) FROM tool_schemas").fetchone()[0],
                 tuple(self._db.execute("SELECT max(rowid), count(*) FROM asps").fetchone()),
+                # A model answer arriving changes a tool's classification.
+                tuple(self._db.execute("SELECT max(asked_at), count(*) FROM tool_model_answers").fetchone()),
             )
             cache = self.__dict__.setdefault("_data_actions_proposal_cache", {})
             proposal = cache.get(stamp)
