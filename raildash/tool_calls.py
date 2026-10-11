@@ -174,7 +174,7 @@ def extract_tool_calls(
     The schema a call is checked against (§4.3):
 
     - requested: the tool list in the same request; when the request body
-      couldn't be read (cut at the capture's bound, or missing), or it went
+      couldn't be read (cut, or lost while its reply arrived), or it went
       to a host `trusted_host` doesn't trust (its list could be doctored,
       §4.1), `fallback_schema(tool)`, the newest trusted one the caller
       holds, and the call says `schema_fallback`;
