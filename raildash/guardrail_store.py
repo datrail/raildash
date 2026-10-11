@@ -712,6 +712,49 @@ class GuardrailCustody:
         bundle = parse_bundle(bytes(asp["exact_bundle"]))
         locked_at = _instant(alignment["locked_at"])
         start = locked_at - g.PROPOSAL_LOOKBACK
+        mine = self._owned_requests_locked(kind, value, start, locked_at)
+        result = g.propose_guardrail(
+            self._alignment_contract(alignment), bundle, mine,
+            guardrail_version_id="grd-proposed",
+            version=self._next_version_label(kind, value),
+            created_at=self._receive_time(),
+        )
+        result["data_actions_blocked"] = []
+        if result["guardrail"] is not None:
+            # DR-205 §4.4: the proposal includes `data_actions`, so a new
+            # guardrail is a v2 version. The panel asks for the proposal on
+            # every poll, so it is cached until a new capture or schema
+            # arrives (its inputs are the window's requests and schemas).
+            # Only captures inside the window, new schema rows and new ASPs
+            # (trusted hosts, declared servers) can change it; a capture
+            # after the lock, or a schema seen again, can't.
+            stamp = (
+                alignment["alignment_version_id"],
+                tuple(self._db.execute(
+                    "SELECT max(id), count(*) FROM interactions WHERE authenticated = 1 "
+                    "AND timestamp_ns BETWEEN ? AND ?",
+                    (int(start.timestamp() * 1e9), int(locked_at.timestamp() * 1e9)),
+                ).fetchone()),
+                self._db.execute("SELECT count(*) FROM tool_schemas").fetchone()[0],
+                tuple(self._db.execute("SELECT max(rowid), count(*) FROM asps").fetchone()),
+            )
+            cache = self.__dict__.setdefault("_data_actions_proposal_cache", {})
+            proposal = cache.get(stamp)
+            if proposal is None:
+                proposal = self._data_actions_proposal_locked(mine, start, locked_at)
+                cache.clear()
+                cache[stamp] = proposal
+            proposal = json.loads(json.dumps(proposal))
+            result["guardrail"]["rules"][g.DATA_ACTIONS] = proposal["rule"]
+            result["guardrail"]["guardrail_contract_version"] = g.GUARDRAIL_CONTRACT_VERSION_V2
+            result["data_actions_blocked"] = proposal["blocked_until_allowed"]
+        return result
+
+    def _owned_requests_locked(
+        self, kind: str, value: str, start: datetime, end: datetime,
+    ) -> list[dict[str, Any]]:
+        """This agent's authenticated captured requests between two instants,
+        given to it the way `guardrail.request_owner` gives a request."""
         candidates = [
             {
                 "identity": self._identity_object(row[0], row[1]),
@@ -727,7 +770,7 @@ class GuardrailCustody:
             """SELECT * FROM interactions
                WHERE authenticated = 1 AND timestamp_ns BETWEEN ? AND ?
                ORDER BY timestamp_ns DESC, id DESC LIMIT ?""",
-            (int(start.timestamp() * 1e9), int(locked_at.timestamp() * 1e9), PROPOSAL_MAX_REQUESTS),
+            (int(start.timestamp() * 1e9), int(end.timestamp() * 1e9), PROPOSAL_MAX_REQUESTS),
         ).fetchall()
         mine = []
         for row in rows:
@@ -735,12 +778,80 @@ class GuardrailCustody:
             owner = g.request_owner(request, candidates, authenticated=True)
             if owner["decision"] == "guardrail" and self._identity_columns(owner["identity"]) == (kind, value):
                 mine.append(request)
-        return g.propose_guardrail(
-            self._alignment_contract(alignment), bundle, mine,
-            guardrail_version_id="grd-proposed",
-            version=self._next_version_label(kind, value),
-            created_at=self._receive_time(),
+        return mine
+
+    # ------------------------------------------------------ data actions
+
+    def _data_actions_dismissed_key(self, kind: str, value: str) -> str:
+        return f"data_actions_offer_dismissed:{kind}:{value}"
+
+    def _data_actions_offer_available_locked(self, kind: str, value: str) -> bool:
+        """Cheap: whether the agent would be offered *Add data actions*."""
+        active = self._active_guardrail_row(kind, value)
+        if active is None or g.DATA_ACTIONS in json.loads(active["contract_json"])["rules"]:
+            return False
+        return self._db.execute(
+            "SELECT 1 FROM settings WHERE key = ?", (self._data_actions_dismissed_key(kind, value),)
+        ).fetchone() is None
+
+    def data_actions_offer(self, ref: str) -> dict[str, Any] | None:
+        """The *Add data actions* proposal, computed when asked for (the
+        panel asks when the offer is opened, not on every poll)."""
+        with self._lock:
+            kind, value = self._resolve_agent_ref(ref)
+            return self._data_actions_offer_locked(kind, value)
+
+    def _data_actions_offer_locked(self, kind: str, value: str) -> dict[str, Any] | None:
+        """DR-205 §4.4: an agent whose active version is a v1 is offered
+        *Add data actions*, proposed from its requests in the 24 hours before
+        now, until it accepts or dismisses."""
+        if not self._data_actions_offer_available_locked(kind, value):
+            return None
+        end = datetime.now(timezone.utc)
+        start = end - g.PROPOSAL_LOOKBACK
+        return self._data_actions_proposal_locked(
+            self._owned_requests_locked(kind, value, start, end), start, end
         )
+
+    def add_data_actions(self, ref: str, rule: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        """**Add data actions**: a new (v2) version, the active v1 version's
+        rules plus `rule`, or the offer's proposal when none is given."""
+        with self._write_transaction():
+            kind, value = self._resolve_agent_ref(ref)
+            active = self._active_guardrail_row(kind, value)
+            if active is None:
+                raise ValueError("this agent has no active guardrail")
+            contract = json.loads(active["contract_json"])
+            if g.DATA_ACTIONS in contract["rules"]:
+                raise ValueError("the active version already has the data_actions rule")
+            edited = rule is not None
+            if rule is None:
+                offer = self._data_actions_offer_locked(kind, value)
+                if offer is None:
+                    raise ValueError("no data_actions offer to accept")
+                rule = offer["rule"]
+            rules = {**json.loads(json.dumps(contract["rules"])), g.DATA_ACTIONS: dict(rule)}
+            created = self._create_version_locked(
+                kind, value, rules, derived_from=contract["derived_from"]["alignment_version_id"],
+                created_by="add_data_actions", detail={"edited": edited},
+            )
+            return self._version_view(created, active=True)
+
+    def dismiss_data_actions(self, ref: str) -> dict[str, Any]:
+        """**Dismiss** the *Add data actions* offer: recorded, not offered again."""
+        with self._write_transaction():
+            kind, value = self._resolve_agent_ref(ref)
+            active = self._active_guardrail_row(kind, value)
+            if active is None:
+                raise ValueError("this agent has no active guardrail")
+            if g.DATA_ACTIONS in json.loads(active["contract_json"])["rules"]:
+                raise ValueError("the active version already has the data_actions rule")
+            self._db.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                (self._data_actions_dismissed_key(kind, value), self._receive_time()),
+            )
+            self._event(kind, value, "dismiss_data_actions", active["guardrail_version_id"], {})
+            return {"agent_ref": ref, "dismissed": True}
 
     def propose_guardrail(self, alignment_version_id: str) -> dict[str, Any]:
         """§4.4's proposal from one locked baseline. Nothing is stored."""
@@ -826,6 +937,11 @@ class GuardrailCustody:
             self._db.execute(
                 "DELETE FROM guardrail_bindings WHERE identity_kind = ? AND identity_value = ?",
                 (kind, value),
+            )
+            # A dismissed *Add data actions* offer is about the guardrail
+            # turned off; a later one is offered afresh (DR-205).
+            self._db.execute(
+                "DELETE FROM settings WHERE key = ?", (self._data_actions_dismissed_key(kind, value),)
             )
             self._event(kind, value, "turn_off", active["guardrail_version_id"],
                         {"version": active["version"]})
@@ -1097,6 +1213,7 @@ class GuardrailCustody:
             return {
                 "agent_ref": ref,
                 "agent_identity": self._identity_object(kind, value),
+                "data_actions_offer_available": self._data_actions_offer_available_locked(kind, value),
                 **summary,
                 "active": self._version_view(active, active=True) if active is not None else None,
                 "rows": rows,

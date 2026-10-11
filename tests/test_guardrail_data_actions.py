@@ -49,6 +49,13 @@ def listed():
     return mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, LISTING)
 
 
+def _adopted_v1(store):
+    """An adopted guardrail made a v1 version (the proposal is v2 now)."""
+    ref, adopted = _adopted(store)
+    rules = {k: v for k, v in adopted["guardrail"]["rules"].items() if k != "data_actions"}
+    return ref, store.edit_guardrail(adopted["guardrail"]["guardrail_version_id"], rules)
+
+
 # --------------------------------------------------------------- contract
 
 
@@ -189,7 +196,7 @@ def test_the_kubecon_scenario_on_the_store(store):
 
 
 def test_switching_back_to_a_v1_version_stops_the_rule(store):
-    ref, adopted = _adopted(store)
+    ref, adopted = _adopted_v1(store)
     v1_id = adopted["guardrail"]["guardrail_version_id"]
     rules = copy.deepcopy(adopted["guardrail"]["rules"])
     rules["data_actions"] = rule()
@@ -251,7 +258,7 @@ def test_calls_are_classified_for_judging_only_under_a_v2_version(store, monkeyp
         return original(self, ref, calls)
 
     monkeypatch.setattr(type(store), "_calls_for_rule", spy)
-    _adopted(store)  # v1 only
+    _adopted_v1(store)  # v1 only
     live(store)
     send(store, listed(), call("read_doc", {"doc_id": "d"}))
     assert seen == []
@@ -265,3 +272,106 @@ def test_a_repeat_without_undeclared_arguments_keeps_the_upload_counting(store):
     send(store, call("read_doc", {"doc_id": "b", "blob": "y"}))
     row = rows(store, ref)[("data_actions", f"mcp@{ENDPOINT}__read_doc · upload")]
     assert row["counts"] and row["detail"]["from_undeclared"] and row["detail"]["undeclared"] == ["blob"]
+
+
+# ------------------------------------------------------------- M2b proposal
+
+
+def test_the_proposal_allows_what_was_called_and_blocks_declared_upload_tools(store):
+    from test_guardrail_custody import baseline
+
+    live(store)
+    # The learning window: the agent lists the server's tools and reads.
+    send(store, listed(), call("read_doc", {"doc_id": "d"}))
+    alignment, ref = baseline(store)
+    proposal = store.propose_guardrail(alignment["alignment_version_id"])
+    contract = proposal["guardrail"]
+    assert contract["guardrail_contract_version"] == 2
+    rule_ = contract["rules"]["data_actions"]
+    assert {"tool": f"mcp@{ENDPOINT}__read_doc", "actions": ["read"]} in rule_["allowed"]
+    assert rule_["unclassified"] == "flag" and rule_["overrides"] == {}
+    blocked = {item["tool"]: item for item in proposal["data_actions_blocked"]}
+    assert blocked[f"mcp@{ENDPOINT}__upload_file"]["actions"] == ["upload"]
+    # Adopting it judges the upload the agent never made while learning.
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    send(store, call("upload_file", {"content": PNG}))
+    assert rows(store, ref)[("data_actions", f"mcp@{ENDPOINT}__upload_file · upload")]["counts"]
+
+
+def test_a_hinted_read_is_blocked_not_allowed_by_the_proposal(store):
+    from test_guardrail_custody import baseline
+
+    hinted = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+        {"name": "sync_notes", "inputSchema": {"type": "object", "properties": {}},
+         "annotations": {"readOnlyHint": True}}]}}
+    send(store, mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, hinted))
+    alignment, _ = baseline(store)
+    proposal = store.propose_guardrail(alignment["alignment_version_id"])
+    blocked = {item["tool"]: item for item in proposal["data_actions_blocked"]}
+    assert blocked[f"mcp@{ENDPOINT}__sync_notes"]["weak_read"]
+    assert not any(e["tool"].endswith("sync_notes") for e in proposal["guardrail"]["rules"]["data_actions"]["allowed"])
+
+
+def test_a_v1_agent_is_offered_data_actions_until_it_accepts_or_dismisses(store):
+    ref, adopted = _adopted_v1(store)
+    rules = adopted["guardrail"]["rules"]
+    send(store, listed(), call("read_doc", {"doc_id": "d"}))
+    assert store.guardrail_detail(ref)["data_actions_offer_available"]
+    offer = store.data_actions_offer(ref)
+    assert {"tool": f"mcp@{ENDPOINT}__read_doc", "actions": ["read"]} in offer["rule"]["allowed"]
+    made = store.add_data_actions(ref)
+    assert made["guardrail"]["guardrail_contract_version"] == 2
+    event = store.guardrail_detail(ref)["events"][0]
+    assert event["action"] == "add_data_actions" and event["detail"]["edited"] is False
+    assert not store.guardrail_detail(ref)["data_actions_offer_available"]
+    with pytest.raises(ValueError):
+        store.add_data_actions(ref)
+    with pytest.raises(ValueError):
+        store.dismiss_data_actions(ref)  # nothing to dismiss under a v2
+    # Back to v1 and dismiss: not offered again, until a turn-off.
+    store.edit_guardrail(made["guardrail"]["guardrail_version_id"], rules)
+    assert store.guardrail_detail(ref)["data_actions_offer_available"]
+    store.dismiss_data_actions(ref)
+    assert not store.guardrail_detail(ref)["data_actions_offer_available"]
+    store.turn_off_guardrail(ref)
+    v1_id = store.guardrail_detail(ref)["versions"][0]["guardrail"]["guardrail_version_id"]
+    store.switch_guardrail(v1_id)
+    assert store.guardrail_detail(ref)["data_actions_offer_available"]
+
+
+def test_the_proposal_counts_only_calls_in_the_learning_window(store):
+    from test_guardrail_custody import baseline
+
+    live(store)
+    send(store, listed(), call("read_doc", {"doc_id": "d"}))
+    alignment, _ = baseline(store)
+    # After the lock: the same tool, now with an undeclared argument.
+    send(store, call("read_doc", {"doc_id": "d", "blob": "x" * 50}))
+    proposal = store.propose_guardrail(alignment["alignment_version_id"])
+    allowed = {e["tool"]: e["actions"] for e in proposal["guardrail"]["rules"]["data_actions"]["allowed"]}
+    assert allowed[f"mcp@{ENDPOINT}__read_doc"] == ["read"]
+
+
+def test_the_routes_need_the_token_and_answer_as_the_store_does(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from raildash import app as app_module
+
+    db = Store(tmp_path / "routes.db")
+    monkeypatch.setattr(app_module, "store", db)
+    client = TestClient(app_module.app)
+    auth = {"X-RailDash-Token": app_module.LOCAL_TOKEN}
+    ref, _ = _adopted_v1(db)
+    path = f"/api/guardrails/{ref}"
+    assert client.post(f"{path}/data-actions", json={}).status_code in (401, 403)
+    assert client.get(f"{path}/data-actions-offer").status_code in (401, 403)
+    assert client.get(f"{path}/data-actions-offer", headers=auth).json()["offer"]["rule"]["unclassified"] == "flag"
+    assert client.post(f"{path}/data-actions", json={"rule": "x"}, headers=auth).status_code == 422
+    assert client.post(f"{path}/data-actions", json={"rule": {"allowed": [{"tool": "x", "actions": ["steal"]}],
+                                                              "overrides": {}, "unclassified": "flag"}},
+                       headers=auth).status_code == 422
+    assert client.post(f"{path}/data-actions", json={}, headers=auth).status_code == 201
+    assert client.post(f"{path}/data-actions", json={}, headers=auth).status_code == 409
+    assert client.post(f"{path}/data-actions/dismiss", json={}, headers=auth).status_code == 409
+    assert client.post("/api/guardrails/nope/data-actions", json={}, headers=auth).status_code == 404
+    db.close()

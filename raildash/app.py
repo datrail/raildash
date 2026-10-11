@@ -1185,6 +1185,40 @@ async def api_dismiss_offer(agent_ref: str, request: Request) -> dict[str, Any]:
     return _guardrail_call(get_store().choose_declared, agent_ref, kind, value, allow=False)
 
 
+@app.get("/api/guardrails/{agent_ref}/data-actions-offer", dependencies=[Depends(require_local_token)])
+def api_data_actions_offer(agent_ref: str) -> dict[str, Any]:
+    """The *Add data actions* proposal for an agent whose active version is
+    a v1 (DR-205): `{"offer": {"rule", "blocked_until_allowed"} | null}`."""
+    return {"offer": _guardrail_call(get_store().data_actions_offer, agent_ref)}
+
+
+@app.post(
+    "/api/guardrails/{agent_ref}/data-actions",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_add_data_actions(agent_ref: str, request: Request) -> dict[str, Any]:
+    """**Add data actions** (DR-205): a new version with the active v1
+    version's rules plus the `data_actions` rule. Body `{}` accepts the
+    offer's proposal; `{"rule": {...}}` adds the rule as edited."""
+    body = await _control_object(request)
+    rule = body.get("rule")
+    if rule is not None and not isinstance(rule, dict):
+        raise HTTPException(422, "rule must be an object")
+    return _guardrail_call(get_store().add_data_actions, agent_ref, rule)
+
+
+@app.post(
+    "/api/guardrails/{agent_ref}/data-actions/dismiss",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_dismiss_data_actions(agent_ref: str, request: Request) -> dict[str, Any]:
+    """**Dismiss** the *Add data actions* offer; it isn't offered again."""
+    await _control_object(request)
+    return _guardrail_call(get_store().dismiss_data_actions, agent_ref)
+
+
 # --------------------------------------------------------- legacy JSON routes
 # Kept because the previous server documented them in its own index page and
 # openapi.yaml. Same paths, same meaning.

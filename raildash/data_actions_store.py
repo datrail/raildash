@@ -81,6 +81,20 @@ def _union_json(old: str, new: Iterable[str]) -> str:
     return json.dumps(sorted(merged))
 
 
+def capture_ref(interaction: Mapping[str, Any]) -> str:
+    """The capture's own identity for its tool schemas and calls:
+    `agent:<host_id>/<sandbox>/<agent_key>` for an attributed request, else
+    `session:<id>`."""
+    if interaction.get("attribution_state") == "attributed" and all(
+        interaction.get(column) for column in ("agent_host_id", "sandbox_name", "agent_key")
+    ):
+        return (
+            f"agent:{interaction['agent_host_id']}/{interaction['sandbox_name']}"
+            f"/{interaction['agent_key']}"
+        )
+    return f"session:{interaction['session_id']}"
+
+
 def _mcp_server_of(tool: str) -> str | None:
     """The server in a model-side `mcp__<server>__<tool>` name."""
     if tool.startswith("mcp__"):
@@ -111,13 +125,7 @@ class DataActionsStore:
         recorded: list[dict[str, Any]] = []
         self._db.execute("SAVEPOINT tool_calls_hook")
         try:
-            trusted = self._trusted_model_hosts()
-            found = tc.extract_tool_calls(
-                interaction,
-                endpoint_schema=self._endpoint_schema,
-                fallback_schema=lambda tool: self._fallback_schema(capture_ref, tool),
-                trusted_host=lambda host: g.host_allowed(host, trusted),
-            )
+            found = self._extract_calls(interaction, capture_ref)
             now = at or self._receive_time()
             interaction_id = interaction.get("interaction_id")
             for call in found["calls"]:
@@ -149,6 +157,18 @@ class DataActionsStore:
             return None
         self._db.execute("RELEASE tool_calls_hook")
         return recorded
+
+    def _extract_calls(self, interaction: Mapping[str, Any], capture_ref: str) -> dict[str, Any]:
+        """`tool_calls.extract_tool_calls` with this store's schemas: an
+        endpoint's newest listing, the newest trusted model-side schema as
+        the fallback, and the trusted hosts."""
+        trusted = self._trusted_model_hosts()
+        return tc.extract_tool_calls(
+            interaction,
+            endpoint_schema=self._endpoint_schema,
+            fallback_schema=lambda tool: self._fallback_schema(capture_ref, tool),
+            trusted_host=lambda host: g.host_allowed(host, trusted),
+        )
 
     def _upsert_call(
         self, capture_ref: str, call: Mapping[str, Any], now: str, interaction_id: Any,
@@ -442,17 +462,92 @@ class DataActionsStore:
     def data_action_rows(self, capture_refs: Iterable[str]) -> list[dict[str, Any]]:
         """The data-action rows of some captures, each with its actions as
         classified now (§4.3), upload rows first, then by last seen."""
+        with self._lock:
+            return self._data_action_rows_locked(capture_refs)
+
+    def _data_actions_proposal_locked(
+        self, requests: Iterable[Mapping[str, Any]], start: datetime, end: datetime,
+    ) -> dict[str, Any]:
+        """§4.4's `data_actions` proposal from an agent's own captured
+        requests in a learning window.
+
+        Allowed: every MCP tool called in the window, with the actions its
+        calls had (an unclassified one as `unclassified`), and every
+        declared MCP tool whose only action is a read from the name table
+        or arguments. Every other declared MCP tool, weak reads included,
+        is listed as blocked until allowed, with its actions and reasons.
+        Returns `{"rule": {...}, "blocked_until_allowed": [...]}`."""
+        requests = list(requests)
+        refs = sorted({capture_ref(request) for request in requests})
+        rule: dict[str, Any] = {"allowed": [], "overrides": {}, "unclassified": "flag"}
+        if not refs:
+            return {"rule": rule, "blocked_until_allowed": []}
+        # What the agent did in the window: its own requests there (chosen by
+        # capture time), each call read again and classified as the rule
+        # would judge it now. Not the lifetime rows: those also hold calls
+        # made after the window, an undeclared upload among them.
+        called: dict[str, set[str]] = {}
+        for request in requests:
+            raw = request.get("raw")
+            if isinstance(raw, str) and not any(marker in raw for marker in _CALL_MARKERS):
+                continue  # no call can be in it; an unreadable POST isn't a call to allow
+            ref = capture_ref(request)
+            found = self._extract_calls(request, ref)
+            for call in self._calls_for_rule(ref, found["calls"]):
+                if call["unreadable"] or not g.judged_tool(call["tool"]):
+                    continue
+                actions = set(call["classified"])
+                if call["undeclared"]:
+                    actions.add(da.UPLOAD)
+                called.setdefault(call["tool"], set()).update(actions or {"unclassified"})
+        # Every declared tool: model-side lists and endpoint listings.
+        trusted = self._trusted_model_hosts()
+        schemas = self._trusted_schemas(refs, trusted)
+        marks = ",".join("?" * len(refs))
+        pseudo = [{"class": tc.REQUESTED, "tool": tool, "endpoint": ""} for tool in schemas]
+        pseudo += [
+            {"class": tc.OBSERVED, "tool": row[0], "endpoint": row[1]}
+            for row in self._db.execute(
+                f"SELECT DISTINCT tool, endpoint FROM tool_schemas WHERE source = ? "
+                f"AND capture_ref IN ({marks})",
+                (ts.SOURCE_MCP_TOOLS_LIST, *refs),
+            )
+        ]
+        self._name_and_schemas(pseudo, schemas)
+        declared: dict[str, list[dict[str, Any]]] = {}
+        for row in pseudo:
+            if g.judged_tool(row["_name"]):
+                declared.setdefault(row["_name"], []).extend(row["_schemas"])
+        blocked = []
+        for tool in sorted(declared):
+            if tool in called:
+                continue
+            result = da.classify(tool, declared[tool])
+            if result["actions"] == [da.READ] and not result["weak_read"]:
+                called[tool] = {da.READ}
+                continue
+            blocked.append({
+                "tool": tool, "actions": result["actions"], "weak_read": result["weak_read"],
+                "unclassified": result["unclassified"], "reasons": result["reasons"],
+            })
+        order = (*g.DATA_ACTION_KINDS, *g.DATA_ACTION_PSEUDO)
+        rule["allowed"] = [
+            {"tool": tool, "actions": [action for action in order if action in actions]}
+            for tool, actions in sorted(called.items())
+        ]
+        return {"rule": rule, "blocked_until_allowed": blocked}
+
+    def _data_action_rows_locked(self, capture_refs: Iterable[str]) -> list[dict[str, Any]]:
         refs = sorted(set(capture_refs))
         if not refs:
             return []
-        with self._lock:
-            trusted = self._trusted_model_hosts()
-            schemas = self._trusted_schemas(refs, trusted)
-            marks = ",".join("?" * len(refs))
-            rows = [dict(row) for row in self._db.execute(
-                f"SELECT * FROM data_action_calls WHERE capture_ref IN ({marks})", refs
-            )]
-            self._name_and_schemas(rows, schemas)
+        trusted = self._trusted_model_hosts()
+        schemas = self._trusted_schemas(refs, trusted)
+        marks = ",".join("?" * len(refs))
+        rows = [dict(row) for row in self._db.execute(
+            f"SELECT * FROM data_action_calls WHERE capture_ref IN ({marks})", refs
+        )]
+        self._name_and_schemas(rows, schemas)
         out = []
         for row in rows:
             special = row["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL)
