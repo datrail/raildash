@@ -81,6 +81,15 @@ def _union_json(old: str, new: Iterable[str]) -> str:
     return json.dumps(sorted(merged))
 
 
+def _mcp_server_of(tool: str) -> str | None:
+    """The server in a model-side `mcp__<server>__<tool>` name."""
+    if tool.startswith("mcp__"):
+        parts = tool.split("__", 2)
+        if len(parts) == 3 and parts[1]:
+            return parts[1]
+    return None
+
+
 class DataActionsStore:
     """Mixed into `Store`; uses its `_db`, `_lock`, `_receive_time`."""
 
@@ -99,10 +108,12 @@ class DataActionsStore:
                 return
         self._db.execute("SAVEPOINT tool_calls_hook")
         try:
+            trusted = self._trusted_model_hosts()
             found = tc.extract_tool_calls(
                 interaction,
                 endpoint_schema=self._endpoint_schema,
                 fallback_schema=lambda tool: self._fallback_schema(capture_ref, tool),
+                trusted_host=lambda host: g.host_allowed(host, trusted),
             )
             now = at or self._receive_time()
             interaction_id = interaction.get("interaction_id")
@@ -268,6 +279,7 @@ class DataActionsStore:
             return cached[1]
         hosts: set[str] = set()
         endpoints: set[str] = set()
+        servers: dict[str, str] = {}
         for row in self._db.execute(
             """SELECT exact_bundle FROM asps a WHERE stored_at = (
                    SELECT max(stored_at) FROM asps b
@@ -289,12 +301,16 @@ class DataActionsStore:
                         url = server.get("url") if isinstance(server, dict) else None
                         if isinstance(url, str) and url:
                             parts = urlsplit(url)
-                            endpoints.add(tc.endpoint_key(
+                            endpoint = tc.endpoint_key(
                                 {"headers": {"host": parts.netloc}, "path": parts.path or "/"}
-                            ))
+                            )
+                            endpoints.add(endpoint)
+                            name = server.get("name")
+                            if isinstance(name, str) and name:
+                                servers.setdefault(endpoint, g.normalize_mcp_server(name))
             except Exception:  # noqa: BLE001 - an unreadable ASP adds nothing
                 continue
-        facts = {"inference_hosts": hosts, "mcp_endpoints": endpoints}
+        facts = {"inference_hosts": hosts, "mcp_endpoints": endpoints, "servers": servers}
         self._asp_facts_cache = (stamp, facts)
         return facts
 
@@ -333,29 +349,55 @@ class DataActionsStore:
             rows = [dict(row) for row in self._db.execute(
                 f"SELECT * FROM data_action_calls WHERE capture_ref IN ({marks})", refs
             )]
-            endpoints = sorted({row["endpoint"] for row in rows if row["class"] == tc.OBSERVED and row["endpoint"]})
+            servers = self._asp_facts()["servers"]  # endpoint -> declared server name
+            by_server = {name: endpoint for endpoint, name in servers.items()}
+            endpoints = {row["endpoint"] for row in rows if row["class"] == tc.OBSERVED and row["endpoint"]}
+            for row in rows:
+                server = _mcp_server_of(row["tool"]) if row["class"] == tc.REQUESTED else None
+                if server in by_server:
+                    endpoints.add(by_server[server])
+            endpoints = sorted(endpoints)
             listed: dict[tuple[str, str], list[dict[str, Any]]] = {}
+            cutoff = (datetime.now(timezone.utc) - SCHEMA_WINDOW).strftime("%Y-%m-%dT%H:%M:%S")
             if endpoints:
-                # One query for every observed row's endpoint listing.
+                # One query for every endpoint listing the rows need.
                 for item in self._db.execute(
-                    f"SELECT * FROM tool_schemas WHERE source = ? AND endpoint IN "
+                    f"SELECT * FROM tool_schemas WHERE source = ? AND last_seen >= ? AND endpoint IN "
                     f"({','.join('?' * len(endpoints))})",
-                    (ts.SOURCE_MCP_TOOLS_LIST, *endpoints),
+                    (ts.SOURCE_MCP_TOOLS_LIST, cutoff, *endpoints),
                 ):
                     listed.setdefault((item["endpoint"], item["tool"]), []).append({
                         **dict(item), "input_schema": json.loads(item["input_schema"]),
                         "annotations": json.loads(item["annotations"]) if item["annotations"] else None,
                     })
             for row in rows:
-                if row["class"] == tc.OBSERVED and row["endpoint"]:
-                    row["_schemas"] = listed.get((row["endpoint"], row["tool"]), [])
+                # The line-up (§4.1): an observed call at a declared server's
+                # endpoint is that server's `mcp__<server>__<tool>`, and its
+                # model-side schemas count with the server's listing; one at
+                # an undeclared endpoint is `mcp@<endpoint>__<tool>`.
+                if row["class"] == tc.OBSERVED and row["endpoint"] and row["tool"] not in (
+                    UNREADABLE_TOOL, OVERFLOW_TOOL
+                ):
+                    server = servers.get(row["endpoint"])
+                    row["_name"] = (
+                        f"mcp__{server}__{row['tool']}" if server else f"mcp@{row['endpoint']}__{row['tool']}"
+                    )
+                    row["_schemas"] = listed.get((row["endpoint"], row["tool"]), []) + (
+                        schemas.get(row["_name"], []) if server else []
+                    )
                 else:
-                    row["_schemas"] = schemas.get(row["tool"], [])
+                    row["_name"] = row["tool"]
+                    row["_schemas"] = list(schemas.get(row["tool"], []))
+                    server = _mcp_server_of(row["tool"]) if row["class"] == tc.REQUESTED else None
+                    if server in by_server:
+                        bare = row["tool"].split("__", 2)[2]
+                        row["_schemas"] += listed.get((by_server[server], bare), [])
         out = []
         for row in rows:
             special = row["tool"] in (UNREADABLE_TOOL, OVERFLOW_TOOL)
+            name = row.pop("_name", row["tool"])
             classification = (
-                None if special else da.classify(row["tool"], row.pop("_schemas"))
+                None if special else da.classify(name, row.pop("_schemas"))
             )
             row.pop("_schemas", None)
             undeclared = json.loads(row["undeclared"])
@@ -365,7 +407,8 @@ class DataActionsStore:
             out.append({
                 "capture_ref": row["capture_ref"],
                 "class": row["class"],
-                "tool": row["tool"],
+                "tool": name,
+                "wire_tool": row["tool"],
                 "endpoint": row["endpoint"] or None,
                 "destination": json.loads(row["destination"]) if row["destination"] else {},
                 "first_seen": row["first_seen"],
