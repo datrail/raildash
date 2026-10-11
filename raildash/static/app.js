@@ -1110,6 +1110,91 @@ function renderGuardrailPolicy(rules) {
   add("Service ports", listOrNone(rules.service_ports.allowed, describePort));
   add("Hosts it may call", listOrNone(rules.out_of_spec_calls.allowed_hosts));
   add("MCP servers", listOrNone(rules.out_of_spec_calls.allowed_mcp_servers));
+  // DR-205: what each MCP tool may do with data (a v2 version only).
+  const actions = rules.data_actions;
+  if (actions) {
+    add("Data actions allowed", listOrNone(actions.allowed, (entry) => `${entry.tool}: ${entry.actions.join(", ")}`));
+    const overrides = Object.entries(actions.overrides || {});
+    if (overrides.length) {
+      add("Overrides", overrides.map(([tool, set]) => `${tool}: ${set.join(", ") || "none"}`).join("; "));
+    }
+    add("Unclassified tools", actions.unclassified === "allow" ? "allowed" : "flagged");
+  }
+  return dl;
+}
+
+// DR-205: declared MCP tools the proposal doesn't allow, each with what it
+// could do and why, so blocking them before they're ever called is a
+// choice the user sees, not one made behind their back.
+function renderDataActionsBlocked(blocked) {
+  const wrap = el("div", "guardrail-blocked");
+  if (!blocked || !blocked.length) return wrap;
+  wrap.append(el("p", null,
+    "Blocked until allowed: declared tools this agent didn't use while learning that could send, " +
+    "change, delete or run something (or whose read only a hint vouches for):"));
+  const list = el("ul", "guardrail-would-be");
+  blocked.forEach((entry) => {
+    const item = el("li");
+    const what = entry.unclassified ? "unclassified"
+      : entry.actions.map((a) => (a === "read" && entry.weak_read ? "read (hint)" : a)).join(", ");
+    item.append(el("code", null, entry.tool), el("span", "muted", ` ${what}`));
+    if (entry.reasons && entry.reasons.length) item.append(el("span", "muted", ` — ${entry.reasons.join("; ")}`));
+    list.append(item);
+  });
+  wrap.append(list);
+  return wrap;
+}
+
+// DR-205: an agent whose active version predates data actions is offered
+// them. The proposal is fetched when the user opens it, not on every poll.
+function renderDataActionsOffer(agentRef, refresh) {
+  const section = el("section", "guardrail-offers guardrail-data-actions-offer");
+  section.append(el("h5", null, "Add data actions"));
+  section.append(el("p", "muted",
+    "Judge what each MCP tool call does with data: read, upload, update, delete or run. " +
+    "Proposed from this agent's last 24 hours."));
+  const details = el("details");
+  details.dataset.key = `data-actions-offer:${agentRef}`;
+  details.append(el("summary", null, "Show the proposal"));
+  const body = el("div");
+  details.append(body);
+  details.addEventListener("toggle", async () => {
+    if (!details.open || body.dataset.loaded) return;
+    body.dataset.loaded = "true";
+    try {
+      const { offer } = await getJSONWithToken(`/api/guardrails/${encodeURIComponent(agentRef)}/data-actions-offer`);
+      body.replaceChildren();
+      if (!offer) {
+        body.append(el("p", "muted", "Nothing to offer now."));
+        return;
+      }
+      body.append(renderDataActionsPolicy(offer.rule));
+      body.append(renderDataActionsBlocked(offer.blocked_until_allowed));
+    } catch (error) {
+      body.dataset.loaded = "";
+      body.replaceChildren(errorMessage(`The proposal couldn't be read: ${error.message}`));
+    }
+  });
+  section.append(details);
+  const base = `/api/guardrails/${encodeURIComponent(agentRef)}/data-actions`;
+  const actions = el("div", "asp-actions");
+  actions.append(guardrailButton("Add data actions", async () => {
+    await postJSON(base, {});
+    refresh();
+  }, { key: `data-actions-add:${agentRef}` }));
+  actions.append(guardrailButton("Dismiss", async () => {
+    await postJSON(`${base}/dismiss`, {});
+    refresh();
+  }, { quiet: true, key: `data-actions-dismiss:${agentRef}` }));
+  section.append(actions);
+  return section;
+}
+
+function renderDataActionsPolicy(rule) {
+  const dl = el("dl", "guardrail-policy");
+  const add = (term, text) => dl.append(el("dt", null, term), el("dd", null, text));
+  add("Data actions allowed", listOrNone(rule.allowed, (entry) => `${entry.tool}: ${entry.actions.join(", ")}`));
+  add("Unclassified tools", rule.unclassified === "allow" ? "allowed" : "flagged");
   return dl;
 }
 
@@ -1263,6 +1348,7 @@ function renderGuardrailProposal(proposal, refresh) {
     "Proposed from the locked baseline: what it already did is allowed (plus Python's bytecode caches), and nothing is " +
     "checked until you adopt it. Every line is shown so you can see what it approves."));
   section.append(renderGuardrailPolicy(proposal.guardrail.rules));
+  section.append(renderDataActionsBlocked(proposal.data_actions_blocked));
   const emptyBecause = Object.entries(proposal.empty_because || {});
   if (emptyBecause.length) {
     const notes = el("ul", "guardrail-notes");
@@ -1491,6 +1577,7 @@ async function loadGuardrails(focusKey = null) {
         "Uploads and out-of-spec calls are judged on the TLS requests the collector captured; " +
         "plain TCP, DNS or a stdio MCP server isn't seen."));
       if (detail.offers.length) card.append(renderGuardrailOffers(detail.agent_ref, detail.active, detail.offers, refresh));
+      if (detail.data_actions_offer_available) card.append(renderDataActionsOffer(detail.agent_ref, refresh));
       card.append(renderGuardrailRows(detail.rows, refresh, true, detail.agent_ref));
       const policy = el("details", "guardrail-active-policy");
       policy.dataset.key = "policy";

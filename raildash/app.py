@@ -1185,6 +1185,13 @@ async def api_dismiss_offer(agent_ref: str, request: Request) -> dict[str, Any]:
     return _guardrail_call(get_store().choose_declared, agent_ref, kind, value, allow=False)
 
 
+@app.get("/api/guardrails/{agent_ref}/data-actions-offer", dependencies=[Depends(require_local_token)])
+def api_data_actions_offer(agent_ref: str) -> dict[str, Any]:
+    """The *Add data actions* proposal for an agent whose active version is
+    a v1 (DR-205): `{"offer": {"rule", "blocked_until_allowed"} | null}`."""
+    return {"offer": _guardrail_call(get_store().data_actions_offer, agent_ref)}
+
+
 @app.post(
     "/api/guardrails/{agent_ref}/data-actions",
     status_code=201,

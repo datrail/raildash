@@ -125,13 +125,7 @@ class DataActionsStore:
         recorded: list[dict[str, Any]] = []
         self._db.execute("SAVEPOINT tool_calls_hook")
         try:
-            trusted = self._trusted_model_hosts()
-            found = tc.extract_tool_calls(
-                interaction,
-                endpoint_schema=self._endpoint_schema,
-                fallback_schema=lambda tool: self._fallback_schema(capture_ref, tool),
-                trusted_host=lambda host: g.host_allowed(host, trusted),
-            )
+            found = self._extract_calls(interaction, capture_ref)
             now = at or self._receive_time()
             interaction_id = interaction.get("interaction_id")
             for call in found["calls"]:
@@ -163,6 +157,18 @@ class DataActionsStore:
             return None
         self._db.execute("RELEASE tool_calls_hook")
         return recorded
+
+    def _extract_calls(self, interaction: Mapping[str, Any], capture_ref: str) -> dict[str, Any]:
+        """`tool_calls.extract_tool_calls` with this store's schemas: an
+        endpoint's newest listing, the newest trusted model-side schema as
+        the fallback, and the trusted hosts."""
+        trusted = self._trusted_model_hosts()
+        return tc.extract_tool_calls(
+            interaction,
+            endpoint_schema=self._endpoint_schema,
+            fallback_schema=lambda tool: self._fallback_schema(capture_ref, tool),
+            trusted_host=lambda host: g.host_allowed(host, trusted),
+        )
 
     def _upsert_call(
         self, capture_ref: str, call: Mapping[str, Any], now: str, interaction_id: Any,
@@ -471,18 +477,26 @@ class DataActionsStore:
         or arguments. Every other declared MCP tool, weak reads included,
         is listed as blocked until allowed, with its actions and reasons.
         Returns `{"rule": {...}, "blocked_until_allowed": [...]}`."""
+        requests = list(requests)
         refs = sorted({capture_ref(request) for request in requests})
         rule: dict[str, Any] = {"allowed": [], "overrides": {}, "unclassified": "flag"}
         if not refs:
             return {"rule": rule, "blocked_until_allowed": []}
-        low, high = self._receive_time(start), self._receive_time(end)
+        # What the agent did in the window: its own requests there (chosen by
+        # capture time), each call read again and classified as the rule
+        # would judge it now. Not the lifetime rows: those also hold calls
+        # made after the window, an undeclared upload among them.
         called: dict[str, set[str]] = {}
-        for row in self._data_action_rows_locked(refs):
-            if row["unreadable"] or not g.judged_tool(row["tool"]):
-                continue
-            if row["last_seen"] < low or row["first_seen"] > high:
-                continue
-            called.setdefault(row["tool"], set()).update(row["actions"] or ["unclassified"])
+        for request in requests:
+            ref = capture_ref(request)
+            found = self._extract_calls(request, ref)
+            for call in self._calls_for_rule(ref, found["calls"]):
+                if call["unreadable"] or not g.judged_tool(call["tool"]):
+                    continue
+                actions = set(call["classified"])
+                if call["undeclared"]:
+                    actions.add(da.UPLOAD)
+                called.setdefault(call["tool"], set()).update(actions or {"unclassified"})
         # Every declared tool: model-side lists and endpoint listings.
         trusted = self._trusted_model_hosts()
         schemas = self._trusted_schemas(refs, trusted)

@@ -316,26 +316,62 @@ def test_a_v1_agent_is_offered_data_actions_until_it_accepts_or_dismisses(store)
     ref, adopted = _adopted_v1(store)
     rules = adopted["guardrail"]["rules"]
     send(store, listed(), call("read_doc", {"doc_id": "d"}))
-    offer = store.guardrail_detail(ref)["data_actions_offer"]
+    assert store.guardrail_detail(ref)["data_actions_offer_available"]
+    offer = store.data_actions_offer(ref)
     assert {"tool": f"mcp@{ENDPOINT}__read_doc", "actions": ["read"]} in offer["rule"]["allowed"]
     made = store.add_data_actions(ref)
     assert made["guardrail"]["guardrail_contract_version"] == 2
-    assert store.guardrail_detail(ref)["data_actions_offer"] is None
+    event = store.guardrail_detail(ref)["events"][0]
+    assert event["action"] == "add_data_actions" and event["detail"]["edited"] is False
+    assert not store.guardrail_detail(ref)["data_actions_offer_available"]
     with pytest.raises(ValueError):
         store.add_data_actions(ref)
-    # Back to v1 and dismiss: no offer again.
+    with pytest.raises(ValueError):
+        store.dismiss_data_actions(ref)  # nothing to dismiss under a v2
+    # Back to v1 and dismiss: not offered again, until a turn-off.
     store.edit_guardrail(made["guardrail"]["guardrail_version_id"], rules)
-    assert store.guardrail_detail(ref)["data_actions_offer"] is not None
+    assert store.guardrail_detail(ref)["data_actions_offer_available"]
     store.dismiss_data_actions(ref)
-    assert store.guardrail_detail(ref)["data_actions_offer"] is None
+    assert not store.guardrail_detail(ref)["data_actions_offer_available"]
+    store.turn_off_guardrail(ref)
+    v1_id = store.guardrail_detail(ref)["versions"][0]["guardrail"]["guardrail_version_id"]
+    store.switch_guardrail(v1_id)
+    assert store.guardrail_detail(ref)["data_actions_offer_available"]
 
 
-def test_the_routes_need_the_token(tmp_path, monkeypatch):
+def test_the_proposal_counts_only_calls_in_the_learning_window(store):
+    from test_guardrail_custody import baseline
+
+    live(store)
+    send(store, listed(), call("read_doc", {"doc_id": "d"}))
+    alignment, _ = baseline(store)
+    # After the lock: the same tool, now with an undeclared argument.
+    send(store, call("read_doc", {"doc_id": "d", "blob": "x" * 50}))
+    proposal = store.propose_guardrail(alignment["alignment_version_id"])
+    allowed = {e["tool"]: e["actions"] for e in proposal["guardrail"]["rules"]["data_actions"]["allowed"]}
+    assert allowed[f"mcp@{ENDPOINT}__read_doc"] == ["read"]
+
+
+def test_the_routes_need_the_token_and_answer_as_the_store_does(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
     from raildash import app as app_module
 
-    monkeypatch.setenv("RAILDASH_DB", str(tmp_path / "r.db"))
+    db = Store(tmp_path / "routes.db")
+    monkeypatch.setattr(app_module, "store", db)
     client = TestClient(app_module.app)
-    assert client.post("/api/guardrails/x/data-actions", json={}).status_code in (401, 403)
-    assert client.post("/api/guardrails/x/data-actions/dismiss", json={}).status_code in (401, 403)
+    auth = {"X-RailDash-Token": app_module.LOCAL_TOKEN}
+    ref, _ = _adopted_v1(db)
+    path = f"/api/guardrails/{ref}"
+    assert client.post(f"{path}/data-actions", json={}).status_code in (401, 403)
+    assert client.get(f"{path}/data-actions-offer").status_code in (401, 403)
+    assert client.get(f"{path}/data-actions-offer", headers=auth).json()["offer"]["rule"]["unclassified"] == "flag"
+    assert client.post(f"{path}/data-actions", json={"rule": "x"}, headers=auth).status_code == 422
+    assert client.post(f"{path}/data-actions", json={"rule": {"allowed": [{"tool": "x", "actions": ["steal"]}],
+                                                              "overrides": {}, "unclassified": "flag"}},
+                       headers=auth).status_code == 422
+    assert client.post(f"{path}/data-actions", json={}, headers=auth).status_code == 201
+    assert client.post(f"{path}/data-actions", json={}, headers=auth).status_code == 409
+    assert client.post(f"{path}/data-actions/dismiss", json={}, headers=auth).status_code == 409
+    assert client.post("/api/guardrails/nope/data-actions", json={}, headers=auth).status_code == 404
+    db.close()

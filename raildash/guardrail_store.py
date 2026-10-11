@@ -764,16 +764,27 @@ class GuardrailCustody:
     def _data_actions_dismissed_key(self, kind: str, value: str) -> str:
         return f"data_actions_offer_dismissed:{kind}:{value}"
 
+    def _data_actions_offer_available_locked(self, kind: str, value: str) -> bool:
+        """Cheap: whether the agent would be offered *Add data actions*."""
+        active = self._active_guardrail_row(kind, value)
+        if active is None or g.DATA_ACTIONS in json.loads(active["contract_json"])["rules"]:
+            return False
+        return self._db.execute(
+            "SELECT 1 FROM settings WHERE key = ?", (self._data_actions_dismissed_key(kind, value),)
+        ).fetchone() is None
+
+    def data_actions_offer(self, ref: str) -> dict[str, Any] | None:
+        """The *Add data actions* proposal, computed when asked for (the
+        panel asks when the offer is opened, not on every poll)."""
+        with self._lock:
+            kind, value = self._resolve_agent_ref(ref)
+            return self._data_actions_offer_locked(kind, value)
+
     def _data_actions_offer_locked(self, kind: str, value: str) -> dict[str, Any] | None:
         """DR-205 §4.4: an agent whose active version is a v1 is offered
         *Add data actions*, proposed from its requests in the 24 hours before
         now, until it accepts or dismisses."""
-        active = self._active_guardrail_row(kind, value)
-        if active is None or g.DATA_ACTIONS in json.loads(active["contract_json"])["rules"]:
-            return None
-        if self._db.execute(
-            "SELECT 1 FROM settings WHERE key = ?", (self._data_actions_dismissed_key(kind, value),)
-        ).fetchone():
+        if not self._data_actions_offer_available_locked(kind, value):
             return None
         end = datetime.now(timezone.utc)
         start = end - g.PROPOSAL_LOOKBACK
@@ -792,6 +803,7 @@ class GuardrailCustody:
             contract = json.loads(active["contract_json"])
             if g.DATA_ACTIONS in contract["rules"]:
                 raise ValueError("the active version already has the data_actions rule")
+            edited = rule is not None
             if rule is None:
                 offer = self._data_actions_offer_locked(kind, value)
                 if offer is None:
@@ -800,7 +812,7 @@ class GuardrailCustody:
             rules = {**json.loads(json.dumps(contract["rules"])), g.DATA_ACTIONS: dict(rule)}
             created = self._create_version_locked(
                 kind, value, rules, derived_from=contract["derived_from"]["alignment_version_id"],
-                created_by="add_data_actions", detail={"edited": rule is not None},
+                created_by="add_data_actions", detail={"edited": edited},
             )
             return self._version_view(created, active=True)
 
@@ -811,6 +823,8 @@ class GuardrailCustody:
             active = self._active_guardrail_row(kind, value)
             if active is None:
                 raise ValueError("this agent has no active guardrail")
+            if g.DATA_ACTIONS in json.loads(active["contract_json"])["rules"]:
+                raise ValueError("the active version already has the data_actions rule")
             self._db.execute(
                 "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
                 (self._data_actions_dismissed_key(kind, value), self._receive_time()),
@@ -902,6 +916,11 @@ class GuardrailCustody:
             self._db.execute(
                 "DELETE FROM guardrail_bindings WHERE identity_kind = ? AND identity_value = ?",
                 (kind, value),
+            )
+            # A dismissed *Add data actions* offer is about the guardrail
+            # turned off; a later one is offered afresh (DR-205).
+            self._db.execute(
+                "DELETE FROM settings WHERE key = ?", (self._data_actions_dismissed_key(kind, value),)
             )
             self._event(kind, value, "turn_off", active["guardrail_version_id"],
                         {"version": active["version"]})
@@ -1173,7 +1192,7 @@ class GuardrailCustody:
             return {
                 "agent_ref": ref,
                 "agent_identity": self._identity_object(kind, value),
-                "data_actions_offer": self._data_actions_offer_locked(kind, value),
+                "data_actions_offer_available": self._data_actions_offer_available_locked(kind, value),
                 **summary,
                 "active": self._version_view(active, active=True) if active is not None else None,
                 "rows": rows,

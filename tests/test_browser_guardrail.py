@@ -257,3 +257,68 @@ def test_allow_all_allows_a_rules_rows_in_one_version(tmp_path):
     panel_writes = [(target, sent) for target, sent in writes if "/api/" in target]
     assert [target.rsplit("/", 1)[1] for target, _ in panel_writes] == ["allow-rows"]
     assert all(sent == token for _, sent in panel_writes), panel_writes
+
+
+def test_the_panel_shows_data_actions_in_the_proposal_and_offers_them_to_a_v1_agent(tmp_path):
+    """DR-205 M2: the proposal's data_actions lines and its blocked-until-
+    allowed list are shown before Adopt; an agent on a v1 version is offered
+    Add data actions, the proposal fetched when opened."""
+    from test_guardrail_data_actions import call, listed
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    store.upsert_session("s1")
+    store.add_interactions("s1", [listed(), call("read_doc", {"doc_id": "d"})], authenticated=True)
+    asp_id = store.load_asp(json.dumps(asp(listeners=[DEMO_LISTENER])).encode())["asp_id"]
+    alignment = store.make_baseline(asp_id, "v1.0")["alignment_version"]
+    proposal = store.propose_guardrail(alignment["alignment_version_id"])
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        token = Path(f"{database}.token").read_text().strip()
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            shown = card.locator(".guardrail-proposal")
+            expect(shown).to_contain_text("Data actions allowed", timeout=TIMEOUT)
+            expect(shown).to_contain_text("mcp@docs.example.com/mcp__read_doc: read")
+            expect(shown.locator(".guardrail-blocked")).to_contain_text("mcp@docs.example.com/mcp__upload_file")
+            expect(shown.locator(".guardrail-blocked")).to_contain_text("upload")
+
+            # Adopt it as a v1 (an edit without the rule): the offer appears.
+            rules = {k: v for k, v in proposal["guardrail"]["rules"].items() if k != "data_actions"}
+            adopt = Request(f"{url}/api/alignments/{alignment['alignment_version_id']}/guardrail",
+                            data=json.dumps({"rules": rules}).encode(), method="POST",
+                            headers={"Content-Type": "application/json", "X-RailDash-Token": token})
+            with urlopen(adopt, timeout=5) as response:
+                assert response.status == 201
+            offer = card.locator(".guardrail-data-actions-offer")
+            expect(offer).to_contain_text("Add data actions", timeout=TIMEOUT)
+            offer.locator("summary", has_text="Show the proposal").click()
+            expect(offer).to_contain_text("mcp@docs.example.com/mcp__read_doc: read", timeout=TIMEOUT)
+            offer.get_by_role("button", name="Add data actions").click()
+            expect(card.locator(".guardrail-data-actions-offer")).to_have_count(0, timeout=TIMEOUT)
+            card.locator(".guardrail-active-policy > summary").click()
+            expect(card.locator(".guardrail-active-policy")).to_contain_text("Data actions allowed")
+            expect(card.locator('.guardrail-rules [data-rule="data_actions"]')).to_have_count(1)
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
