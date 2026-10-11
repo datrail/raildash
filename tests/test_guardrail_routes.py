@@ -89,6 +89,7 @@ WRITES = [
     ("/api/guardrails/agt-x/turn-off", None),
     ("/api/guardrail-rows/1/acknowledge", None),
     ("/api/guardrail-rows/1/allow", None),
+    ("/api/guardrails/agt-x/allow-rows", {"row_ids": [1]}),
     ("/api/guardrails/agt-x/offers/allow", {"kind": "host", "value": "a.example"}),
     ("/api/guardrails/agt-x/offers/dismiss", {"kind": "host", "value": "a.example"}),
 ]
@@ -221,3 +222,36 @@ def test_a_row_id_outside_sqlites_range_is_refused_not_a_server_error(client):
     for path in ("acknowledge", "allow"):
         res = client.post(f"/api/guardrail-rows/{2**70}/{path}", headers=auth())
         assert res.status_code == 422
+
+
+def test_allow_all_over_http_is_one_version_or_none(client):
+    ref, g1 = adopted(client)
+    for host in ("a.example.net", "b.example.net", "c.example.net"):
+        post_capture(client, host)
+    found = by_item(detail(client, ref))
+    hosts = ("a.example.net", "b.example.net", "c.example.net")
+    ids = [found[("uploads", host)]["row_id"] for host in hosts]
+    assert all(found[("uploads", host)]["allowable"] for host in hosts)
+    path = f"/api/guardrails/{ref}/allow-rows"
+
+    for body in ({}, {"row_ids": []}, {"row_ids": "1"}, {"row_ids": [True]}, {"row_ids": [0]},
+                 {"row_ids": [2**70]}, [1]):
+        assert client.post(path, json=body, headers=auth()).status_code == 422, body
+    listener = found[("service_ports", "tcp/127.0.0.1/8443")]["row_id"]
+    res = client.post(path, json={"row_ids": [*ids, listener]}, headers=auth())
+    assert res.status_code == 409 and "one rule" in res.json()["detail"]
+    assert len(detail(client, ref)["versions"]) == 1
+
+    res = client.post(path, json={"row_ids": ids}, headers=auth())
+    assert res.status_code == 201, res.text
+    assert res.json()["guardrail"]["version"] == "g2"
+    body = detail(client, ref)
+    assert [v["guardrail"]["version"] for v in body["versions"]] == ["g2", "g1"]
+    after = by_item(body)
+    assert not any(after[("uploads", host)]["counts"] for host in hosts)
+    assert all(after[("out_of_spec_calls", host)]["counts"] for host in hosts)
+    assert body["events"][0]["action"] == "allow_rows"
+    assert body["events"][0]["detail"]["items"] == list(hosts)
+    # The same rows again no longer count: refused, nothing created.
+    assert client.post(path, json={"row_ids": ids}, headers=auth()).status_code == 409
+    assert len(detail(client, ref)["versions"]) == 2

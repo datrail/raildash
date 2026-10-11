@@ -61,6 +61,13 @@ Where the design is silent this module chooses:
   MCP name and an upload over a size cap; the cap is changed by an edit.
 - **Allow this** and **Dismiss** on a declared offer need the offer to be
   current, so a stale page can't record a choice nobody was shown.
+- **Allow all** (DR-202) allows several of one rule's counting rows in one
+  version, so allowing nine rows is one version, not g2...g10. It takes the
+  row ids the page showed, not "every row of the rule", so it allows exactly
+  what the user saw: a row that arrived since isn't allowed unseen. It is
+  all or nothing: if any id isn't a counting row of this agent's rule that
+  Allow this could allow, nothing is created. Each row reports whether one
+  click can allow it (`allowable`), so the page offers only those.
 - A hook that fails is rolled back to a savepoint, so the evidence it was
   judging is still stored and drift still runs. It fails closed: which agent
   the evidence belonged to may be what failed, so every rule of every agent
@@ -87,7 +94,7 @@ import sys
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from .asp import parse_bundle
 
@@ -203,6 +210,20 @@ def _setting(name: str, default: int) -> int:
 
 def _instant(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _one_click_allowable(rules: Mapping[str, Any] | None, row: Mapping[str, Any]) -> bool:
+    """Whether **Allow this** on `row` would succeed against the version in
+    force (`rules`; None with no guardrail): the server's own answer, so the
+    page needn't mirror every refusal, an upload over a size cap included.
+    **Allow all** (DR-202) offers exactly these rows."""
+    if rules is None or row["overflow"] or row["allowed_by"] is not None:
+        return False
+    try:
+        g.with_item_allowed(rules, row)
+    except ValueError:
+        return False
+    return True
 
 
 def _merged_detail(rule: str, old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str, Any]:
@@ -814,6 +835,65 @@ class GuardrailCustody:
             )
             return self._version_view(created, active=True)
 
+    def allow_guardrail_rows(self, ref: str, row_ids: Sequence[int]) -> dict[str, Any]:
+        """**Allow all** on one rule's rows (DR-202): one new version that
+        allows every listed row's item, as **Allow this** would one by one,
+        recorded once in the history with the items it added.
+
+        All or nothing: every id must be a distinct row of this agent, of
+        one rule, that counts under the version in force and that Allow this
+        could allow; otherwise `ValueError` and no version is created. A
+        stale page (a row allowed or acknowledged since) is refused rather
+        than half-applied, and the user reloads and sees what is left."""
+        with self._write_transaction():
+            kind, value = self._resolve_agent_ref(ref)
+            active = self._active_guardrail_row(kind, value)
+            if active is None:
+                raise ValueError("this agent has no active guardrail")
+            if not row_ids:
+                raise ValueError("no rows to allow")
+            if len(set(row_ids)) != len(row_ids):
+                raise ValueError("a row is listed more than once")
+            contract = json.loads(active["contract_json"])
+            rules = contract["rules"]
+            rule = None
+            items = []
+            for row_id in row_ids:
+                row = self._db.execute(
+                    "SELECT * FROM guardrail_rows WHERE row_id = ? AND identity_kind = ? "
+                    "AND identity_value = ?",
+                    (row_id, kind, value),
+                ).fetchone()
+                # Another agent's row is refused like a missing one, so the
+                # answer says nothing about rows outside this agent.
+                if row is None:
+                    raise ValueError(f"row {row_id} is not one of this agent's rows")
+                if rule is None:
+                    rule = row["rule"]
+                elif row["rule"] != rule:
+                    raise ValueError("Allow all takes the rows of one rule")
+                view = self._row_view(row)
+                if not g.row_counts(contract, view):
+                    raise ValueError(f"row {row_id} no longer counts; reload to see what is left")
+                try:
+                    # Refused exactly where Allow this on the version in
+                    # force refuses; then folded into the version being
+                    # built, skipping an item an earlier row already covers
+                    # so no entry is listed twice.
+                    g.with_item_allowed(contract["rules"], view)
+                    if not g.item_allowed({"rules": rules}, view):
+                        rules = g.with_item_allowed(rules, view)
+                except ValueError as exc:
+                    raise ValueError(f"row {row_id} ({row['item']}): {exc}") from exc
+                items.append(row["item"])
+            created = self._create_version_locked(
+                kind, value, rules,
+                derived_from=contract["derived_from"]["alignment_version_id"],
+                created_by="allow_rows",
+                detail={"rule": rule, "row_ids": list(row_ids), "items": items},
+            )
+            return self._version_view(created, active=True)
+
     def choose_declared(self, ref: str, kind_of_item: str, item: str, *, allow: bool) -> dict[str, Any]:
         """**Allow this** (`allow=True`) or **Dismiss** on a *declared since
         gN* offer: a new version that records it as shown, and allows it
@@ -947,6 +1027,9 @@ class GuardrailCustody:
         with self._lock:
             kind, value = self._resolve_agent_ref(ref)
             summary, active, rows = self._state_locked(kind, value, now)
+            in_force = json.loads(active["contract_json"])["rules"] if active is not None else None
+            for row in rows:
+                row["allowable"] = _one_click_allowable(in_force, row)
             versions = [
                 self._version_view(row, active=active is not None
                                    and row["guardrail_version_id"] == active["guardrail_version_id"])

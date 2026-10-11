@@ -280,6 +280,7 @@ token, including both reads:
 | `POST /api/guardrails/{agent_ref}/turn-off` | Turn off (No guardrail) |
 | `POST /api/guardrail-rows/{row_id}/acknowledge` | Acknowledge a row; a later hit re-opens it |
 | `POST /api/guardrail-rows/{row_id}/allow` | Allow this: a new version that allows the row's item |
+| `POST /api/guardrails/{agent_ref}/allow-rows` `{"row_ids": [...]}` | Allow all: one new version that allows several of one rule's rows; all or nothing |
 | `POST /api/guardrails/{agent_ref}/offers/allow` or `.../dismiss` `{"kind": "host", "value": "..."}` | Allow or dismiss a newly declared host or MCP server |
 
 The proposal allows each written path of the baseline exactly, plus one
@@ -341,7 +342,11 @@ are `raildash.guardrail_store`, served by the routes under "HTTP: the Data
 Guardrail" above. The dashboard's Data Guardrail panel, beside the alignment
 panel, shows each agent's state and rows and offers every action: adopt the
 proposal (as is or edited), Allow this, Acknowledge, Allow or Dismiss a
-declared host, Edit, Switch and Turn off.
+declared host, Edit, Switch and Turn off. Where two or more of a rule's
+counting rows can be allowed with one click, **Allow all N** allows them in
+one version instead of one per row; rows it can't allow (the overflow row,
+a request with no host, a wildcard host, a tool name with no MCP server, an
+upload over a size cap) stay, and the panel says how many.
 
 Run `make asp-acceptance` for the deterministic replay, controlled-drift,
 version-switch, and incompatible-rule-pack flow. The clean-build and live demo

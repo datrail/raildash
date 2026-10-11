@@ -406,6 +406,41 @@ paths:
         '409': {description: The row can't be allowed with one click (overflow, unknown or wildcard host, over a size cap) or no guardrail is active}
         '422': {description: row_id outside 1..2^63-1, or the version this would create breaks the guardrail contract (e.g. an over-long host or path)}
 
+  /api/guardrails/{agent_ref}/allow-rows:
+    post:
+      operationId: allowGuardrailRows
+      summary: Allow all - one new version that allows several of one rule's rows
+      description: >-
+        Token-gated (DR-202). Allows every listed row's item, as Allow this
+        would one by one, in one version, recorded once in the history with
+        the items it added. Send the rows the page showed: each must be a
+        distinct, counting row of this agent, all of one rule, that Allow
+        this could allow (the detail's `allowable`). All or nothing - if any
+        isn't, 409 and no version is created.
+      parameters:
+        - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [row_ids]
+              properties:
+                row_ids:
+                  type: array
+                  minItems: 1
+                  uniqueItems: true
+                  items: {type: integer, minimum: 1, maximum: 9223372036854775807}
+      responses:
+        '201': {description: The new version, now active}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such agent}
+        '409': {description: "A row isn't this agent's, doesn't count, is of another rule, is listed twice or can't be allowed with one click; or no guardrail is active. Nothing was created"}
+        '413': {description: Body larger than the guardrail body limit}
+        '422': {description: row_ids missing, empty or not row ids, or the version this would create breaks the guardrail contract}
+
   /api/guardrails/{agent_ref}/offers/allow:
     post:
       operationId: allowDeclaredOffer

@@ -462,6 +462,7 @@ code { font-family: var(--mono); }
 .guardrail-table th { color: var(--ink-faint); font-weight: 500; }
 .guardrail-table tr[data-counts="true"] .guardrail-row-status { color: var(--fail); }
 .guardrail-row-actions, .guardrail-action { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.guardrail-allow-all { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 11.5px; }
 .guardrail-policy {
   display: grid; grid-template-columns: max-content minmax(0, 1fr);
   gap: 3px 12px; margin: 0; font: 11px var(--mono);
