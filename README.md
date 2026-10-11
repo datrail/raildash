@@ -282,6 +282,15 @@ token, including both reads:
 | `POST /api/guardrail-rows/{row_id}/allow` | Allow this: a new version that allows the row's item |
 | `POST /api/guardrails/{agent_ref}/offers/allow` or `.../dismiss` `{"kind": "host", "value": "..."}` | Allow or dismiss a newly declared host or MCP server |
 
+The proposal allows each written path of the baseline exactly, plus one
+glob it always shows: `**/__pycache__/*.pyc`, Python's bytecode caches.
+Any Python process writes those for the modules it imports, so without it
+every new Python command in the agent would be a `saved_files` row. Remove
+it before adopting if you want those writes judged; a file named like a
+bytecode cache in a `__pycache__` directory isn't flagged while it's there.
+A guardrail adopted before RailDash seeded this line doesn't have it;
+**Edit** adds it.
+
 `RAILDASH_GUARDRAIL_MAX_OPEN_ROWS` (default 1000) caps the unacknowledged
 rows per agent before further items count in one overflow row, and
 `RAILDASH_GUARDRAIL_ACK_RETENTION_DAYS` (default 30) is how long an

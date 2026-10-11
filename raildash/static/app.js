@@ -1082,9 +1082,13 @@ function describePort(entry) {
   return `${entry.protocol}/${entry.addr || "any address"}/${entry.port}`;
 }
 
+// The glob every proposal seeds (raildash.guardrail.BYTECODE_CACHE_ENTRY).
+const BYTECODE_CACHE_PATH = "**/__pycache__/*.pyc";
+
 function describeSavedFile(entry) {
   const kinds = entry.kinds ? ` (${entry.kinds.join(", ")})` : "";
-  return `${entry.path}${entry.literal ? " (exact)" : ""}${kinds}`;
+  const bytecode = !entry.literal && entry.path === BYTECODE_CACHE_PATH ? " (Python bytecode caches)" : "";
+  return `${entry.path}${entry.literal ? " (exact)" : ""}${kinds}${bytecode}`;
 }
 
 // What a version allows, rule by rule, in words.
@@ -1217,7 +1221,7 @@ function renderGuardrailProposal(proposal, refresh) {
     return section;
   }
   section.append(el("p", "muted",
-    "Proposed from the locked baseline: what it already did is allowed, and nothing is " +
+    "Proposed from the locked baseline: what it already did is allowed (plus Python's bytecode caches), and nothing is " +
     "checked until you adopt it. Every line is shown so you can see what it approves."));
   section.append(renderGuardrailPolicy(proposal.guardrail.rules));
   const emptyBecause = Object.entries(proposal.empty_because || {});
@@ -1226,7 +1230,10 @@ function renderGuardrailProposal(proposal, refresh) {
     emptyBecause.forEach(([where, why]) => {
       const reason = why.reason || why.status || "NOT_COLLECTED";
       notes.append(el("li", "muted",
-        `${where} is empty: ${guardrailReason(reason)}${why.note ? ` (${why.note})` : ""}`));
+        // saved_files always holds the bytecode-cache glob; what's missing
+        // is the baseline's own written paths.
+        `${where} ${where === "saved_files.allowed" ? "has no path from the baseline" : "is empty"}: ` +
+        `${guardrailReason(reason)}${why.note ? ` (${why.note})` : ""}`));
     });
     section.append(notes);
   }

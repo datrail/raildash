@@ -1188,6 +1188,20 @@ def row_counts(guardrail: Mapping[str, Any] | None, row: Mapping[str, Any]) -> b
 # ---------------------------------------------------------------- proposal
 
 
+# The one glob a proposal seeds (DR-201): Python's bytecode caches. Every
+# Python process writes `__pycache__/<module>.<tag>.pyc` for each module it
+# imports that has none yet, so seeding only the baseline's literal paths
+# made any new Python run (`python3 -m http.server`, a one-line `python3 -c`)
+# a saved_files row per directory, and each rename's random temp name a
+# new one (RailMon folds those to `<dir>/__pycache__/*.pyc`). The file is
+# the interpreter's cache of code it imported, not data the agent saved.
+# It is a shown line of the proposal like any other, so a user who wants
+# those writes judged removes it before adopting. The price: an agent that
+# hides data in a file named like a bytecode cache, in a __pycache__
+# directory, isn't flagged under it.
+BYTECODE_CACHE_ENTRY: dict[str, Any] = {"path": "**/__pycache__/*.pyc"}
+
+
 def propose_guardrail(
     alignment: Mapping[str, Any],
     bundle: Mapping[str, Any],
@@ -1208,8 +1222,10 @@ def propose_guardrail(
     the agent already did, so everything that would be a violation under
     the proposal (the baseline's listeners, undeclared hosts and MCP servers
     it called) is listed for the user to allow with one click, and a
-    declared list left empty says why. A multi-agent baseline gets no
-    proposal (`reason: MULTI_AGENT`).
+    declared list left empty says why. `saved_files` is the baseline's
+    written paths, each exact, after `BYTECODE_CACHE_ENTRY`, the one glob
+    seeded (a written path it already allows isn't listed again). A
+    multi-agent baseline gets no proposal (`reason: MULTI_AGENT`).
     """
     if is_multi_agent(bundle):
         return {"guardrail": None, "would_be_violations": [], "empty_because": {}, "reason": MULTI_AGENT}
@@ -1231,10 +1247,10 @@ def propose_guardrail(
             upload_hosts.add(host)
 
     files = attributes.get(FILE_ACCESS_ATTRIBUTE) or {}
-    saved: list[dict[str, Any]] = []
+    saved: list[dict[str, Any]] = [dict(BYTECODE_CACHE_ENTRY)]
     if files.get("status") in ("ANSWERED", "PARTIAL") and isinstance(files.get("value"), list):
         for path in sorted({entry["path"] for entry in files["value"] if entry["write"]}):
-            if not kernel_interface_path(path):
+            if not kernel_interface_path(path) and not saved_file_allowed(path, [BYTECODE_CACHE_ENTRY]):
                 saved.append({"path": path, "literal": True})
     elif files.get("status") != "ABSENT":
         empty_because["saved_files.allowed"] = _why_empty(files)

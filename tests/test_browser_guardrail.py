@@ -89,6 +89,8 @@ def test_the_guardrail_panel_drives_every_action(tmp_path):
             proposal = card.locator(".guardrail-proposal")
             expect(proposal).to_contain_text("Adopt a guardrail for this agent?")
             expect(proposal.locator(".guardrail-would-be")).to_contain_text("tcp/127.0.0.1/8443")
+            # The one seeded glob says what it is for (DR-201).
+            expect(proposal).to_contain_text("**/__pycache__/*.pyc (Python bytecode caches)")
 
             # Adopt → Violated by that listener.
             proposal.get_by_role("button", name="Adopt", exact=True).click()
