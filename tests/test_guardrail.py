@@ -860,7 +860,8 @@ def test_a_proposal_from_answered_declarations(store):
         "allowed_hosts": ["api.anthropic.com", "api.openai.com", "host.openshell.internal"],
         "max_request_bytes": {}, "denied_tool_calls": [],
     }
-    assert rules["saved_files"] == {"allowed": [{"path": "/app/agent.log", "literal": True},
+    assert rules["saved_files"] == {"allowed": [g.BYTECODE_CACHE_ENTRY,
+                                                {"path": "/app/agent.log", "literal": True},
                                                 {"path": "/tmp/tmp*", "literal": True}]}
     assert rules["service_ports"] == {"allowed": []}
     assert rules["out_of_spec_calls"] == {
@@ -887,6 +888,27 @@ def test_a_proposal_from_answered_declarations(store):
     assert [v["item"] for v in result["rules"]["service_ports"]["violations"]] == ["tcp/127.0.0.1/8443"]
 
 
+def test_a_proposal_allows_python_bytecode_caches_with_one_shown_glob(store):
+    """DR-201: every Python run writes bytecode caches for the modules it
+    imports, which RailMon reports folded per directory. The proposal seeds
+    one glob for them, and lists no baseline path it already allows."""
+    cache = "/usr/local/lib/python3.13/__pycache__/*.pyc"
+    alignment, bundle = _lock(store, v1_bundle(observed_file_access=observed(
+        [_file(cache), _file("/app/agent.log")], method=FILE_METHOD)))
+    rules = _propose(alignment, bundle, [])["guardrail"]["rules"]
+    assert rules["saved_files"]["allowed"] == [g.BYTECODE_CACHE_ENTRY, {"path": "/app/agent.log", "literal": True}]
+    allowed = rules["saved_files"]["allowed"]
+    # A cache in a directory the baseline never wrote to, folded or not yet.
+    for path in ("/usr/local/lib/python3.13/importlib/__pycache__/*.pyc", "/__pycache__/*.pyc",
+                 "/app/.venv/lib/python3.13/site-packages/x/__pycache__/y.cpython-313.opt-1.pyc"):
+        assert g.saved_file_allowed(path, allowed), path
+    # Nothing else: not outside __pycache__, not another extension, not the
+    # unfolded temp name, not a directory merely named like one.
+    for path in ("/data/report.pyc", "/app/__pycache__/notes.txt", "/app/__pycache__/x.pyc.1234",
+                 "/app/__pycache__x/y.pyc", "/app/__pycache__/sub/y.pyc"):
+        assert not g.saved_file_allowed(path, allowed), path
+
+
 def test_a_proposal_from_absent_declarations_says_why_its_lists_are_empty(store):
     # The real fixture as RailMon wrote it: no MCP config, no base URL.
     alignment, bundle = _lock(store, v1_bundle())
@@ -895,7 +917,7 @@ def test_a_proposal_from_absent_declarations_says_why_its_lists_are_empty(store)
     assert rules["uploads"]["allowed_hosts"] == []
     assert rules["out_of_spec_calls"]["allowed_hosts"] == []
     assert rules["out_of_spec_calls"]["allowed_mcp_servers"] == []
-    assert rules["saved_files"]["allowed"] == []
+    assert rules["saved_files"]["allowed"] == [g.BYTECODE_CACHE_ENTRY]
     assert {where: (why["status"], why["reason"]) for where, why in proposal["empty_because"].items()} == {
         "saved_files.allowed": (None, "NOT_COLLECTED"),
         "out_of_spec_calls.allowed_hosts": ("ABSENT", None),
@@ -933,7 +955,7 @@ def test_a_proposal_from_a_single_agent_v2_baseline_reads_both_scopes(store):
     proposal = _propose(alignment, bundle, [])
     rules = proposal["guardrail"]["rules"]
     assert rules["out_of_spec_calls"]["allowed_hosts"] == ["api.openai.com"]
-    assert rules["saved_files"]["allowed"] == [{"path": "/app/agent.log", "literal": True}]
+    assert rules["saved_files"]["allowed"] == [g.BYTECODE_CACHE_ENTRY, {"path": "/app/agent.log", "literal": True}]
     assert [v["item"] for v in proposal["would_be_violations"]] == ["tcp/127.0.0.1/8443"]
 
 
