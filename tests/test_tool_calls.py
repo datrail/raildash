@@ -464,3 +464,44 @@ def test_a_requested_call_through_an_untrusted_host_is_held_to_the_trusted_schem
     [row] = store.data_action_rows(["session:s1"])
     assert row["undeclared"] == ["notes"] and "upload" in row["actions"]
     store.close()
+
+
+def _asp_with_servers(store, servers, bundle_id="bnd-da"):
+    from test_guardrail import declared, v1_bundle
+
+    status = "ANSWERED" if servers is not None else "ABSENT"
+    bundle = v1_bundle(mcp_servers_declared=declared(servers, status))
+    bundle["bundle_id"] = bundle_id
+    store.load_asp(json.dumps(bundle, sort_keys=True).encode())
+
+
+def test_a_real_asp_declaring_a_server_lines_it_up(tmp_path):
+    store = new_store(tmp_path)
+    _asp_with_servers(store, [{"name": "docs", "url": "https://docs.example.com/mcp", "transport": "http"},
+                              {"name": "x__read", "url": "https://other.example.com/mcp", "transport": "http"}])
+    listed(store)
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": {"name": "read_doc", "arguments": {"doc_id": "a"}}}))
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                         "params": {"name": "upload_file", "arguments": {"content": PNG}}},
+                        host="other.example.com"))
+    add(store, model_turn({"content": [{"type": "tool_use", "name": "plain_tool", "input": {}}]}))
+    tools = {r["tool"] for r in store.data_action_rows(["session:s1"])}
+    assert "mcp__docs__read_doc" in tools
+    # A declared name with `__` isn't lined up: its endpoint keeps mcp@.
+    assert "mcp@other.example.com/mcp__upload_file" in tools
+    assert "plain_tool" in tools
+    assert store.observed_profile("s1")["observed"]["data_actions"]
+    store.close()
+
+
+def test_a_real_asp_with_no_declared_servers_changes_nothing(tmp_path):
+    store = new_store(tmp_path)
+    _asp_with_servers(store, None)
+    listed(store)
+    add(store, model_turn({"content": [{"type": "tool_use", "name": "read_doc", "input": {}}]}))
+    add(store, mcp_call({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                         "params": {"name": "read_doc", "arguments": {"doc_id": "a"}}}))
+    tools = {r["tool"] for r in store.data_action_rows(["session:s1"])}
+    assert tools == {"read_doc", "mcp@docs.example.com/mcp__read_doc"}
+    store.close()

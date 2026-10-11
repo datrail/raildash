@@ -295,9 +295,9 @@ class DataActionsStore:
                     host = g._url_host(endpoint.get("value"))
                     if host:
                         hosts.add(host)
-                servers = attributes.get("mcp_servers_declared") or {}
-                if servers.get("status") == "ANSWERED" and isinstance(servers.get("value"), list):
-                    for server in servers["value"]:
+                declared = attributes.get("mcp_servers_declared") or {}
+                if declared.get("status") == "ANSWERED" and isinstance(declared.get("value"), list):
+                    for server in declared["value"]:
                         url = server.get("url") if isinstance(server, dict) else None
                         if isinstance(url, str) and url:
                             parts = urlsplit(url)
@@ -306,8 +306,15 @@ class DataActionsStore:
                             )
                             endpoints.add(endpoint)
                             name = server.get("name")
-                            if isinstance(name, str) and name:
-                                servers.setdefault(endpoint, g.normalize_mcp_server(name))
+                            normalized = g.normalize_mcp_server(name) if isinstance(name, str) else ""
+                            # The name is the agent's own writing: one with
+                            # `__` would split differently from a tool name
+                            # and lend its words to the tool's (§5), so it
+                            # isn't lined up and the endpoint keeps `mcp@`.
+                            # Global, like the trusted hosts (single-user):
+                            # the first agent's name for an endpoint wins.
+                            if normalized and "__" not in normalized:
+                                servers.setdefault(endpoint, normalized)
             except Exception:  # noqa: BLE001 - an unreadable ASP adds nothing
                 continue
         facts = {"inference_hosts": hosts, "mcp_endpoints": endpoints, "servers": servers}
