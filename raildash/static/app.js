@@ -1714,9 +1714,54 @@ async function loadOverview() {
   renderHosts(data.hosts || []);
 }
 
+// DR-203: a profile list shows its first PROFILE_CHIP_CAP chips, and a
+// button under it shows the rest. A Python agent's kernel-observed files are
+// hundreds of stdlib reads, and drawn in full they made the page about
+// 8,800 px tall. Nothing is dropped: every chip is in the page, the rest are
+// only hidden until asked for. Each list is already ordered so the ones
+// worth seeing come first (written and run files ahead of files only read,
+// then by count), so the cap hides the long tail, not the interesting part.
+const PROFILE_CHIP_CAP = 20;
+// Which lists the user opened, by key, so the five-second poll's redraw
+// leaves them open. Cleared when the profile is of another session or agent.
+const profileExpanded = new Set();
+let profileExpandedScope = null;
+let profileListSerial = 0;
+
+// Puts `chips` into `values`, all but the first PROFILE_CHIP_CAP hidden
+// unless the list `key` was opened, and returns the show-all button (null
+// when everything fits) for the caller to place after the list.
+function cappedChips(values, chips, key, noun) {
+  chips.forEach((chip) => values.append(chip));
+  if (chips.length <= PROFILE_CHIP_CAP) return null;
+  values.id = values.id || `profile-list-${++profileListSerial}`;
+  const rest = chips.slice(PROFILE_CHIP_CAP);
+  const toggle = el("button", "btn btn-quiet profile-more");
+  toggle.type = "button";
+  toggle.dataset.key = key;
+  toggle.setAttribute("aria-controls", values.id);
+  const draw = (open) => {
+    rest.forEach((chip) => { chip.hidden = !open; });
+    toggle.setAttribute("aria-expanded", String(open));
+    toggle.textContent = open
+      ? "Show fewer"
+      : `Show all ${fmtInt(chips.length)} ${noun} (${fmtInt(rest.length)} more)`;
+  };
+  toggle.addEventListener("click", () => {
+    const open = !profileExpanded.has(key);
+    if (open) profileExpanded.add(key);
+    else profileExpanded.delete(key);
+    draw(open);
+  });
+  draw(profileExpanded.has(key));
+  return toggle;
+}
+
 // One profile dimension: a heading, an optional note, and a chip per value
 // with its count, or "None observed".
-function profileGroup(title, items, { className, note, chipClass = "profile-chip", count }) {
+function profileGroup(title, items, {
+  className, note, chipClass = "profile-chip", count, noun = "values",
+}) {
   const group = el("section", className ? `profile-group ${className}` : "profile-group");
   group.append(el("h3", null, title));
   if (note) group.append(el("p", "note", note));
@@ -1724,22 +1769,25 @@ function profileGroup(title, items, { className, note, chipClass = "profile-chip
   if (!items.length) {
     values.append(el("span", "muted", "None observed"));
   }
-  items.forEach((item) => {
+  const chips = items.map((item) => {
     const chip = el("span", chipClass);
     chip.append(el("span", "profile-value", item.value));
     chip.append(el("span", "profile-count", count(item)));
-    values.append(chip);
+    return chip;
   });
+  const toggle = cappedChips(values, chips, `group:${title}`, noun);
   group.append(values);
+  if (toggle) group.append(toggle);
   return group;
 }
 
-function profileValues(title, items) {
-  return profileGroup(title, items, { count: (item) => item.count });
+function profileValues(title, items, noun) {
+  return profileGroup(title, items, { count: (item) => item.count, noun });
 }
 
 function profileUploads(title, items) {
   return profileGroup(title, items, {
+    noun: "hosts",
     chipClass: "profile-chip profile-chip-stacked",
     count: (item) =>
       `${fmtInt(item.count)} calls · ${fmtBytes(item.total_bytes)} · largest ${fmtBytes(item.max_bytes)}`,
@@ -1753,9 +1801,10 @@ function fileOps(item) {
   return parts.join(" · ");
 }
 
-function profileFiles(title, items, className) {
+function profileFiles(title, items, className, noun = "files") {
   return profileGroup(title, items, {
     className,
+    noun,
     note: "Asked of file tools in the captured conversation; not a filesystem trace.",
     count: fileOps,
   });
@@ -1765,7 +1814,6 @@ function profileFiles(title, items, className) {
 // for. It comes from RailMon's ASPs, not this capture, so it carries its own
 // provenance (which sandbox, which ASP, when) and its evidence class, and is
 // never merged into the asked list above it.
-const MAX_KERNEL_FILE_CHIPS = 100;
 const EVIDENCE_STATUS = {
   ANSWERED: ["●", "pill-ok"],
   PARTIAL: ["◐", "pill-warn"],
@@ -1820,21 +1868,23 @@ function kernelFileSource(source) {
       ? "No regular file opened in the window"
       : "No files listed"));
   }
-  // Written and run files first: they are the ones a baseline drifts on.
+  // Written and run files first: they are the ones a baseline drifts on,
+  // and they stay in view when the list is capped. The ASP's list is at most
+  // 512 entries (the bundle schema's maxItems), so all of them go in the
+  // page, the rest behind the show-all button.
   const ranked = [...files].sort((a, b) =>
     Number(b.write === true || b.exec === true) - Number(a.write === true || a.exec === true) ||
     String(a.path).localeCompare(String(b.path)));
-  ranked.slice(0, MAX_KERNEL_FILE_CHIPS).forEach((entry) => {
+  const chips = ranked.map((entry) => {
     const chip = el("span", "profile-chip kernel-file-chip");
     chip.append(el("span", "profile-value", fileLabel(entry)));
     chip.append(el("span", "profile-count", kernelFileOps(entry)));
-    values.append(chip);
+    return chip;
   });
-  if (ranked.length > MAX_KERNEL_FILE_CHIPS) {
-    values.append(el("span", "muted",
-      `+${fmtInt(ranked.length - MAX_KERNEL_FILE_CHIPS)} more files in the ASP`));
-  }
+  const toggle = cappedChips(values, chips,
+    `kernel:${source.subject.host_id}/${source.subject.sandbox_name}`, "files");
   block.append(values);
+  if (toggle) block.append(toggle);
   return block;
 }
 
@@ -1886,9 +1936,8 @@ async function loadKernelFiles(sessionId, agentKey) {
 async function loadProfile() {
   const grid = $("profile-grid");
   const download = $("profile-download");
-  grid.replaceChildren();
   if (!state.sessionId) {
-    grid.append(el("p", "muted", "Select a captured session."));
+    grid.replaceChildren(el("p", "muted", "Select a captured session."));
     download.setAttribute("aria-disabled", "true");
     download.removeAttribute("href");
     return;
@@ -1904,6 +1953,20 @@ async function loadProfile() {
   // of the profile rather than showing a loading state of its own.
   const [kernelFiles, kernelError] = await loadKernelFiles(state.sessionId, agentKey);
   const observed = profile.observed || {};
+  // The lists the user opened stay open across the poll's redraw, but not
+  // into another session's or agent's profile.
+  const scope = `${state.sessionId}|${agentKey}`;
+  if (scope !== profileExpandedScope) {
+    profileExpanded.clear();
+    profileExpandedScope = scope;
+  }
+  // Drawn into a fragment and swapped in at once, after the fetches: the
+  // grid is never left empty while they run, and a show-all button that had
+  // focus gets it back after the redraw instead of dropping it on the body.
+  const focused = grid.contains(document.activeElement) && document.activeElement.dataset.key
+    ? document.activeElement.dataset.key
+    : null;
+  const view = document.createDocumentFragment();
   download.href = staticDemo ? "./profile.json" : path;
   download.removeAttribute("aria-disabled");
 
@@ -1925,22 +1988,28 @@ async function loadProfile() {
   // let a column of "None observed" read as a failure.
   if (observed.interaction_count && !(observed.models || []).length &&
       !(observed.tool_names || []).length && !(observed.content_kinds || []).length) {
-    grid.append(el("p", "note profile-no-model-calls",
+    view.append(el("p", "note profile-no-model-calls",
       "No captured call names a model, so Tools, Models, Uploaded content and the files " +
       "asked of tools have nothing to show. That is expected for an agent that makes no " +
       "model API calls, such as the demo agent; Hosts and Methods still describe its traffic."));
   }
-  grid.append(facts);
-  grid.append(profileValues("Hosts", observed.hosts || []));
-  grid.append(profileValues("Methods", observed.methods || []));
-  grid.append(profileValues("Tools", observed.tool_names || []));
-  grid.append(profileValues("Models", observed.models || []));
-  grid.append(profileValues("Uploaded content", observed.content_kinds || []));
-  grid.append(profileValues("Request content types", observed.request_media_types || []));
-  grid.append(profileUploads("Bytes sent per host", observed.upload_bytes || []));
-  grid.append(profileFiles("Files · asked", observed.file_access || [], "profile-files-asked"));
-  grid.append(profileKernelFiles(kernelFiles, kernelError));
-  grid.append(profileFiles("File types", observed.file_types || []));
+  view.append(facts);
+  view.append(profileValues("Hosts", observed.hosts || [], "hosts"));
+  view.append(profileValues("Methods", observed.methods || [], "methods"));
+  view.append(profileValues("Tools", observed.tool_names || [], "tools"));
+  view.append(profileValues("Models", observed.models || [], "models"));
+  view.append(profileValues("Uploaded content", observed.content_kinds || [], "kinds"));
+  view.append(profileValues("Request content types", observed.request_media_types || [], "content types"));
+  view.append(profileUploads("Bytes sent per host", observed.upload_bytes || []));
+  view.append(profileFiles("Files · asked", observed.file_access || [], "profile-files-asked"));
+  view.append(profileKernelFiles(kernelFiles, kernelError));
+  view.append(profileFiles("File types", observed.file_types || [], undefined, "file types"));
+  grid.replaceChildren(view);
+  if (focused) {
+    const target = [...grid.querySelectorAll("button[data-key]")]
+      .find((node) => node.dataset.key === focused);
+    if (target) target.focus();
+  }
 }
 
 function changedValues(before, after) {
