@@ -575,17 +575,19 @@ class GuardrailCustody:
             self._check_asp_locked(active, newest[0]["asp_id"], bundle, kind, value, recheck=True)
 
     def _guardrail_on_request(
-        self, interaction: Mapping[str, Any], active: list[dict[str, Any]]
+        self, interaction: Mapping[str, Any], active: list[dict[str, Any]],
+        calls: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         """§4.5 "On request ingest": `uploads` and `out_of_spec_calls`
         against one newly stored authenticated request, in the transaction
         that stores it. `active` is `_active_guardrails()`, read once per
         batch. An unauthenticated request never reaches here (§4.1)."""
         with self._hook_guard("request"):
-            self._check_request_locked(interaction, active)
+            self._check_request_locked(interaction, active, calls)
 
     def _check_request_locked(
-        self, interaction: Mapping[str, Any], active: list[dict[str, Any]]
+        self, interaction: Mapping[str, Any], active: list[dict[str, Any]],
+        calls: Sequence[Mapping[str, Any]] = (),
     ) -> None:
         now = self._receive_time()
         owner = g.request_owner(interaction, active, authenticated=True)
@@ -604,12 +606,14 @@ class GuardrailCustody:
         when = g._instant(interaction.get("timestamp")) or _instant(now)
         if when < _instant(version["activated_at"]):
             return
-        result = g.evaluate_request(json.loads(version["contract_json"]), interaction)
+        contract = json.loads(version["contract_json"])
+        result = g.evaluate_request(contract, interaction)
         if not result["tool_calls"]["readable"]:
             self._mark(kind, value, MARK_TOOL_CALLS_UNREADABLE, now)
         self._record_violations(
             kind, value, version["guardrail_version_id"],
-            [*result["uploads"], *result["out_of_spec_calls"]], now,
+            [*result["uploads"], *result["out_of_spec_calls"],
+             *g.evaluate_data_actions(contract, calls, interaction)], now,
         )
 
     # ------------------------------------------------------------- custody
@@ -643,7 +647,12 @@ class GuardrailCustody:
         transaction."""
         version_id = f"grd-{uuid.uuid4()}"
         contract = {
-            "guardrail_contract_version": g.GUARDRAIL_CONTRACT_VERSION,
+            # DR-205: a version with the data_actions rule is a v2; one
+            # without stays v1, exactly as before.
+            "guardrail_contract_version": (
+                g.GUARDRAIL_CONTRACT_VERSION_V2 if g.DATA_ACTIONS in rules
+                else g.GUARDRAIL_CONTRACT_VERSION
+            ),
             "guardrail_version_id": version_id,
             "version": self._next_version_label(kind, value),
             "created_at": self._receive_time(),
@@ -1000,21 +1009,22 @@ class GuardrailCustody:
             last_tool_calls_unreadable_at=self._mark_at(kind, value, MARK_TOOL_CALLS_UNREADABLE),
             last_capture_refused_at=self.latest_capture_refusal_at(),
         )
-        rules = g.rule_states(asp_result, request_status)
+        names = g.contract_rules(contract)
+        rules = g.rule_states(asp_result, request_status, names)
         failed = self._mark_at(*EVERY_AGENT, MARK_CHECK_FAILED)
         if failed is not None and _instant(failed) >= _instant(active["activated_at"]):
             rules = {
                 rule: {"state": g.UNVERIFIED, "reason": g.CHECK_FAILED, "violations": []}
-                for rule in g.RULES
+                for rule in names
             }
         counting = [row for row in rows if row["counts"]]
         state = g.agent_state(
-            has_active_guardrail=True, rule_results=rules, counting_rows=len(counting),
+            has_active_guardrail=True, rule_results=rules, counting_rows=len(counting), rules=names,
         )
         summary = {
             "state": state,
             "rules": g.shown_rule_states(
-                rules, (row["rule"] for row in counting), overflow_rule=OVERFLOW_RULE
+                rules, (row["rule"] for row in counting), overflow_rule=OVERFLOW_RULE, rules=names,
             ),
         }
         return summary, active, rows

@@ -144,11 +144,38 @@ from . import store as _store
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "guardrail-version-v1.schema.json"
 SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text())
 _VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
+# DR-205: v2 adds the `data_actions` rule; every v1 rule is unchanged, and a
+# v1 version stays valid and is judged on its four rules.
+SCHEMA_V2_PATH = SCHEMA_PATH.with_name("guardrail-version-v2.schema.json")
+SCHEMA_V2: dict[str, Any] = json.loads(SCHEMA_V2_PATH.read_text())
+_VALIDATORS = {
+    1: _VALIDATOR,
+    2: Draft202012Validator(SCHEMA_V2, format_checker=FormatChecker()),
+}
 
 GUARDRAIL_CONTRACT_VERSION = SCHEMA["properties"]["guardrail_contract_version"]["const"]
+GUARDRAIL_CONTRACT_VERSION_V2 = SCHEMA_V2["properties"]["guardrail_contract_version"]["const"]
 RULES = ("uploads", "saved_files", "service_ports", "out_of_spec_calls")
+DATA_ACTIONS = "data_actions"
+RULES_V2 = (*RULES, DATA_ACTIONS)
 ASP_RULES = ("service_ports", "saved_files")
 REQUEST_RULES = ("uploads", "out_of_spec_calls")
+# `request_rules_status` answers for every request rule a version can have.
+ALL_REQUEST_RULES = (*REQUEST_RULES, DATA_ACTIONS)
+# Real actions (data_actions.ACTIONS) and the three a row can be about
+# without one: an unclassified tool, an unreadable call, and a tool its
+# endpoint never offered (data-actions design §4.4).
+DATA_ACTION_KINDS = ("read", "upload", "update", "delete", "execute")
+DATA_ACTION_PSEUDO = ("unclassified", "unreadable", "not_offered")
+# Tools the rule judges (design §2): MCP tools, local and provider-side.
+JUDGED_TOOL_PREFIXES = ("mcp__", "mcp@", "provider-mcp__")
+
+
+def contract_rules(contract: Mapping[str, Any] | None) -> tuple[str, ...]:
+    """The rules a version has: v1's four, and `data_actions` in v2."""
+    if contract is not None and DATA_ACTIONS in (contract.get("rules") or {}):
+        return RULES_V2
+    return RULES
 LISTENERS_ATTRIBUTE = "observed_listeners"
 
 HELD, VIOLATED, UNVERIFIED = "held", "violated", "unverified"
@@ -238,9 +265,10 @@ def guardrail_problems(version: Any) -> list[str]:
     (`raildash.asp.identity_problems`, which also sorts a key list)."""
     if not isinstance(version, dict):
         return ["guardrail version must be an object"]
+    validator = _VALIDATORS.get(version.get("guardrail_contract_version"), _VALIDATOR)
     problems = [
         f"{'.'.join(str(part) for part in error.path) or 'guardrail'}: {error.message}"
-        for error in sorted(_VALIDATOR.iter_errors(version), key=str)
+        for error in sorted(validator.iter_errors(version), key=str)
     ]
     if problems:
         return problems
@@ -900,7 +928,7 @@ def request_rules_status(
         reason = None
     return {
         rule: {"state": UNVERIFIED if reason else HELD, "reason": reason, "violations": []}
-        for rule in REQUEST_RULES
+        for rule in ALL_REQUEST_RULES
     }
 
 
@@ -1079,14 +1107,17 @@ def _file_violations(
 
 
 def rule_states(
-    asp_result: Mapping[str, Any] | None, request_status: Mapping[str, Mapping[str, Any]]
+    asp_result: Mapping[str, Any] | None, request_status: Mapping[str, Mapping[str, Any]],
+    rules: Iterable[str] = RULES,
 ) -> dict[str, dict[str, Any]]:
     """All four rules' latest results: the ASP rules from `evaluate_asp`
     (Unverified `NOT_COLLECTED` when no ASP has been evaluated) and the
     request rules from `request_rules_status`, except that a multi-agent ASP
     makes every rule Unverified (multi-agent)."""
+    rules = tuple(rules)
     if asp_result is not None and asp_result.get("multi_agent"):
-        return {rule: dict(asp_result["rules"][rule]) for rule in RULES}
+        multi = next(iter(asp_result["rules"].values()))
+        return {rule: dict(asp_result["rules"].get(rule, multi)) for rule in rules}
     states: dict[str, dict[str, Any]] = {}
     for rule in ASP_RULES:
         result = (asp_result or {}).get("rules", {}).get(rule)
@@ -1095,8 +1126,9 @@ def rule_states(
             if result
             else {"state": UNVERIFIED, "reason": NOT_COLLECTED, "violations": []}
         )
-    for rule in REQUEST_RULES:
-        states[rule] = dict(request_status[rule])
+    for rule in rules:
+        if rule not in ASP_RULES:
+            states[rule] = dict(request_status[rule])
     return states
 
 
@@ -1105,6 +1137,7 @@ def agent_state(
     has_active_guardrail: bool,
     rule_results: Mapping[str, Mapping[str, Any]],
     counting_rows: int,
+    rules: Iterable[str] = RULES,
 ) -> str:
     """§4.5's per-agent state, highest first: `violated` (a counting row),
     `unverified` (no counting row, but some rule Unverified on its latest
@@ -1118,7 +1151,7 @@ def agent_state(
         return STATE_NO_GUARDRAIL
     if counting_rows > 0:
         return STATE_VIOLATED
-    for rule in RULES:
+    for rule in rules:
         result = rule_results.get(rule)
         if not result or result.get("state") not in (HELD, VIOLATED) or result.get("reason"):
             return STATE_UNVERIFIED
@@ -1130,6 +1163,7 @@ def shown_rule_states(
     counting_rules: Iterable[str],
     *,
     overflow_rule: str | None = None,
+    rules: Iterable[str] = RULES,
 ) -> dict[str, dict[str, Any]]:
     """Each rule's state as it is shown beside its rows, read the way
     `agent_state` reads the same results and rows, so the two never
@@ -1151,7 +1185,7 @@ def shown_rule_states(
     counting = set(counting_rules)
     overflowing = overflow_rule in counting
     shown: dict[str, dict[str, Any]] = {}
-    for rule in RULES:
+    for rule in rules:
         result = rule_results.get(rule) or {}
         reason = result.get("reason")
         if rule in counting or (overflowing and result.get("state") == VIOLATED):
@@ -1202,6 +1236,11 @@ def item_allowed(guardrail: Mapping[str, Any], violation: Mapping[str, Any]) -> 
             server = detail.get("server")
             return server is not None and server in out_of_spec["allowed_mcp_servers"]
         return item != UNKNOWN_HOST and host_allowed(item, out_of_spec["allowed_hosts"])
+    if rule == DATA_ACTIONS:
+        if DATA_ACTIONS not in rules:
+            # A v1 version has no such rule: switching back to one stops it.
+            return True
+        return data_action_row_allowed(rules[DATA_ACTIONS], detail)
     return False
 
 
@@ -1226,6 +1265,96 @@ def row_counts(guardrail: Mapping[str, Any] | None, row: Mapping[str, Any]) -> b
     if row.get("overflow"):
         return True
     return not item_allowed(guardrail, row)
+
+
+# ------------------------------------------------------------ data actions
+
+
+def tool_glob_matches(pattern: str, tool: str) -> bool:
+    """A `data_actions` tool pattern: `*` matches any run of characters,
+    `/` included (tool names aren't paths; DR-184's path globs stop at it)."""
+    regex = "".join(".*" if char == "*" else re.escape(char) for char in pattern)
+    return re.fullmatch(regex, tool, flags=re.DOTALL) is not None
+
+
+def data_action_allowed(rule: Mapping[str, Any], tool: str, action: str) -> bool:
+    """Whether a `data_actions` rule allows one action of one tool."""
+    if action == "unclassified" and rule.get("unclassified") == "allow":
+        return True
+    return any(
+        action in entry["actions"] and tool_glob_matches(entry["tool"], tool)
+        for entry in rule.get("allowed") or []
+    )
+
+
+def data_action_row_allowed(rule: Mapping[str, Any], detail: Mapping[str, Any]) -> bool:
+    """A stored `data_actions` row, re-checked against a version: its action
+    allowed, or (for a real action the schema gave, not an undeclared
+    argument) no longer the tool's under the version's override."""
+    tool, action = detail.get("tool"), detail.get("action")
+    if not isinstance(tool, str) or not isinstance(action, str):
+        return False
+    if data_action_allowed(rule, tool, action):
+        return True
+    override = (rule.get("overrides") or {}).get(tool)
+    if override is not None and action in DATA_ACTION_KINDS and not detail.get("from_undeclared"):
+        return action not in override
+    if override is not None and action == "unclassified":
+        return bool(override)
+    return False
+
+
+def judged_tool(tool: str) -> bool:
+    return tool.startswith(JUDGED_TOOL_PREFIXES)
+
+
+def evaluate_data_actions(
+    guardrail: Mapping[str, Any], calls: Iterable[Mapping[str, Any]], interaction: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """`data_actions` against one request's calls (design §4.4).
+
+    Each call is `{tool, class, actions, unclassified, unreadable,
+    undeclared, bytes, content_kinds, endpoint}` as the store worked it out
+    (`DataActionsStore._calls_for_rule`): its actions from the tool's
+    classification, `upload` added for an undeclared argument. A version's
+    override replaces the classified actions (not the undeclared upload).
+    One request yields one violation per (tool, action).
+    """
+    rule = (guardrail.get("rules") or {}).get(DATA_ACTIONS)
+    if rule is None:
+        return []
+    source = _interaction_source(interaction)
+    found: dict[str, dict[str, Any]] = {}
+    for call in calls:
+        tool = call["tool"]
+        if call.get("unreadable"):
+            actions = [("unreadable", False)]
+        elif not judged_tool(tool):
+            continue
+        else:
+            override = (rule.get("overrides") or {}).get(tool)
+            classified = list(override) if override is not None else list(call.get("classified") or [])
+            actions = [(action, False) for action in classified]
+            if call.get("undeclared") and "upload" not in classified:
+                actions.append(("upload", True))
+            if not classified and not call.get("undeclared"):
+                actions = [("unclassified", False)] if rule.get("unclassified") != "allow" else []
+            if call.get("not_offered"):
+                actions.append(("not_offered", False))
+        for action, from_undeclared in actions:
+            if data_action_allowed(rule, tool, action):
+                continue
+            item = f"{tool} · {action}"
+            if item in found:
+                continue
+            found[item] = _violation(
+                DATA_ACTIONS, item, call.get("class") or OBSERVED, source,
+                kind="data_action", tool=tool, action=action, from_undeclared=from_undeclared,
+                undeclared=list(call.get("undeclared") or []),
+                bytes=call.get("bytes"), content_kinds=list(call.get("content_kinds") or []),
+                endpoint=call.get("endpoint"),
+            )
+    return list(found.values())
 
 
 # ---------------------------------------------------------------- proposal
@@ -1533,6 +1662,25 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
         _refuse_wildcard_host(item)
         if not host_allowed(item, out_of_spec["allowed_hosts"]):
             out_of_spec["allowed_hosts"] = sorted([*out_of_spec["allowed_hosts"], item])
+        return updated
+    if rule == DATA_ACTIONS:
+        if DATA_ACTIONS not in updated:
+            raise ValueError("this version has no data_actions rule")
+        tool, action = detail.get("tool"), detail.get("action")
+        if not isinstance(tool, str) or action not in (*DATA_ACTION_KINDS, *DATA_ACTION_PSEUDO):
+            raise ValueError("this data-action row can't be read back into a tool and action")
+        allowed = updated[DATA_ACTIONS]["allowed"]
+        # Exactly this tool and action: an entry for the same literal tool
+        # gains the action; a glob entry is the user's to edit.
+        for entry in allowed:
+            if entry["tool"] == tool:
+                if action not in entry["actions"]:
+                    entry["actions"] = [
+                        a for a in (*DATA_ACTION_KINDS, *DATA_ACTION_PSEUDO)
+                        if a in {*entry["actions"], action}
+                    ]
+                return updated
+        allowed.append({"tool": tool, "actions": [action]})
         return updated
     raise ValueError(f"unknown rule {rule!r}")
 

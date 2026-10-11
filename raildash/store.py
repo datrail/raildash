@@ -1652,13 +1652,13 @@ class Store(GuardrailCustody, DataActionsStore):
                 )
                 inserted += cur.rowcount
                 if authenticated and cur.rowcount and row.get("interaction_id"):
-                    self._record_capture_tools({**row, "session_id": session_id})
+                    calls = self._record_capture_tools({**row, "session_id": session_id})
                     if active:
                         stored = self._db.execute(
                             "SELECT * FROM interactions WHERE session_id = ? AND interaction_id = ?",
                             (session_id, row["interaction_id"]),
                         ).fetchone()
-                        self._guardrail_on_request(dict(stored), active)
+                        self._guardrail_on_request(dict(stored), active, calls)
             if inserted:
                 self._db.execute(
                     """
@@ -1690,13 +1690,22 @@ class Store(GuardrailCustody, DataActionsStore):
             self._db.commit()
         return inserted
 
-    def _record_capture_tools(self, interaction: dict[str, Any], *, at: str | None = None) -> None:
+    def _record_capture_tools(
+        self, interaction: dict[str, Any], *, at: str | None = None
+    ) -> list[dict[str, Any]]:
         """DR-205: the tool schemas (M0) and tool calls (M1) one stored
-        authenticated request carries. `at` is the time to record them at
+        authenticated request carries; returns the calls as the
+        `data_actions` rule reads them. `at` is the time to record them at
         (the capture's own, when backfilling)."""
         if _tool_schemas.may_carry_tools(interaction.get("raw")):
             self._record_tool_schemas(interaction, at=at)
-        self._record_tool_calls(interaction, _capture_ref(interaction), at=at)
+        ref = _capture_ref(interaction)
+        recorded = self._record_tool_calls(interaction, ref, at=at)
+        try:
+            return self._calls_for_rule(ref, recorded)
+        except Exception as exc:  # noqa: BLE001 - evidence must still be stored
+            print(f"raildash: data-action classification failed: {exc!r}", file=sys.stderr)
+            return []
 
     def _record_tool_schemas(self, interaction: dict[str, Any], *, at: str | None = None) -> None:
         """DR-205 M0: the tool schemas one newly stored authenticated
