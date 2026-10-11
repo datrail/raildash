@@ -514,3 +514,33 @@ def test_a_failing_judgement_marks_the_check_and_does_not_block_the_queue(store,
     assert store._mark_at(*EVERY_AGENT, MARK_CHECK_FAILED) is not None
     # The other call was still judged.
     assert any("not offered" in key[1] for key in rows(store, ref))
+
+
+# ------------------------------------------------------------------ M3 panel
+
+
+def test_a_tool_says_why_and_shows_its_schemas(store):
+    send(store, listed(), call("upload_file", {"content": PNG}))
+    found = store.data_action_tool(f"mcp@{ENDPOINT}__upload_file")
+    assert found["classification"]["actions"] == ["upload"]
+    assert any("base64" in reason for reason in found["classification"]["reasons"])
+    assert found["schemas"][0]["endpoint"] == ENDPOINT and found["calls"] == 1
+    assert store.data_action_tool("nope") is None
+
+
+def test_the_tool_route_is_token_gated(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from raildash import app as app_module
+
+    db = Store(tmp_path / "routes.db")
+    monkeypatch.setattr(app_module, "store", db)
+    client = TestClient(app_module.app)
+    auth = {"X-RailDash-Token": app_module.LOCAL_TOKEN}
+    db.upsert_session("s1")
+    db.add_interactions("s1", [listed(), call("read_doc", {"doc_id": "d"})], authenticated=True)
+    name = f"mcp@{ENDPOINT}__read_doc"
+    assert client.get("/api/data-actions/tool", params={"name": name}).status_code in (401, 403)
+    assert client.get("/api/data-actions/tool", params={"name": name}, headers=auth).json()["classification"]["actions"] == ["read"]
+    assert client.get("/api/data-actions/tool", params={"name": "x"}, headers=auth).status_code == 404
+    db.close()

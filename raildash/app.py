@@ -1185,6 +1185,17 @@ async def api_dismiss_offer(agent_ref: str, request: Request) -> dict[str, Any]:
     return _guardrail_call(get_store().choose_declared, agent_ref, kind, value, allow=False)
 
 
+@app.get("/api/data-actions/tool", dependencies=[Depends(require_local_token)])
+def api_data_action_tool(name: str = Query(..., min_length=1, max_length=1024)) -> dict[str, Any]:
+    """DR-205: one tool's classification (actions, reasons, notes) and the
+    schemas behind it, for the Guardrail panel's "Why". Token-gated: the
+    schemas name the agent's tools and services."""
+    found = get_store().data_action_tool(name)
+    if found is None:
+        raise HTTPException(404, "no call of that tool was recorded")
+    return found
+
+
 @app.get("/api/guardrails/{agent_ref}/data-actions-offer", dependencies=[Depends(require_local_token)])
 def api_data_actions_offer(agent_ref: str) -> dict[str, Any]:
     """The *Add data actions* proposal for an agent whose active version is
