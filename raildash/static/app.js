@@ -1719,8 +1719,9 @@ async function loadOverview() {
 // hundreds of stdlib reads, and drawn in full they made the page about
 // 8,800 px tall. Nothing is dropped: every chip is in the page, the rest are
 // only hidden until asked for. Each list is already ordered so the ones
-// worth seeing come first (written and run files ahead of files only read,
-// then by count), so the cap hides the long tail, not the interesting part.
+// worth seeing come first (files written or run ahead of files only read;
+// the server's lists then by count, or bytes for Bytes sent per host), so
+// the cap hides the long tail, not the interesting part.
 const PROFILE_CHIP_CAP = 20;
 // Which lists the user opened, by key, so the five-second poll's redraw
 // leaves them open. Cleared when the profile is of another session or agent.
@@ -1882,7 +1883,7 @@ function kernelFileSource(source) {
     return chip;
   });
   const toggle = cappedChips(values, chips,
-    `kernel:${source.subject.host_id}/${source.subject.sandbox_name}`, "files");
+    `kernel:${JSON.stringify([source.subject.host_id, source.subject.sandbox_name])}`, "files");
   block.append(values);
   if (toggle) block.append(toggle);
   return block;
@@ -1933,10 +1934,17 @@ async function loadKernelFiles(sessionId, agentKey) {
   }
 }
 
+let profileGeneration = 0;
+
 async function loadProfile() {
   const grid = $("profile-grid");
   const download = $("profile-download");
-  if (!state.sessionId) {
+  // The poll, the agent filter and a session switch can each start a load
+  // while another runs; only the latest one draws, so an older one finishing
+  // last never puts back the previous agent's profile.
+  const generation = ++profileGeneration;
+  const sessionId = state.sessionId;
+  if (!sessionId) {
     grid.replaceChildren(el("p", "muted", "Select a captured session."));
     download.setAttribute("aria-disabled", "true");
     download.removeAttribute("href");
@@ -1946,16 +1954,29 @@ async function loadProfile() {
   // With an agent selected the profile is that agent's attributed traffic
   // only; unattributed rows never count toward it.
   const agentKey = $("f-agent").value;
-  const path = `/api/profile?session_id=${encodeURIComponent(state.sessionId)}` +
+  const path = `/api/profile?session_id=${encodeURIComponent(sessionId)}` +
     (agentKey ? `&agent_key=${encodeURIComponent(agentKey)}` : "");
-  const profile = await getJSON("/api/profile", { session_id: state.sessionId, agent_key: agentKey });
+  let profile;
+  try {
+    profile = await getJSON("/api/profile", { session_id: sessionId, agent_key: agentKey });
+  } catch (error) {
+    // The grid is no longer cleared before the fetch, so a failed one must
+    // not leave the previous selection's profile standing under this one.
+    if (generation === profileGeneration) {
+      grid.replaceChildren(errorMessage(`Could not load the observed profile: ${error.message}`));
+      download.setAttribute("aria-disabled", "true");
+      download.removeAttribute("href");
+    }
+    throw error;
+  }
   // Fetched before the grid is filled, so the group is drawn with the rest
   // of the profile rather than showing a loading state of its own.
-  const [kernelFiles, kernelError] = await loadKernelFiles(state.sessionId, agentKey);
+  const [kernelFiles, kernelError] = await loadKernelFiles(sessionId, agentKey);
+  if (generation !== profileGeneration) return;  // a later load draws instead
   const observed = profile.observed || {};
   // The lists the user opened stay open across the poll's redraw, but not
   // into another session's or agent's profile.
-  const scope = `${state.sessionId}|${agentKey}`;
+  const scope = JSON.stringify([sessionId, agentKey]);
   if (scope !== profileExpandedScope) {
     profileExpanded.clear();
     profileExpandedScope = scope;
