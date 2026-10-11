@@ -39,6 +39,7 @@ from .json_safety import (
     JSONStructureTooComplex,
 )
 from .guardrail import GuardrailValidationError
+from . import classifier_model
 from .store import Store
 from .asp import (
     DEFAULT_DRIFT_PAGE_SIZE,
@@ -86,6 +87,9 @@ app = FastAPI(
 # lets the tests point at a tmpdir; the default sits in the working directory
 # because the expected way to run this is `raildash serve` in a shell.
 store = Store(os.environ.get("RAILDASH_DB", "raildash.db"))
+# DR-205: the data-actions classifier's opt-in model step; off unless
+# RAILDASH_CLASSIFIER_MODEL_URL and _MODEL are set (classifier_model.py).
+classifier_model.start_from_env(store)
 
 
 def get_store() -> Store:
