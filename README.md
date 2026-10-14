@@ -5,15 +5,23 @@
 > one `docker compose up -d` runs RailMon, RailDash and a demo agent
 > together. This README covers RailDash on its own.
 
-RailDash is a local dashboard for traffic captured by
-[RailMon](https://github.com/datrail/railmon). It shows destinations, requests,
-responses, failures, tool calls, and `x-rail` presence without requiring a
-cloud account or Rail Center.
+RailDash is a local dashboard for agents watched by
+[RailMon](https://github.com/datrail/railmon). It needs no cloud account or
+Rail Center.
 
-It also keeps the evidence bundles RailMon's scanner delivers as Agent
-Security Profiles (ASPs): what an agent is set up to use and was observed
-doing. You can lock an ASP as a baseline and see later drift from it. These
-terms are defined in the
+- **Agent Security Profiles (ASPs).** RailDash keeps each evidence bundle
+  RailMon's scanner delivers as an ASP: what an agent is set up to use and
+  was observed doing. You lock an ASP as the agent's baseline in the UI,
+  and RailDash shows drift from it as later scans arrive.
+- **Data Guardrail.** Rules adopted from a baseline cover allowed uploads,
+  saved-file kinds, no service ports, out-of-spec API/MCP calls, what each
+  MCP tool call may do with data (read, upload, update, delete, execute) and,
+  optionally, contained egress. RailDash checks them as evidence arrives and
+  shows each agent's state: held, violated, unverified or no guardrail.
+- **Traffic.** The captured calls themselves: destinations, requests,
+  responses, failures, tool calls and `x-rail` presence.
+
+These terms are defined in the
 [DatRail glossary](https://github.com/datrail/datrail-project/blob/master/docs/glossary.md).
 
 ## Quick start
@@ -263,10 +271,13 @@ routes.
 
 ### HTTP: the Data Guardrail
 
-DR-184's guardrail checks every ASP and every authenticated capture of an
-agent against four rules the user adopted: allowed uploads, saved-file
-kinds, no service ports, and no out-of-spec calls (design:
-railxia/docs `design/2026-10-07-data-guardrail`). The store checks them as
+The guardrail checks every ASP and every authenticated capture of an agent
+against the rules the user adopted: allowed uploads, saved-file kinds, no
+service ports, no out-of-spec calls, and the data actions each MCP tool may
+take (the
+[glossary](https://github.com/datrail/datrail-project/blob/master/docs/glossary.md#data-guardrail)
+defines these five), plus contained egress when required (**Egress
+containment** below). The store checks them as
 evidence arrives, whichever way it arrives. Every guardrail route needs the
 token, including both reads:
 
@@ -282,6 +293,10 @@ token, including both reads:
 | `POST /api/guardrail-rows/{row_id}/allow` | Allow this: a new version that allows the row's item |
 | `POST /api/guardrails/{agent_ref}/allow-rows` `{"row_ids": [...]}` | Allow all: one new version that allows several of one rule's rows; all or nothing |
 | `POST /api/guardrails/{agent_ref}/offers/allow` or `.../dismiss` `{"kind": "host", "value": "..."}` | Allow or dismiss a newly declared host or MCP server |
+| `GET /api/guardrails/{agent_ref}/data-actions-offer` | `{"offer": ...}`: the *Add data actions* proposal for an agent whose guardrail predates the rule, or `null` |
+| `POST /api/guardrails/{agent_ref}/data-actions` `{}` or `{"rule": {...}}` | Add data actions: a new version with the active rules plus `data_actions`, as proposed or as edited |
+| `POST /api/guardrails/{agent_ref}/data-actions/dismiss` `{}` | Dismiss the *Add data actions* offer; it isn't offered again |
+| `GET /api/data-actions/tool?name=...` | One tool's classification (actions, reasons) and the schemas behind it, for the panel's **Why** |
 | `POST /api/guardrails/{agent_ref}/egress-containment` `{}` or `{"require": "allow_list_enforced"}` | Require containment: a new version that requires the agent's egress be contained; `starts_violated` says whether the newest ASP already fails it |
 
 The proposal allows each written path of the baseline exactly, plus one
@@ -293,8 +308,7 @@ bytecode cache in a `__pycache__` directory isn't flagged while it's there.
 A guardrail adopted before RailDash seeded this line doesn't have it;
 **Edit** adds it.
 
-**Egress containment** (DR-207; railxia/docs
-`design/2026-10-11-egress-containment`). Each agent's panel has an
+**Egress containment.** Each agent's panel has an
 **Egress** line read from RailMon's `egress_containment`, an observed level:
 - Contained: an OpenShell sandbox's enforced allow-list, no network, or
   internal networks only, naming any container that is the way out.
@@ -352,8 +366,9 @@ The existing capture and `/api/profile` paths are unchanged. The pure
 validator/comparator and versioned JSON Schemas live under `raildash.asp`
 and `raildash/schemas/`.
 
-The Data Guardrail's contract (DR-184) is
-`raildash/schemas/guardrail-version-v1.schema.json`, and its pure evaluator
+The Data Guardrail's contract is
+`raildash/schemas/guardrail-version-v1.schema.json` (v2 adds `data_actions`,
+v3 `egress_containment`), and its pure evaluator
 is `raildash.guardrail`. Its storage and the two ingest hooks that call it
 are `raildash.guardrail_store`, served by the routes under "HTTP: the Data
 Guardrail" above. The dashboard's Data Guardrail panel, beside the alignment
