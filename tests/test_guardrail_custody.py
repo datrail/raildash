@@ -314,6 +314,23 @@ def test_unauthenticated_and_old_captures_never_touch_a_guardrail(store):
     assert "forged.example.net" not in items and "old.example.net" not in items
 
 
+def test_a_capture_stamped_just_before_activation_is_still_judged(store):
+    """The collector's clock is CLOCK_MONOTONIC plus a boot time in whole
+    seconds, so a request made right after a version is activated can carry
+    a timestamp up to a second before it. That is new traffic, not an old
+    capture."""
+    ref, adopted = _adopted(store)
+    activated = datetime.fromisoformat(
+        store.guardrail_detail(ref)["active"]["activated_at"].replace("Z", "+00:00")
+    )
+    skewed = (activated - timedelta(milliseconds=900)).isoformat().replace("+00:00", "Z")
+    send(store, request("skewed.example.net", when=skewed))
+    assert ("uploads", "skewed.example.net") in rows(store, ref)
+    stale = (activated - g.CAPTURE_CLOCK_SLACK - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+    send(store, request("stale.example.net", when=stale))
+    assert ("uploads", "stale.example.net") not in rows(store, ref)
+
+
 def test_a_request_to_an_allowed_host_with_an_unlisted_mcp_server_is_one_requested_row(store):
     ref, _ = _adopted(store, uploads={"allowed_hosts": ["api.anthropic.com"], "max_request_bytes": {},
                                       "denied_tool_calls": ["mcp__fs__upload_file"]},

@@ -268,6 +268,12 @@ CAPTURE_REFUSED_WINDOW = UNATTRIBUTED_WINDOW
 # §4.4: hosts the agent sent a body to in this window before the lock seed
 # `uploads.allowed_hosts`. The caller selects the requests; this names it.
 PROPOSAL_LOOKBACK = timedelta(hours=24)
+# Not in the design: §4.5 skips a capture stamped before the version was
+# activated as old traffic. The collector stamps a request with
+# CLOCK_MONOTONIC plus a boot time read once in whole seconds, so it can
+# trail this process's wall clock by up to a second; a request made right
+# after activation must not be skipped as old. A day-old replay still is.
+CAPTURE_CLOCK_SLACK = timedelta(seconds=2)
 
 UNATTRIBUTED_STATES = frozenset({"ambiguous", "unknown", "conflict"})
 _MCP_NAME_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
