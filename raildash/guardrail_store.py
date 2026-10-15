@@ -615,9 +615,10 @@ class GuardrailCustody:
             if (item["row"]["identity_kind"], item["row"]["identity_value"]) == (kind, value)
         )
         version = entry["row"]
-        # An old capture loaded now isn't new traffic (§4.5).
+        # An old capture loaded now isn't new traffic (§4.5); one stamped
+        # within the collector's clock error of activation is.
         when = g._instant(interaction.get("timestamp")) or _instant(now)
-        if when < _instant(version["activated_at"]):
+        if when < _instant(version["activated_at"]) - g.CAPTURE_CLOCK_SLACK:
             return
         contract = json.loads(version["contract_json"])
         if g.DATA_ACTIONS in contract["rules"]:
