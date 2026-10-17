@@ -29,7 +29,8 @@ PUBLIC_SERVERS = [
                                      {"content": {"type": "string"}, "repo": {"type": "string"}}),
      ["upload", "update"]),
     ("push_files", schema("Push multiple files to a GitHub repository in a single commit",
-                          {"files": {"type": "array"}, "repo": {"type": "string"}}), ["upload"]),
+                          {"files": {"type": "array"}, "repo": {"type": "string"}}),
+     ["upload", "update"]),
     ("search_repositories", schema("Search for GitHub repositories", {"query": {"type": "string"}}),
      ["read"]),
     ("get_file_contents", schema("Get the contents of a file or directory",
@@ -46,7 +47,7 @@ PUBLIC_SERVERS = [
      ["read"]),
     ("write_file", schema("Create a new file or completely overwrite an existing file",
                           {"path": {"type": "string"}, "content": {"type": "string"}}),
-     ["upload"]),
+     ["upload", "update"]),
     ("edit_file", schema("Make line-based edits to a text file", {"edits": {"type": "array"}}),
      ["update"]),
     ("move_file", schema("Move or rename files and directories",
@@ -126,6 +127,18 @@ def test_hints_only_add_and_a_hinted_read_is_weak():
         "its server calls it destructive (destructiveHint), so a read is weak",
         "reaches outside its own service (openWorldHint)",
     ]
+
+
+def test_an_overwriting_verb_is_also_an_update():
+    # RC-412: write_file, push_files and kubectl_apply replace what is there.
+    for tool in ("write_file", "save_note", "put_object", "push_files", "kubectl_apply"):
+        result = da.classify(tool, [schema()])
+        assert result["actions"] == ["upload", "update"], tool
+        assert result["sources"]["update"] == ["rule"]
+    assert actions("notes", schema("Write the notes")) == ["upload", "update"]
+    mode = schema(properties={"method": {"type": "string", "enum": ["write"]}})
+    assert actions("sub_issue", mode) == ["upload", "update"]
+    assert actions("create_issue") == ["upload"]
 
 
 def test_destructive_hint_adds_no_action_and_makes_a_read_weak():
