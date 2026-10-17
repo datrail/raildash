@@ -39,7 +39,7 @@ PUBLIC_SERVERS = [
     ("list_issues", schema("List issues in a GitHub repository", {"state": {"type": "string"}}),
      ["read"]),
     ("fork_repository", schema("Fork a GitHub repository to your account",
-                               {"owner": {"type": "string"}}), []),
+                               {"owner": {"type": "string"}}), ["upload"]),
     ("delete_branch", schema("Delete a branch", {"branch": {"type": "string"}}), ["delete"]),
     # Filesystem
     ("read_file", schema("Read the complete contents of a file", {"path": {"type": "string"}}),
@@ -83,7 +83,7 @@ def test_mcp_prefixes_are_not_read_as_words():
     assert da.tool_part("provider-mcp__Docs_Hub__read_doc") == "read_doc"
     assert da.tool_part("mcp@docs.example.com/mcp__upload_file") == "upload_file"
     # A server named after a verb doesn't classify its tools.
-    assert actions("mcp__delete__fork_repository") == []
+    assert actions("mcp__delete__frobnicate_repository") == []
     assert da.words("createIssue") == ["create", "issue"]
 
 
@@ -121,8 +121,62 @@ def test_hints_only_add_and_a_hinted_read_is_weak():
     named = da.classify("read_doc", [schema(annotations={"readOnlyHint": True})])
     assert named["actions"] == ["read"] and not named["weak_read"]
     destructive = da.classify("tidy", [schema(annotations={"destructiveHint": True, "openWorldHint": True})])
-    assert destructive["actions"] == ["update", "delete"]
-    assert destructive["notes"] == ["reaches outside its own service (openWorldHint)"]
+    assert destructive["actions"] == [] and destructive["unclassified"]
+    assert destructive["notes"] == [
+        "its server calls it destructive (destructiveHint), so a read is weak",
+        "reaches outside its own service (openWorldHint)",
+    ]
+
+
+def test_destructive_hint_adds_no_action_and_makes_a_read_weak():
+    # RC-412: Playwright marks typing as destructive. Read as update and
+    # delete, the upload went unjudged; unclassified, it is refused.
+    typing = schema("Type text into editable element", {"text": {"type": "string"}},
+                    {"destructiveHint": True, "readOnlyHint": False})
+    assert actions("browser_type", typing) == []
+    assert actions("delete_file", schema(annotations={"destructiveHint": True})) == ["delete"]
+    # A proposal never allows unseen a read its own server calls destructive.
+    navigate = da.classify("get_page", [schema(annotations={"destructiveHint": True})])
+    assert navigate["actions"] == ["read"] and navigate["weak_read"]
+    # One destructive schema of several is enough.
+    plain = da.classify("get_page", [schema(), schema(annotations={"destructiveHint": True})])
+    assert plain["weak_read"]
+    assert not da.classify("get_page", [schema()])["weak_read"]
+
+
+def test_every_verb_of_every_mode_of_a_mode_argument_counts():
+    label_write = schema("Perform write operations on repository labels", {
+        "method": {"type": "string", "enum": ["create", "update", "delete"]}})
+    assert actions("label_write", label_write) == ["upload", "update", "delete"]
+    # A leading noun can't hide a later delete, as in a name.
+    assert actions("comments", schema(properties={
+        "operation": {"enum": ["comment_list", "comment_delete"]}})) == ["read", "upload", "delete"]
+    result = da.classify("subscription", [schema(properties={
+        "action": {"enum": ["watch", "delete"]}})])
+    assert result["actions"] == ["update", "delete"]
+    assert 'argument "action" mode "delete"' in result["reasons"]
+    # A mode the table can't name makes a read weak: the proposal can't
+    # allow unseen a browser whose other modes click and type.
+    browser = da.classify("browser", [schema(properties={
+        "action": {"enum": ["navigate", "click", "get_text"]}})])
+    assert browser["actions"] == ["read"] and browser["weak_read"]
+    assert da.classify("browser", [schema(properties={"action": {"enum": ["view", 7]}})])["weak_read"]
+    assert not da.classify("viewer", [schema(properties={"mode": {"enum": ["view", "find"]}})])["weak_read"]
+    # Only a mode argument's values are read, and only an enum's.
+    assert actions("thing", schema(properties={"format": {"enum": ["delete"]}})) == []
+    assert actions("thing", schema(properties={"method": {"type": "string"}})) == []
+
+
+def test_verbs_rc412_found_missing():
+    assert actions("track_package", schema("Look up delivery tracking information")) == ["read"]
+    assert actions("dismiss_notification", schema("Dismiss a notification by marking it as read")) == [
+        "update"]
+    assert actions("mark_all_notifications_read") == ["read", "update"]
+    assert actions("buyStock") == ["update"] and actions("sellStock") == ["update"]
+    assert actions("merge_pull_request") == ["update"]
+    assert actions("install_helm_chart") == ["upload"]
+    assert actions("uninstall_helm_chart") == ["delete"]
+    assert actions("browser_evaluate") == ["execute"]
 
 
 def test_the_union_over_schemas_means_a_doctored_schema_cannot_hide_an_upload():
@@ -272,6 +326,6 @@ def test_identical_schemas_are_asked_once_and_every_action_keeps_a_reason():
     da.classify("frobnicate", [schema("same")] * 50, model_classifier=model)
     assert len(calls) == 1
     many = schema(properties={f"p{i}": {"format": "byte"} for i in range(30)})
-    result = da.classify("tidy", [many, schema(annotations={"destructiveHint": True})])
-    assert result["actions"] == ["upload", "update", "delete"]
-    assert "annotation destructiveHint" in result["reasons"]
+    result = da.classify("tidy", [many, schema("Remove it", {"x": {"format": "byte"}})])
+    assert result["actions"] == ["upload", "delete"]
+    assert 'description verb "remove"' in result["reasons"]

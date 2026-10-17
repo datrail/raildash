@@ -445,9 +445,11 @@ def test_a_declared_server_lines_up_its_endpoint_and_model_side_names(tmp_path, 
     rows = {(r["class"], r["tool"]): r for r in store.data_action_rows(["session:s1"])}
     observed = rows[("observed", "mcp__docs__tidy")]
     requested = rows[("requested", "mcp__docs__tidy")]
-    # Both sides see the server's destructiveHint through the line-up.
-    assert observed["actions"] == ["update", "delete"]
-    assert requested["actions"] == ["update", "delete"]
+    # Both sides see the server's destructiveHint through the line-up: it
+    # adds no action, and both say so.
+    assert observed["actions"] == requested["actions"] == []
+    assert observed["classification"]["notes"] == requested["classification"]["notes"]
+    assert any("destructiveHint" in note for note in observed["classification"]["notes"])
     assert observed["wire_tool"] == "tidy"
     store.close()
 
