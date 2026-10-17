@@ -57,7 +57,7 @@ SOURCE_MODEL = "model"
 
 # Bumped whenever the table, the argument rules or the model prompt change,
 # so stored classifications are redone (§4.2, last paragraph).
-CLASSIFIER_VERSION = 2
+CLASSIFIER_VERSION = 3
 
 VERBS: dict[str, str] = {
     **dict.fromkeys(
@@ -84,6 +84,9 @@ VERBS: dict[str, str] = {
         READ,
     ),
 }
+# Upload verbs that also replace what is already there: `write_file`
+# overwrites, `push` moves a ref, `apply` and `put` replace the object.
+OVERWRITE_VERBS = frozenset(("write", "save", "put", "push", "apply"))
 
 DATA_CARRYING_NAMES = frozenset(
     ("content", "contents", "data", "body", "file", "files", "attachment", "attachments",
@@ -133,6 +136,8 @@ def _verb_actions(text: str) -> list[tuple[str, str]]:
         action = VERBS.get(word)
         if action is not None and (action, word) not in found:
             found.append((action, word))
+        if word in OVERWRITE_VERBS and (UPDATE, word) not in found:
+            found.append((UPDATE, word))
     return found
 
 
