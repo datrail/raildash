@@ -144,18 +144,24 @@ def test_destructive_hint_adds_no_action_and_makes_a_read_weak():
     assert not da.classify("get_page", [schema()])["weak_read"]
 
 
-def test_every_mode_of_a_mode_argument_counts_by_its_first_verb():
+def test_every_verb_of_every_mode_of_a_mode_argument_counts():
     label_write = schema("Perform write operations on repository labels", {
         "method": {"type": "string", "enum": ["create", "update", "delete"]}})
     assert actions("label_write", label_write) == ["upload", "update", "delete"]
-    # A mode is named verb first: `get_workflow_run` reads, it doesn't run.
-    actions_get = schema("Get details about GitHub Actions resources", {
-        "method": {"type": "string", "enum": ["get_workflow_run", "list_workflow_jobs"]}})
-    assert actions("actions_get", actions_get) == ["read"]
+    # A leading noun can't hide a later delete, as in a name.
+    assert actions("comments", schema(properties={
+        "operation": {"enum": ["comment_list", "comment_delete"]}})) == ["read", "upload", "delete"]
     result = da.classify("subscription", [schema(properties={
-        "action": {"enum": ["watch", "delete", 7, None]}})])
+        "action": {"enum": ["watch", "delete"]}})])
     assert result["actions"] == ["update", "delete"]
     assert 'argument "action" mode "delete"' in result["reasons"]
+    # A mode the table can't name makes a read weak: the proposal can't
+    # allow unseen a browser whose other modes click and type.
+    browser = da.classify("browser", [schema(properties={
+        "action": {"enum": ["navigate", "click", "get_text"]}})])
+    assert browser["actions"] == ["read"] and browser["weak_read"]
+    assert da.classify("browser", [schema(properties={"action": {"enum": ["view", 7]}})])["weak_read"]
+    assert not da.classify("viewer", [schema(properties={"mode": {"enum": ["view", "find"]}})])["weak_read"]
     # Only a mode argument's values are read, and only an enum's.
     assert actions("thing", schema(properties={"format": {"enum": ["delete"]}})) == []
     assert actions("thing", schema(properties={"method": {"type": "string"}})) == []

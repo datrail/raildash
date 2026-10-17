@@ -19,9 +19,10 @@ every signal that fires adds actions from a closed set with a reason:
    only the first verb would let a leading noun hide a later `delete`
    (`query_execute` would be a strong `read`), and the user allows it once;
 4. arguments: a data-carrying argument, or an explicitly loose schema, adds
-   `upload`; the first verb of every value a mode argument (`method`, `action`,
-   ...) may take is read against the verb table, since allowing the tool allows every
-   mode; a destination-hint argument is reported and adds nothing;
+   `upload`; every verb of every value a mode argument (`method`, `action`,
+   ...) may take is read against the verb table, since allowing the tool
+   allows every mode, and a mode with no verb in the table makes a read
+   weak; a destination-hint argument is reported and adds nothing;
 5. an opt-in model, asked only when 1-4 found nothing; its `read` is weak;
 6. otherwise the tool is `unclassified`.
 
@@ -212,6 +213,7 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
         add(action, SOURCE_RULE, f'{where} verb "{word}"')
 
     input_schema = schema.get("input_schema") if isinstance(schema.get("input_schema"), dict) else {}
+    unnamed_mode = False
     for name, spec in _properties(input_schema).items():
         if not isinstance(name, str):
             continue
@@ -219,19 +221,23 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
         if why:
             add(UPLOAD, SOURCE_RULE, why)
         if name.lower() in MODE_NAMES and isinstance(spec, dict) and isinstance(spec.get("enum"), list):
-            # A mode is named verb first (`delete_pending`), so its first
-            # verb is the one it takes: `get_workflow_run` reads.
+            # Every verb of every mode counts, as in a name, so a leading
+            # noun can't hide a later `delete`. A mode the table can't name
+            # might do anything, so it makes a read weak.
             for value in spec["enum"]:
                 verbs = _verb_actions(value) if isinstance(value, str) else []
-                if verbs:
-                    add(verbs[0][0], SOURCE_RULE, f'argument "{name}" mode "{value}"')
+                for action, word in verbs:
+                    add(action, SOURCE_RULE, f'argument "{name}" mode "{value}"')
+                if not verbs and not unnamed_mode:
+                    unnamed_mode = True
+                    notes.append(f'argument "{name}" has a mode the table can\'t name, so a read is weak')
     if explicitly_loose(input_schema):
         add(UPLOAD, SOURCE_RULE, "schema accepts arbitrary arguments")
 
     if annotations.get("readOnlyHint") is True and not actions:
         add(READ, SOURCE_ANNOTATION, "annotation readOnlyHint")
     return {"actions": actions, "reasons": list(reasons), "first_reason": first_reason,
-            "notes": notes, "destructive": destructive,
+            "notes": notes, "weakens_read": destructive or unnamed_mode,
             "destinations": destination_hints(input_schema)}
 
 
@@ -280,7 +286,7 @@ def classify(
     reasons: dict[str, None] = {}
     notes: dict[str, None] = {}
     destinations: set[str] = set()
-    destructive = False
+    weakens_read = False
     valid = [item for item in schemas if isinstance(item, Mapping)]
     for item in valid:
         signals = _schema_signals(tool, item)
@@ -299,7 +305,7 @@ def classify(
         for note in signals["notes"]:
             notes.setdefault(note, None)
         destinations.update(signals["destinations"])
-        destructive = destructive or signals["destructive"]
+        weakens_read = weakens_read or signals["weakens_read"]
 
     # A weak read is dropped when any schema found a real action.
     if READ in sources and sources[READ] == {SOURCE_ANNOTATION} and set(sources) != {READ}:
@@ -339,9 +345,9 @@ def classify(
         unclassified=not actions,
         # §4.2: a read only a hint or a model gave is weak, whatever else
         # the tool does, and so is any read of a tool its server calls
-        # destructive.
+        # destructive or with a mode the table can't name.
         weak_read=READ in sources
-        and (destructive or sources[READ] <= {SOURCE_ANNOTATION, SOURCE_MODEL}),
+        and (weakens_read or sources[READ] <= {SOURCE_ANNOTATION, SOURCE_MODEL}),
     )
     return result
 
