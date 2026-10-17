@@ -5,16 +5,23 @@ A tool's schemas (`tool_schemas`, M0) are read for signals, in order, and
 every signal that fires adds actions from a closed set with a reason:
 
 1. a user override replaces everything below;
-2. MCP annotations: `destructiveHint` adds `delete` and `update`;
-   `readOnlyHint` adds a *weak* `read`, and only when nothing below adds
-   another action; `openWorldHint` adds nothing and is reported;
+2. MCP annotations: `readOnlyHint` adds a *weak* `read`, and only when
+   nothing below adds another action. `destructiveHint` adds nothing: it
+   is reported, and it makes any `read` weak. Servers set it on navigating,
+   clicking and typing as readily as on deleting, so reading it as
+   `delete` and `update` mostly named actions a tool doesn't take, and hid
+   the upload a form-filling tool does (RC-412). Without it such a tool is
+   `unclassified`, which the rule refuses until allowed. `openWorldHint`
+   adds nothing and is reported;
 3. every word of the tool's own name that is in the verb table, else of
    its description's first sentence. Nouns that are also verbs count too
    (`get_commit` is `read` and `upload`): that fails safe, since reading
    only the first verb would let a leading noun hide a later `delete`
    (`query_execute` would be a strong `read`), and the user allows it once;
 4. arguments: a data-carrying argument, or an explicitly loose schema, adds
-   `upload`; a destination-hint argument is reported and adds nothing;
+   `upload`; the first verb of every value a mode argument (`method`, `action`,
+   ...) may take is read against the verb table, since allowing the tool allows every
+   mode; a destination-hint argument is reported and adds nothing;
 5. an opt-in model, asked only when 1-4 found nothing; its `read` is weak;
 6. otherwise the tool is `unclassified`.
 
@@ -49,21 +56,30 @@ SOURCE_MODEL = "model"
 
 # Bumped whenever the table, the argument rules or the model prompt change,
 # so stored classifications are redone (§4.2, last paragraph).
-CLASSIFIER_VERSION = 1
+CLASSIFIER_VERSION = 2
 
 VERBS: dict[str, str] = {
     **dict.fromkeys(
         ("upload", "create", "send", "post", "publish", "share", "put", "write", "commit",
          "push", "insert", "add", "append", "attach", "export", "email", "message",
-         "comment", "reply", "submit", "save"),
+         "comment", "reply", "submit", "save", "fork", "apply", "install", "fill"),
         UPLOAD,
     ),
-    **dict.fromkeys(("update", "edit", "patch", "modify", "rename", "move", "set", "replace"), UPDATE),
-    **dict.fromkeys(("delete", "remove", "destroy", "drop", "purge", "trash"), DELETE),
-    **dict.fromkeys(("run", "exec", "execute", "eval", "shell", "bash", "command", "invoke"), EXECUTE),
+    **dict.fromkeys(
+        ("update", "edit", "patch", "modify", "rename", "move", "set", "replace", "mark",
+         "dismiss", "assign", "merge", "star", "unstar", "upgrade", "scale", "reset",
+         "checkout", "cancel", "watch", "ignore", "buy", "sell"),
+        UPDATE,
+    ),
+    **dict.fromkeys(
+        ("delete", "remove", "destroy", "drop", "purge", "trash", "uninstall", "cleanup"), DELETE
+    ),
+    **dict.fromkeys(
+        ("run", "exec", "execute", "eval", "evaluate", "shell", "bash", "command", "invoke"), EXECUTE
+    ),
     **dict.fromkeys(
         ("get", "list", "read", "search", "fetch", "download", "query", "find", "view",
-         "describe", "show", "lookup"),
+         "describe", "show", "lookup", "look"),
         READ,
     ),
 }
@@ -72,6 +88,9 @@ DATA_CARRYING_NAMES = frozenset(
     ("content", "contents", "data", "body", "file", "files", "attachment", "attachments",
      "image", "images")
 )
+# Arguments whose values pick what the call does (`label_write`'s
+# `method: create | update | delete`).
+MODE_NAMES = frozenset(("method", "action", "operation", "op", "mode", "subcommand"))
 DESTINATION_NAMES = frozenset(
     ("url", "uri", "repo", "repository", "bucket", "channel", "to", "visibility", "public",
      "private")
@@ -178,9 +197,9 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
             reasons.setdefault(reason, None)
 
     annotations = schema.get("annotations") if isinstance(schema.get("annotations"), dict) else {}
-    if annotations.get("destructiveHint") is True:
-        add(DELETE, SOURCE_ANNOTATION, "annotation destructiveHint")
-        add(UPDATE, SOURCE_ANNOTATION, "annotation destructiveHint")
+    destructive = annotations.get("destructiveHint") is True
+    if destructive:
+        notes.append("its server calls it destructive (destructiveHint), so a read is weak")
     if annotations.get("openWorldHint") is True:
         notes.append("reaches outside its own service (openWorldHint)")
 
@@ -199,13 +218,20 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
         why = data_carrying(name, spec)
         if why:
             add(UPLOAD, SOURCE_RULE, why)
+        if name.lower() in MODE_NAMES and isinstance(spec, dict) and isinstance(spec.get("enum"), list):
+            # A mode is named verb first (`delete_pending`), so its first
+            # verb is the one it takes: `get_workflow_run` reads.
+            for value in spec["enum"]:
+                verbs = _verb_actions(value) if isinstance(value, str) else []
+                if verbs:
+                    add(verbs[0][0], SOURCE_RULE, f'argument "{name}" mode "{value}"')
     if explicitly_loose(input_schema):
         add(UPLOAD, SOURCE_RULE, "schema accepts arbitrary arguments")
 
     if annotations.get("readOnlyHint") is True and not actions:
         add(READ, SOURCE_ANNOTATION, "annotation readOnlyHint")
     return {"actions": actions, "reasons": list(reasons), "first_reason": first_reason,
-            "notes": notes,
+            "notes": notes, "destructive": destructive,
             "destinations": destination_hints(input_schema)}
 
 
@@ -254,6 +280,7 @@ def classify(
     reasons: dict[str, None] = {}
     notes: dict[str, None] = {}
     destinations: set[str] = set()
+    destructive = False
     valid = [item for item in schemas if isinstance(item, Mapping)]
     for item in valid:
         signals = _schema_signals(tool, item)
@@ -272,6 +299,7 @@ def classify(
         for note in signals["notes"]:
             notes.setdefault(note, None)
         destinations.update(signals["destinations"])
+        destructive = destructive or signals["destructive"]
 
     # A weak read is dropped when any schema found a real action.
     if READ in sources and sources[READ] == {SOURCE_ANNOTATION} and set(sources) != {READ}:
@@ -310,8 +338,10 @@ def classify(
         destinations=sorted(destinations),
         unclassified=not actions,
         # §4.2: a read only a hint or a model gave is weak, whatever else
-        # the tool does.
-        weak_read=READ in sources and sources[READ] <= {SOURCE_ANNOTATION, SOURCE_MODEL},
+        # the tool does, and so is any read of a tool its server calls
+        # destructive.
+        weak_read=READ in sources
+        and (destructive or sources[READ] <= {SOURCE_ANNOTATION, SOURCE_MODEL}),
     )
     return result
 
