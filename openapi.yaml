@@ -1079,9 +1079,13 @@ components:
         v2 (evidence bundle v2) changes always carry it: null for the
         shared sandbox scope and for attestations, otherwise the agent the
         change is in. AGENT_* changes are v2 only; their `name` is the agent_key.
-        A v2 attribute declaring a `window` reports `value` only
-        for something newly seen in the window (a new item, or a `union`
-        key turned true), never for what a quieter window did not see.
+        A v2 attribute declaring a `window`, and in v1 each list RailMon
+        windows in v2 (`tool_names`, `observed_destinations`,
+        `undeclared_destinations`, `observed_listeners`,
+        `observed_ingress_peers`, `observed_file_access`), reports `value`
+        only for something newly seen in the window (a new item, or a
+        `union` key turned true), never for what a quieter window did not
+        see.
       required: [type, name, fields]
       properties:
         agent_key: {type: [string, 'null']}

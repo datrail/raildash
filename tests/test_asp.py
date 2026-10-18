@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import copy
 import json
 import os
@@ -18,6 +19,7 @@ from raildash.asp import (
     MAX_DRIFT_PAGE_SIZE,
     MAX_DRIFT_RESULT_BYTES,
     SCHEMA,
+    V1_WINDOW_LISTS,
     BundleValidationError,
     IdentityRequiredError,
     alignment_problems,
@@ -900,6 +902,100 @@ def test_without_a_window_a_list_is_compared_exactly_as_before():
         (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
         ("executor", "ATTRIBUTE_CHANGED", "observed_destinations", ["value"]),
     ]
+
+
+def _windowed_v1(destinations: list, files: list, tools: list | None = None) -> dict:
+    value = bundle()
+    attributes = value["attributes"]
+    attributes["observed_destinations"] = {
+        "value": destinations, "status": "ANSWERED", "tier": "observed", "authored_by": "none",
+    }
+    attributes["observed_file_access"] = {
+        "value": files, "status": "ANSWERED", "tier": "observed", "authored_by": "none",
+    }
+    if tools is not None:
+        attributes["tool_names"] = {
+            "value": tools, "status": "ANSWERED", "tier": "observed", "authored_by": "none",
+        }
+    return value
+
+
+def _v1_window_drift(baseline: dict, current: dict) -> list:
+    baseline_raw = raw(baseline)
+    current = copy.deepcopy(current)
+    current["bundle_id"] = "bnd-fixture-next"
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
+    validate("drift-result-v1.schema.json", result)
+    assert result["comparable"] is True, result["reason"]
+    return [(change["type"], change["name"], change["fields"]) for change in result["changes"]]
+
+
+def test_a_v1_bundle_reads_railmons_window_lists_as_windows():
+    # DR-217 (RC-411's window-quieter and window-recounted): v1 cannot declare
+    # a `window`, but a single RailMon scan writes v1 with the same lists, so
+    # a re-scan of an unchanged agent that saw less, or counted differently,
+    # is not drift.
+    baseline = _windowed_v1(
+        [_destination("a.example", 9), _destination("b.example")],
+        [_file("/etc/hosts", read=True), _file("/tmp/out", write=True, read=True)],
+        ["read_file", "search"],
+    )
+    quieter = _windowed_v1(
+        [_destination("a.example", 1)], [_file("/tmp/out", read=True)], ["search"]
+    )
+    assert _v1_window_drift(baseline, quieter) == []
+    recounted = _windowed_v1(
+        [_destination("b.example", 4), _destination("a.example", 2)],
+        [_file("/etc/hosts", read=True), _file("/tmp/out", write=True, read=True)],
+        ["read_file", "search"],
+    )
+    assert _v1_window_drift(baseline, recounted) == []
+
+
+def test_something_newly_seen_in_a_v1_window_is_still_drift():
+    baseline = _windowed_v1([_destination("a.example")], [_file("/etc/hosts", read=True)], ["search"])
+    assert _v1_window_drift(
+        baseline, _windowed_v1([_destination("c.example")], [_file("/etc/hosts", read=True)], ["search"])
+    ) == [("ATTRIBUTE_CHANGED", "observed_destinations", ["value"])]
+    assert _v1_window_drift(
+        baseline, _windowed_v1([_destination("a.example")], [_file("/etc/hosts", write=True)], ["search"])
+    ) == [("ATTRIBUTE_CHANGED", "observed_file_access", ["value"])]
+    assert _v1_window_drift(
+        baseline, _windowed_v1([_destination("a.example")], [_file("/etc/hosts", read=True)], ["exec"])
+    ) == [("ATTRIBUTE_CHANGED", "tool_names", ["value"])]
+    # Qualifiers are still compared exactly, and a list RailMon does not
+    # window is not read as one.
+    blind = _windowed_v1([_destination("a.example")], [_file("/etc/hosts", read=True)], ["search"])
+    blind["attributes"]["observed_destinations"] = {
+        "value": None, "status": "BLIND", "tier": "observed", "reason": "NO_SOURCE_ACCESS",
+    }
+    assert _v1_window_drift(baseline, blind) == [
+        ("ATTRIBUTE_CHANGED", "observed_destinations", ["status", "reason", "authored_by"]),
+    ]
+    fewer_mounts = copy.deepcopy(baseline)
+    fewer_mounts["attributes"]["mounts"]["value"] = []
+    assert ("ATTRIBUTE_CHANGED", "mounts", ["value"]) in _v1_window_drift(baseline, fewer_mounts)
+
+
+def test_the_v1_window_table_is_railmons():
+    # RailMon's composer declares `window` on v2 from one table, which says
+    # consumers hard-code it. Read it from RailMon's source, not imported.
+    schemas = _railmon_schema("evidence-bundle-v2.schema.json")
+    composer = (
+        None if schemas is None
+        else schemas.parents[1] / "tools" / "scan" / "compose_evidence_bundle_v2.py"
+    )
+    if composer is None or not composer.is_file():
+        message = "no RailMon checkout with tools/scan -- can't check V1_WINDOW_LISTS"
+        if _running_in_ci():
+            pytest.fail(message + "; CI must check RailMon's tools/scan out")
+        pytest.skip(message)
+    table = next(
+        node.value
+        for node in ast.parse(composer.read_text()).body
+        if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "WINDOW_LISTS"
+    )
+    assert ast.literal_eval(table) == V1_WINDOW_LISTS
 
 
 def test_a_window_that_saw_nothing_is_an_empty_list_not_a_value_change():

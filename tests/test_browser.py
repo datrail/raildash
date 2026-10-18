@@ -567,6 +567,26 @@ def test_kernel_observed_files_sit_beside_the_asked_ones_and_a_new_write_is_drif
                 "/workspace/exfil.txt", "/workspace/config.json",
             ]
             assert kernel.locator(".profile-count").all_inner_texts() == ["write", "read"]
+
+            # A quieter window that missed the read is not a stopped read, in
+            # v1 as in v2 (DR-217): the panel lists no "No longer read" row.
+            quieter = bundle("bnd-browser-quieter", [WROTE], collected_at="2026-09-24T03:00:00Z")
+            response = page.request.post(
+                f"{url}/v1/evidence-bundles", data=encode(quieter),
+                headers={"X-RailDash-Token": token, "Content-Type": "application/json"},
+            )
+            assert response.status == 202, response.text()
+            page.locator("#refresh").click()
+            row = page.locator(".asp-state-card", has_text="Drift detected").first.locator(
+                ".asp-file-diff",
+                has=page.locator(".asp-diff-new", has_text="1 file [ANSWERED, observed]"),
+            )
+            row.wait_for()
+            changes = {
+                line.get_attribute("data-kind"): line.locator(".drift-label").all_inner_texts()
+                for line in row.locator(".asp-file-change").all()
+            }
+            assert changes == {"Newly written": ["/workspace/exfil.txt"]}
             assert errors == []
             browser.close()
     finally:
