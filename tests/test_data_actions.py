@@ -259,6 +259,17 @@ def test_a_model_answering_no_data_action_leaves_the_tool_unclassified_with_its_
         assert da.parse_model_reply("m1", reply) is None
 
 
+def test_the_model_prompt_counts_entering_data_into_a_page_as_upload():
+    # RC-412: typing into a page, selecting in a form and answering a dialog
+    # were answered update or execute, which the steps leave to the model,
+    # so the upload was missed silently. A missed upload is what the rule
+    # can't see, so the prompt asks for upload whenever data leaves.
+    prompt = da.model_request_body("m1", {})["messages"][0]["content"]
+    assert "entering it into a page, form or dialog" in prompt
+    assert "include upload whenever data leaves through it" in prompt
+    assert da.CLASSIFIER_VERSION == 5  # a prompt change redoes stored classifications
+
+
 def test_the_model_request_carries_the_schema_and_no_captured_value():
     body = da.model_request_body("m1", {"tool": "frob", "description": "d", "input_schema": OBJ,
                                         "interaction_id": "secret", "host": "h"})
