@@ -61,6 +61,27 @@ def test_an_unclassified_tool_is_asked_about_off_the_lock_and_the_answer_is_used
     store.close()
 
 
+def test_an_answer_of_no_data_action_is_kept_and_the_tool_stays_unclassified(tmp_path):
+    store = _store(tmp_path)
+    calls = []
+
+    def post(url, headers, body):
+        calls.append(1)
+        return {"choices": [{"message": {"content": json.dumps({"actions": [], "reason": "only waits"})}}]}
+
+    worker = cm.ModelClassifierWorker(store, cm.ModelSettings("http://m/v1", "small"), post=post)
+    store.model_classifier = worker.lookup
+    store.data_action_rows(["session:s1"])
+    assert worker.drain_once() == 1
+    [row] = store.data_action_rows(["session:s1"])
+    assert worker.drain_once() == 0  # an answer, not an invalid one: cached, not re-asked
+    assert len(calls) == 1
+    assert row["actions"] == [] and row["unclassified"]
+    assert row["classification"]["notes"] == [
+        "model small: only waits (no data action, so it stays unclassified)"]
+    store.close()
+
+
 def test_a_failed_ask_is_not_repeated_at_once(tmp_path):
     store = _store(tmp_path)
     calls = []
