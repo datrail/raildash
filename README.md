@@ -162,9 +162,8 @@ paths are evidence values).
 `observed_file_access` takes part in drift like any attribute. When it
 changes, the drift view lists the paths by what changed (newly written, run,
 read or opened; no longer written, run, read or opened) instead of two raw
-lists. A reading that declares a `window` (see evidence bundle v2 below)
-lists only what is newly seen, since a quieter window is not something
-stopped.
+lists. A window list (see evidence bundle v2 below) lists only what is
+newly seen, since a quieter window is not something stopped.
 
 The value of an attribute RailMon publishes as *dynamic*
 (`raildash/schemas/attribute-groups.json`, vendored from RailMon) never takes
@@ -353,9 +352,18 @@ it turns true. A new item or a newly-true `union` key is the usual
 no change at all, and the member itself is never drift. The current
 reading's declaration is used, else the baseline's, so a baseline locked
 before RailMon emitted it compares the same way. Status and the other
-qualifiers are still compared exactly, and a reading without a window on
+qualifiers are still compared exactly, and a v2 reading without a window on
 either side is compared exactly as before. The emitted shape is unchanged,
 so this stays `drift_contract_version: 2`.
+
+A v1 bundle cannot declare a `window`, but a single RailMon scan writes v1
+with the same window lists. So a v1 comparison reads the six lists RailMon
+windows in v2 (`tool_names`, `observed_destinations`,
+`undeclared_destinations`, `observed_listeners`, `observed_ingress_peers`
+and `observed_file_access`) by the declarations RailMon gives them there
+(`V1_WINDOW_LISTS`, checked against RailMon's composer in CI). A re-scan of
+an unchanged agent that saw fewer hosts, or the same hosts a different
+number of times, is not drift.
 
 A v1 bundle compared with a v2 baseline (or the reverse) is
 `CONTRACT_MISMATCH`. v1 comparisons still emit contract v1 unchanged.

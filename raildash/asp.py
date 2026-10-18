@@ -568,8 +568,11 @@ def _bundle_changes(
     # dynamic attribute's value is where this copy runs. Preserve their
     # evidence qualifiers as drift, but omit only those copy-specific values
     # after the explicit logical-identity gate (`_comparison_attributes`).
-    baseline_attributes = _comparison_attributes(baseline["attributes"])
-    current_attributes = _comparison_attributes(current["attributes"])
+    baseline_attributes, current_attributes = _window_attributes(
+        _comparison_attributes(baseline["attributes"]),
+        _comparison_attributes(current["attributes"]),
+        implied=V1_WINDOW_LISTS,
+    )
     changes.extend(
         _map_changes(
             baseline_attributes,
@@ -661,6 +664,23 @@ def _bundle_changes_v2(
     return changes
 
 
+# The lists RailMon's composer windows in v2 (`compose_evidence_bundle_v2.
+# WINDOW_LISTS`, which says consumers hard-code it; Rail Center's
+# `alignment._WINDOW_LISTS` is the same table). A v1 bundle carries the same
+# lists from the same collector but its schema has no `window` member, so a
+# v1 comparison reads them by this table: otherwise a re-scan of an unchanged
+# agent that saw fewer hosts, or the same hosts a different number of times,
+# would be drift (DR-217, found by RC-411).
+V1_WINDOW_LISTS: dict[str, dict[str, list[str]]] = {
+    "tool_names": {},
+    "observed_destinations": {"ignore": ["count", "error_count"]},
+    "undeclared_destinations": {},
+    "observed_listeners": {},
+    "observed_ingress_peers": {},
+    "observed_file_access": {"union": ["exec", "read", "write"]},
+}
+
+
 def _comparison_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     # A copy-specific value is never drift; its evidence qualifiers still are
     # (DR-118), so a probe that stops answering is reported.
@@ -673,21 +693,25 @@ def _comparison_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
 
 
 def _window_attributes(
-    baseline: dict[str, Any], current: dict[str, Any]
+    baseline: dict[str, Any],
+    current: dict[str, Any],
+    *,
+    implied: dict[str, dict[str, list[str]]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Project v2 attributes that declare a `window` (DR-169) for comparison.
+    """Project attributes that hold a collector's window (DR-169) for comparison.
 
     Such a list holds only what the collector's window saw, so its value is
     drift only when the current window saw something the baseline did not:
     a new item, or a `union` key newly true. A quieter window is not. One
     declaration covers both sides, the current reading's if it has one, so
-    items are keyed the same way; the member itself is never drift. A
-    reading without a `window` on either side is compared exactly.
+    items are keyed the same way; the member itself is never drift. A v2
+    reading without a `window` on either side is compared exactly; v1 cannot
+    declare one, so its window lists come from `implied` (DR-217).
     """
     baseline, current = dict(baseline), dict(current)
     for name in baseline.keys() & current.keys():
         before, after = baseline[name], current[name]
-        window = after.get("window", before.get("window"))
+        window = after.get("window", before.get("window", (implied or {}).get(name)))
         if window is None:
             continue
         before = {key: value for key, value in before.items() if key != "window"}
