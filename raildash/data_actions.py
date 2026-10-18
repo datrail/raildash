@@ -320,6 +320,8 @@ def classify(
         del sources[READ]
         reasons.pop("annotation readOnlyHint", None)
 
+    # A model's "no data action", shown only if nothing else classifies the tool.
+    nothing: dict[str, None] = {}
     if not sources and model_classifier is not None:
         # Each distinct schema is asked once and the answers unioned, so a
         # doctored newest schema can't speak for the others.
@@ -344,11 +346,13 @@ def classify(
             for action in chosen:
                 sources.setdefault(action, set()).add(SOURCE_MODEL)
             if not chosen:
-                notes.setdefault(f"{said} (no data action, so it stays unclassified)", None)
+                nothing.setdefault(f"{said} (no data action, so it stays unclassified)", None)
             elif len(reasons) < MAX_REASONS:
                 reasons.setdefault(said, None)
 
     actions = [action for action in ACTIONS if action in sources]
+    if not actions:
+        notes.update(nothing)
     result.update(
         actions=actions,
         sources={action: sorted(sources[action]) for action in actions},

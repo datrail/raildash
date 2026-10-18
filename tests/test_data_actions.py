@@ -249,6 +249,7 @@ def test_a_model_answering_no_data_action_leaves_the_tool_unclassified_with_its_
     result = da.classify("frob", [schema("a"), schema("b")], model_classifier=lambda _s: next(answers))
     assert result["actions"] == ["upload"] and not result["unclassified"]
     assert result["reasons"] == ["model m1: sends"]
+    assert result["notes"] == []  # "stays unclassified" would contradict the upload
 
     assert "empty when the tool does none" in da.model_request_body("m1", {})["messages"][0]["content"]
     reply = {"choices": [{"message": {"content": json.dumps({"actions": [], "reason": "r"})}}]}
