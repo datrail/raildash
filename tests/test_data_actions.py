@@ -229,9 +229,33 @@ def test_the_model_is_asked_only_when_nothing_else_fired_and_only_closed_answers
     assert result["reasons"] == ["model m1: fetches"]
     da.classify("upload_file", [schema()], model_classifier=model)
     assert len(asked) == 1  # a tool the rules classify never reaches the model
-    for bad in (None, {"actions": []}, {"actions": ["exfiltrate"]}, {"actions": ["read", "steal"]}, "read"):
+    for bad in (None, {"actions": None}, {"actions": ["exfiltrate"]}, {"actions": ["read", "steal"]}, "read"):
         result = da.classify("frobnicate", [schema()], model_classifier=lambda _s, bad=bad: bad)
-        assert result["unclassified"]
+        assert result["unclassified"] and not result["notes"]
+
+
+def test_a_model_answering_no_data_action_leaves_the_tool_unclassified_with_its_reason():
+    # RC-412: the prompt asked for a non-empty set, so a tool that takes no
+    # data action was always given one. Nothing is still unclassified, which
+    # the rule refuses until allowed: a description can steer a model to it.
+    nothing = {"actions": [], "reason": "waits for a page to load", "model": "m1"}
+    result = da.classify("browser_wait_for", [schema("Waits.")], model_classifier=lambda _s: nothing)
+    assert result["unclassified"] and result["actions"] == [] and not result["weak_read"]
+    assert result["reasons"] == []
+    assert result["notes"] == ["model m1: waits for a page to load (no data action, so it stays unclassified)"]
+
+    # Another schema's answer still counts: the union only adds.
+    answers = iter([nothing, {"actions": ["upload"], "reason": "sends", "model": "m1"}])
+    result = da.classify("frob", [schema("a"), schema("b")], model_classifier=lambda _s: next(answers))
+    assert result["actions"] == ["upload"] and not result["unclassified"]
+    assert result["reasons"] == ["model m1: sends"]
+
+    assert "empty when the tool does none" in da.model_request_body("m1", {})["messages"][0]["content"]
+    reply = {"choices": [{"message": {"content": json.dumps({"actions": [], "reason": "r"})}}]}
+    assert da.parse_model_reply("m1", reply) == {"actions": [], "reason": "r", "model": "m1"}
+    for bad in ({"actions": None}, {"reason": "r"}, {"actions": ["steal"]}, ["read"]):
+        reply = {"choices": [{"message": {"content": json.dumps(bad)}}]}
+        assert da.parse_model_reply("m1", reply) is None
 
 
 def test_the_model_request_carries_the_schema_and_no_captured_value():

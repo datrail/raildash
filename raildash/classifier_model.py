@@ -13,7 +13,8 @@ Only a tool's schema is sent (its name, description and argument schema),
 never a captured value (`data_actions.model_request_body`). The model is
 asked only about tools the deterministic rules left unclassified, and its
 answer counts only when every action is from the closed set; its `read` is
-weak.
+weak. An empty answer, no data action, is cached like any other and leaves
+the tool `unclassified`, with the model's reason as a note.
 
 A network call never runs while RailDash holds its store lock: classifying
 reads answers from a cache table only (`lookup`), and a miss is queued for
