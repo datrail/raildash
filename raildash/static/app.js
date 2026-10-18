@@ -501,13 +501,16 @@ function fileEntries(record) {
 
 // DR-169: a list that declares a `window` holds only what that window saw,
 // so what a quieter window did not see is not something the sandbox stopped.
-function isWindowed(before, after) {
-  return [before, after].some((record) => Boolean(record && record.window));
+// A v1 change (no `agent_key` member) cannot declare one, and the server
+// compares v1's file access as RailMon's window all the same (DR-217).
+function isWindowed(change) {
+  return !("agent_key" in change)
+    || [change.baseline, change.current].some((record) => Boolean(record && record.window));
 }
 
 // Rows of [label, paths], in the order a reader cares about: what the
 // sandbox started doing before what it stopped doing, writes first.
-function fileAccessChanges(before, after) {
+function fileAccessChanges(before, after, windowed) {
   const previous = fileEntries(before);
   const current = fileEntries(after);
   const keys = [...new Set([...previous.keys(), ...current.keys()])];
@@ -535,7 +538,7 @@ function fileAccessChanges(before, after) {
     .sort();
   gained.push(["Newly opened", opened(previous, current)]);
   lost.push(["No longer opened", opened(current, previous)]);
-  return [...gained, ...(isWindowed(before, after) ? [] : lost)].filter(([, paths]) => paths.length);
+  return [...gained, ...(windowed ? [] : lost)].filter(([, paths]) => paths.length);
 }
 
 function describeFileAccessRecord(record) {
@@ -565,7 +568,8 @@ function renderFileAccessDiffRow(change) {
     dl.append(el("dd", null, change.fields.join(", ")));
   }
   row.append(dl);
-  const paths = fileAccessChanges(change.baseline, change.current);
+  const windowed = isWindowed(change);
+  const paths = fileAccessChanges(change.baseline, change.current, windowed);
   paths.forEach(([label, items]) => {
     const line = el("div", "drift-change asp-file-change");
     line.dataset.kind = label;
@@ -577,7 +581,7 @@ function renderFileAccessDiffRow(change) {
     row.append(line);
   });
   if (!paths.length) {
-    row.append(el("p", "muted", isWindowed(change.baseline, change.current)
+    row.append(el("p", "muted", windowed
       ? "Nothing newly opened; only the qualifiers moved."
       : "The same files, opened the same way; only the qualifiers moved."));
   }
