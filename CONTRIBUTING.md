@@ -9,10 +9,10 @@ needs no cloud account or control plane.
 ## Contracts are shared, not invented here
 
 RailDash speaks the contracts the other DatRail components already speak:
-RailMon's webhook and evidence-bundle formats, and the shape of Rail Center's
-`POST /v1/evidence-bundles`. A component must not need code changes or special
-cases to talk to RailDash. If a contribution requires that, it is the wrong
-shape. Open an issue and we will find another way.
+RailMon's webhook and evidence-bundle formats, and the bundle bytes Rail
+Center takes on `POST /v1/agents/register`. A component must not need code
+changes or special cases to talk to RailDash. If a contribution requires that,
+it is the wrong shape. Open an issue and we will find another way.
 
 ## Known limitations, not bugs
 
