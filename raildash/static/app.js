@@ -1201,20 +1201,23 @@ function renderRequireContainment(agentRef, egress, refresh) {
   return section;
 }
 
-// DR-205: declared MCP tools the proposal doesn't allow, each with what it
-// could do and why, so blocking them before they're ever called is a
-// choice the user sees, not one made behind their back.
+// DR-205: MCP tools the proposal doesn't allow, each with what it could do
+// and why, so blocking them is a choice the user sees, not one made behind
+// their back. A tool called while learning is here when its only action is
+// a weak read: one the server's hints or description, or a model, gave, or
+// that the server's destructive hint or an unnamed mode weakens (RC-414).
 function renderDataActionsBlocked(blocked) {
   const wrap = el("div", "guardrail-blocked");
   if (!blocked || !blocked.length) return wrap;
   wrap.append(el("p", null,
     "Blocked until allowed: declared tools this agent didn't use while learning that could send, " +
-    "change, delete or run something (or whose read only a hint vouches for):"));
+    "change, delete or run something or can't be classified, and tools, used or not, whose only " +
+    "action is a read the guardrail can't trust on its own:"));
   const list = el("ul", "guardrail-would-be");
   blocked.forEach((entry) => {
     const item = el("li");
     const what = entry.unclassified ? "unclassified"
-      : entry.actions.map((a) => (a === "read" && entry.weak_read ? "read (hint)" : a)).join(", ");
+      : entry.actions.map((a) => (a === "read" && entry.weak_read ? "read (unverified)" : a)).join(", ");
     item.append(el("code", null, entry.tool), el("span", "muted", ` ${what}`));
     if (entry.reasons && entry.reasons.length) item.append(el("span", "muted", ` — ${entry.reasons.join("; ")}`));
     list.append(item);
@@ -1383,7 +1386,7 @@ function renderDataActionWhy(tool, action, active, refresh) {
       dataActionTools.set(tool, { found, at: cached && cached.found === found ? cached.at : Date.now() });
       const why = found.classification;
       const said = `${why.actions.length ? why.actions.join(", ") : "unclassified"}` +
-        `${why.weak_read ? " (read only on a hint)" : ""}: ${why.reasons.join("; ") || "no signal"}`;
+        `${why.weak_read ? " (a read the guardrail can't trust on its own)" : ""}: ${why.reasons.join("; ") || "no signal"}`;
       // With an override in force, that is what the rule judges by; the
       // classifier's view (over every capture of the tool) is shown under it.
       body.append(el("p", null, override
@@ -2102,13 +2105,14 @@ function profileValues(title, items, noun) {
 
 // DR-205: what each tool call did with data, as classified from the schema
 // the agent was given. Upload rows come first (the server orders them).
-// A read only a server's hint or a model gave is marked, since the
+// A weak read is marked: one only a server's hint or description, or a
+// model, gave, or one its destructive hint or an unnamed mode weakens. The
 // guardrail never trusts it on its own.
 function dataActionsLabel(item) {
   if (item.unreadable) return "unreadable call";
   if (!item.actions.length) return "unclassified";
   return item.actions
-    .map((action) => (action === "read" && item.weak_read ? "read (hint)" : action))
+    .map((action) => (action === "read" && item.weak_read ? "read (unverified)" : action))
     .join(" + ");
 }
 
