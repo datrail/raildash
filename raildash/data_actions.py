@@ -14,7 +14,9 @@ every signal that fires adds actions from a closed set with a reason:
    `unclassified`, which the rule refuses until allowed. `openWorldHint`
    adds nothing and is reported;
 3. every word of the tool's own name that is in the verb table, else of
-   its description's first sentence. Nouns that are also verbs count too
+   its description's first sentence, whose `read` is weak: the server
+   writes the description, so a framed first sentence could make any tool
+   whose name holds no verb a read (RC-414). Nouns that are also verbs count too
    (`get_commit` is `read` and `upload`): that fails safe, since reading
    only the first verb would let a leading noun hide a later `delete`
    (`query_execute` would be a strong `read`), and the user allows it once;
@@ -31,9 +33,11 @@ every signal that fires adds actions from a closed set with a reason:
 
 A tool's actions are the union over every schema it was seen with, so a
 schema that drops its `content` argument can't make an upload tool read-only.
-A `read` that only an annotation or a model supplied is *weak*: shown, never
-allowed by a proposal (§4.4), because a server writes its own hints and its
-description can steer a model.
+A `read` that only an annotation, a model or a description supplied is
+*weak*: shown, never allowed by a proposal (§4.4), because a server writes
+its own hints and description, and its description can steer a model. Only
+the tool's name, which is what the agent calls, or a mode argument's values
+make a read strong.
 
 This module is pure: no storage, no network. The model step is a callable
 the caller passes in (`model_classifier`).
@@ -60,7 +64,7 @@ SOURCE_MODEL = "model"
 
 # Bumped whenever the table, the argument rules or the model prompt change,
 # so stored classifications are redone (§4.2, last paragraph).
-CLASSIFIER_VERSION = 5
+CLASSIFIER_VERSION = 6
 
 VERBS: dict[str, str] = {
     **dict.fromkeys(
@@ -219,6 +223,7 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
         where = "description"
     for action, word in verbs:
         add(action, SOURCE_RULE, f'{where} verb "{word}"')
+    strong_read = where == "name" and any(action == READ for action, _ in verbs)
 
     input_schema = schema.get("input_schema") if isinstance(schema.get("input_schema"), dict) else {}
     unnamed_mode = False
@@ -236,6 +241,7 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
                 verbs = _verb_actions(value) if isinstance(value, str) else []
                 for action, word in verbs:
                     add(action, SOURCE_RULE, f'argument "{name}" mode "{value}"')
+                    strong_read = strong_read or action == READ
                 if not verbs and not unnamed_mode:
                     unnamed_mode = True
                     notes.append(f'argument "{name}" has a mode the table can\'t name, so a read is weak')
@@ -245,7 +251,7 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
     if annotations.get("readOnlyHint") is True and not actions:
         add(READ, SOURCE_ANNOTATION, "annotation readOnlyHint")
     return {"actions": actions, "reasons": list(reasons), "first_reason": first_reason,
-            "notes": notes, "weakens_read": destructive or unnamed_mode,
+            "notes": notes, "weakens_read": destructive or unnamed_mode, "strong_read": strong_read,
             "destinations": destination_hints(input_schema)}
 
 
@@ -295,6 +301,7 @@ def classify(
     notes: dict[str, None] = {}
     destinations: set[str] = set()
     weakens_read = False
+    strong_read = False
     valid = [item for item in schemas if isinstance(item, Mapping)]
     for item in valid:
         signals = _schema_signals(tool, item)
@@ -314,6 +321,7 @@ def classify(
             notes.setdefault(note, None)
         destinations.update(signals["destinations"])
         weakens_read = weakens_read or signals["weakens_read"]
+        strong_read = strong_read or signals["strong_read"]
 
     # A weak read is dropped when any schema found a real action.
     if READ in sources and sources[READ] == {SOURCE_ANNOTATION} and set(sources) != {READ}:
@@ -360,11 +368,11 @@ def classify(
         notes=list(notes),
         destinations=sorted(destinations),
         unclassified=not actions,
-        # §4.2: a read only a hint or a model gave is weak, whatever else
-        # the tool does, and so is any read of a tool its server calls
-        # destructive or with a mode the table can't name.
-        weak_read=READ in sources
-        and (weakens_read or sources[READ] <= {SOURCE_ANNOTATION, SOURCE_MODEL}),
+        # §4.2: a read neither the name nor a mode gave (a hint, a model or
+        # the description) is weak, whatever else the tool does, and so is
+        # any read of a tool its server calls destructive or with a mode the
+        # table can't name.
+        weak_read=READ in sources and (weakens_read or not strong_read),
     )
     return result
 

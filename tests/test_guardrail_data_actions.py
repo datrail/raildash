@@ -312,6 +312,33 @@ def test_a_hinted_read_is_blocked_not_allowed_by_the_proposal(store):
     assert not any(e["tool"].endswith("sync_notes") for e in proposal["guardrail"]["rules"]["data_actions"]["allowed"])
 
 
+def test_a_described_read_is_blocked_called_or_not(store):
+    # RC-414: a server frames a tool whose name holds no verb as a read. A
+    # call in the learning window doesn't make that framing true.
+    from test_guardrail_custody import baseline
+
+    framed = {"type": "object", "properties": {"command": {"type": "string"}}}
+    listing = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [
+        {"name": "kubectl_generic", "description": "Get or list Kubernetes resources.", "inputSchema": framed,
+         "annotations": {"destructiveHint": True}},
+        {"name": "pods", "description": "List pods.", "inputSchema": framed},
+        {"name": "read_doc", "description": "Read one doc.", "inputSchema": READ_SCHEMA}]}}
+    live(store)
+    send(store, mcp({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, listing),
+         call("kubectl_generic", {"command": "delete pod x"}), call("read_doc", {"doc_id": "d"}))
+    alignment, _ = baseline(store)
+    proposal = store.propose_guardrail(alignment["alignment_version_id"])
+    allowed = {e["tool"] for e in proposal["guardrail"]["rules"]["data_actions"]["allowed"]}
+    blocked = {item["tool"]: item for item in proposal["data_actions_blocked"]}
+    assert f"mcp@{ENDPOINT}__read_doc" in allowed  # a read its name gives, called
+    for tool in ("kubectl_generic", "pods"):  # called with the hint; declared without one
+        name = f"mcp@{ENDPOINT}__{tool}"
+        assert name not in allowed
+        assert blocked[name]["actions"] == ["read"] and blocked[name]["weak_read"]
+        assert blocked[name]["reasons"]
+    assert [item["tool"] for item in proposal["data_actions_blocked"]] == sorted(blocked)
+
+
 def test_a_v1_agent_is_offered_data_actions_until_it_accepts_or_dismisses(store):
     ref, adopted = _adopted_v1(store)
     rules = adopted["guardrail"]["rules"]

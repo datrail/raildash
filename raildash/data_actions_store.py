@@ -541,6 +541,9 @@ class DataActionsStore:
                 "tool": row["_name"] if not special else f"mcp@{call['endpoint'] or '(more calls)'}",
                 "class": call["class"],
                 "classified": list(classification["actions"]) if classification else [],
+                # For the proposal, which must not allow a weak read alone.
+                "weak_read": bool(classification and classification["weak_read"]),
+                "reasons": list(classification["reasons"]) if classification else [],
                 "undeclared": list(call.get("undeclared") or []),
                 "unreadable": special,
                 "bytes": int(call.get("arguments_bytes") or 0),
@@ -567,7 +570,9 @@ class DataActionsStore:
         calls had (an unclassified one as `unclassified`), and every
         declared MCP tool whose only action is a read from the name table
         or arguments. Every other declared MCP tool, weak reads included,
-        is listed as blocked until allowed, with its actions and reasons.
+        is listed as blocked until allowed, with its actions and reasons,
+        and so is a called tool whose only action is a weak read: a call
+        doesn't make its server's hint or description true (RC-414).
         Returns `{"rule": {...}, "blocked_until_allowed": [...]}`."""
         requests = list(requests)
         refs = sorted({capture_ref(request) for request in requests})
@@ -579,6 +584,7 @@ class DataActionsStore:
         # would judge it now. Not the lifetime rows: those also hold calls
         # made after the window, an undeclared upload among them.
         called: dict[str, set[str]] = {}
+        weak: dict[str, list[str]] = {}  # called tools with a weak read: their reasons
         for request in requests:
             raw = request.get("raw")
             if isinstance(raw, str) and not any(marker in raw for marker in _CALL_MARKERS):
@@ -592,6 +598,8 @@ class DataActionsStore:
                 if call["undeclared"]:
                     actions.add(da.UPLOAD)
                 called.setdefault(call["tool"], set()).update(actions or {"unclassified"})
+                if call["weak_read"]:
+                    weak.setdefault(call["tool"], call["reasons"])
         # Every declared tool: model-side lists and endpoint listings.
         trusted = self._trusted_model_hosts()
         schemas = self._trusted_schemas(refs, trusted)
@@ -622,6 +630,12 @@ class DataActionsStore:
                 "tool": tool, "actions": result["actions"], "weak_read": result["weak_read"],
                 "unclassified": result["unclassified"], "reasons": result["reasons"],
             })
+        for tool, reasons in weak.items():
+            if called[tool] == {da.READ}:
+                del called[tool]
+                blocked.append({"tool": tool, "actions": [da.READ], "weak_read": True,
+                                "unclassified": False, "reasons": reasons})
+        blocked.sort(key=lambda item: item["tool"])
         order = (*g.DATA_ACTION_KINDS, *g.DATA_ACTION_PSEUDO)
         rule["allowed"] = [
             {"tool": tool, "actions": [action for action in order if action in actions]}
