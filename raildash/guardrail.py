@@ -1438,7 +1438,8 @@ def evaluate_data_actions(
     Each call is `{tool, class, actions, unclassified, unreadable,
     undeclared, bytes, content_kinds, endpoint}` as the store worked it out
     (`DataActionsStore._calls_for_rule`): its actions from the tool's
-    classification, `upload` added for an undeclared argument. A version's
+    classification, `upload` added for an undeclared argument (`weak_read`
+    and `reasons` are for the proposal; the rule doesn't read them). A version's
     override replaces the classified actions (not the undeclared upload).
     One request yields one violation per (tool, action).
     """
