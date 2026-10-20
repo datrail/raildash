@@ -563,9 +563,9 @@ paths:
       operationId: ingestEvidenceBundle
       summary: Ingest one Agent Security Profile evidence bundle
       description: |
-        Token-gated. RailDash's counterpart to Rail Center's own
-        `POST /v1/evidence-bundles` -- same path and general shape, RailDash's
-        own dedup semantics (content digest, not a client-asserted id). The
+        Token-gated. It takes the same bytes Rail Center takes on
+        `POST /v1/agents/register`, and deduplicates by content digest, not a
+        client-asserted id. The
         body is the exact evidence-bundle bytes, unmodified, bounded by
         `RAILDASH_MAX_EVIDENCE_BUNDLE_BYTES` (default 1,048,576).
       parameters:

@@ -188,11 +188,11 @@ re-exporting an env var. Locked versions and their ASPs are never pruned.
 
 ### HTTP: evidence-bundle ingest
 
-`POST /v1/evidence-bundles` is RailDash's counterpart to Rail Center's own
-`POST /v1/evidence-bundles` — same path and general shape (raw bytes in, a
-202 with a `duplicate` flag on accept), RailDash's own dedup semantics
-(content digest, not a client-asserted id). A scanner (RailMon's, or any
-script) can deliver a bundle without the CLI:
+`POST /v1/evidence-bundles` takes a bundle's raw bytes and answers 202 with
+a `duplicate` flag, deduplicating by content digest rather than a
+client-asserted id. These are the same bytes Rail Center takes on
+`POST /v1/agents/register`. A scanner (RailMon's, or any script) can deliver
+a bundle without the CLI:
 
 ```python
 import requests

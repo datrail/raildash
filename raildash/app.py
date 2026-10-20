@@ -958,10 +958,8 @@ async def ingest_evidence_bundle(
 ) -> JSONResponse:
     """Ingest one Agent Security Profile evidence bundle over HTTP (DR-120/DR-121).
 
-    This is RailDash's counterpart to Rail Center's `POST /v1/evidence-bundles`
-    (`rail-center/api/src/profiling/bundles_router.py`) -- same path and
-    general shape, RailDash's own dedup semantics (content digest, not a
-    client-asserted id).
+    It takes the same bytes Rail Center takes on `POST /v1/agents/register`,
+    and deduplicates by content digest, not a client-asserted id.
 
     Contract for a delivering client (e.g. RailMon's scanner):
 
