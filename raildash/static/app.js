@@ -1140,9 +1140,9 @@ function renderGuardrailPolicy(rules) {
 // declared proxy beside it. Never "Contained" on partial or missing evidence.
 const EGRESS_WORDS = {
   allow_list_enforced: ["Contained",
-    "it can't open connections to outside hosts itself; OpenShell enforces an allow-list (its contents aren't visible to datRail)"],
-  no_network: ["Contained", "it can't open connections to outside hosts itself; no network at all"],
-  internal_network: ["Contained", "it can't open connections to outside hosts itself; internal networks only"],
+    "it should not reach outside hosts itself; OpenShell enforces an allow-list (its contents aren't visible to datRail)"],
+  no_network: ["Contained", "it should not reach outside hosts itself; no network at all"],
+  internal_network: ["Contained", "it should not reach outside hosts itself; internal networks only"],
   open: ["Open", "this agent can reach any host"],
   host_network: ["Open", "on the host's network"],
   host_process: ["Open", "a host process, not in a container"],

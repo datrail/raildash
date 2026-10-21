@@ -310,7 +310,9 @@ A guardrail adopted before RailDash seeded this line doesn't have it;
 **Egress containment.** Each agent's panel has an
 **Egress** line read from RailMon's `egress_containment`, an observed level:
 - Contained: an OpenShell sandbox's enforced allow-list, no network, or
-  internal networks only, naming any container that is the way out.
+  internal networks only, naming any container that is the way out. The
+  line says the agent *should not* reach outside hosts itself: the level is
+  read from Docker's configuration, not tested with a connection.
 - Open: the agent can reach any host, is on the host's network, or is a host
   process.
 
