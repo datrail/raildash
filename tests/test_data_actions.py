@@ -157,6 +157,50 @@ def test_destructive_hint_adds_no_action_and_makes_a_read_weak():
     assert not da.classify("get_page", [schema()])["weak_read"]
 
 
+def test_a_boolean_flag_named_for_a_delete_adds_delete():
+    # RC-413's holdout and RC-412's corpus: since destructiveHint adds
+    # nothing, these deletes went unjudged. Each argument as its server has it.
+    hint = {"destructiveHint": True}
+    rename = schema("Renames a collection in a MongoDB database", {
+        "collection": {"type": "string"}, "newName": {"type": "string"},
+        "dropTarget": {"type": "boolean", "description": "If true, drops the target collection if it exists"},
+    }, hint)
+    block = schema("Notion | Update a block", {
+        "block_id": {"type": "string"},
+        "archived": {"type": "boolean", "description": "Set to true to archive (delete) a block."},
+    }, hint)
+    page = schema("Notion | Update page properties", {
+        "page_id": {"type": "string"}, "archived": {"type": "boolean"}, "in_trash": {"type": "boolean"},
+    }, hint)
+    drain = schema("Manage Kubernetes nodes with cordon, drain, and uncordon operations", {
+        "name": {"type": "string"}, "deleteLocalData": {"type": "boolean"},
+    }, hint)
+    for tool, item, expected in (
+        ("rename-collection", rename, ["update", "delete"]),
+        ("API-update-a-block", block, ["update", "delete"]),
+        ("API-patch-page", page, ["update", "delete"]),
+        ("node_management", drain, ["delete"]),
+    ):
+        result = da.classify(tool, [item])
+        assert result["actions"] == expected, tool
+        assert result["sources"]["delete"] == ["rule"]
+        assert any(reason.startswith("flag ") for reason in result["reasons"]), tool
+    # Without the hint too: a tool known only from a model request has none.
+    assert actions("rename-collection", schema(properties={"dropTarget": {"type": "boolean"}})) == [
+        "update", "delete"]
+    # A tool whose name only reads takes the flag as a filter on what it
+    # returns: Notion's and HubSpot's list and query tools.
+    archived = {"archived": {"type": "boolean"}, "in_trash": {"type": "boolean"}}
+    for tool in ("API-query-data-source", "hubspot-list-objects", "hubspot-list-properties"):
+        result = da.classify(tool, [schema("Query or list", archived)])
+        assert result["actions"] == ["read"] and not result["weak_read"], tool
+    # A name with no verb isn't a name that only reads, and the flag must be
+    # a flag: a string or a number named for a delete adds nothing.
+    assert actions("collection", schema(properties={"dropTarget": {"type": "boolean"}})) == ["delete"]
+    assert actions("rename_thing", schema(properties={"delete_after": {"type": "string"}})) == ["update"]
+    assert da.CLASSIFIER_VERSION >= 7  # stored classifications are redone
+
+
 # RC-414's retrieval-framing pairs, from its 2026-10-17 planted family: the
 # server replaces the description's first sentence with a read tool's.
 KUBECTL_GENERIC = {
