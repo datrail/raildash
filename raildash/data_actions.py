@@ -24,7 +24,12 @@ every signal that fires adds actions from a closed set with a reason:
    `upload`; every verb of every value a mode argument (`method`, `action`,
    ...) may take is read against the verb table, since allowing the tool
    allows every mode, and a mode with no verb in the table makes a read
-   weak; a destination-hint argument is reported and adds nothing;
+   weak; a boolean flag whose name says delete (`dropTarget`, `in_trash`,
+   `archived`) adds `delete`, since setting it deletes and `destructiveHint`
+   no longer says so (RC-413), unless every verb of the tool's name is a
+   read, where such a flag filters what the call returns
+   (`list_objects(archived)`); a destination-hint argument is reported and
+   adds nothing;
 5. an opt-in model, asked only when 1-4 found nothing; its `read` is weak.
    It may answer that the tool takes no data action, which adds none and
    is shown as a note: the tool stays `unclassified`, since a description
@@ -64,7 +69,7 @@ SOURCE_MODEL = "model"
 
 # Bumped whenever the table, the argument rules or the model prompt change,
 # so stored classifications are redone (§4.2, last paragraph).
-CLASSIFIER_VERSION = 6
+CLASSIFIER_VERSION = 7
 
 VERBS: dict[str, str] = {
     **dict.fromkeys(
@@ -94,6 +99,14 @@ VERBS: dict[str, str] = {
 # Upload verbs that also replace what is already there: `write_file`
 # overwrites, `push` moves a ref, `apply` and `put` replace the object.
 OVERWRITE_VERBS = frozenset(("write", "save", "put", "push", "apply"))
+
+# A boolean argument named with one of these deletes when set: the delete
+# verbs, `archive` (Notion's schema calls archiving deleting) and their past
+# participles, which a flag usually takes (`archived`, `deleted`).
+DELETE_FLAG_WORDS = frozenset(
+    [word for word, action in VERBS.items() if action == DELETE]
+    + ["archive", "archived", "deleted", "removed", "destroyed", "dropped", "purged", "trashed"]
+)
 
 DATA_CARRYING_NAMES = frozenset(
     ("content", "contents", "data", "body", "file", "files", "attachment", "attachments",
@@ -224,6 +237,8 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
     for action, word in verbs:
         add(action, SOURCE_RULE, f'{where} verb "{word}"')
     strong_read = where == "name" and any(action == READ for action, _ in verbs)
+    # A tool whose name only reads takes a delete-named flag as a filter.
+    reads_only = where == "name" and bool(verbs) and all(action == READ for action, _ in verbs)
 
     input_schema = schema.get("input_schema") if isinstance(schema.get("input_schema"), dict) else {}
     unnamed_mode = False
@@ -233,6 +248,9 @@ def _schema_signals(tool: str, schema: Mapping[str, Any]) -> dict[str, Any]:
         why = data_carrying(name, spec)
         if why:
             add(UPLOAD, SOURCE_RULE, why)
+        if (not reads_only and isinstance(spec, dict) and spec.get("type") == "boolean"
+                and DELETE_FLAG_WORDS.intersection(words(name))):
+            add(DELETE, SOURCE_RULE, f'flag "{name}"')
         if name.lower() in MODE_NAMES and isinstance(spec, dict) and isinstance(spec.get("enum"), list):
             # Every verb of every mode counts, as in a name, so a leading
             # noun can't hide a later `delete`. A mode the table can't name
