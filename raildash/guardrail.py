@@ -130,7 +130,9 @@ from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator, FormatChecker
 
-from .asp import BUNDLE_VERSION_V2, FILE_ACCESS_ATTRIBUTE, identity_problems, uuid_name_template
+from .asp import (
+    BUNDLE_VERSION_V2, FILE_ACCESS_ATTRIBUTE, identity_problems, only_reads_left_out, uuid_name_template,
+)
 from .ingest import _header, legacy_exchange
 from .json_safety import (
     MAX_SAFE_JSON_BYTES,
@@ -1047,7 +1049,9 @@ def evaluate_asp(
 
     Per rule, from the attribute's status: `ANSWERED` and `ABSENT` are
     verified; `PARTIAL` is violated when a listed item breaks the rule (a
-    capped list keeps what it lists) and Unverified otherwise; `BLIND`,
+    capped list keeps what it lists) and Unverified otherwise, except that
+    `saved_files` on a file list capped only by reads is verified
+    (`raildash.asp.only_reads_left_out`); `BLIND`,
     `FAILED`, `TEMPLATED` and a missing attribute are Unverified. A stale
     or `PARTIAL` ASP, or one with an unreadable listener, is not verified:
     its violations stay real (`state: violated`) and `reason` says why the
@@ -1072,10 +1076,13 @@ def evaluate_asp(
             lambda items: _listener_violations(items, rules["service_ports"]["allowed"], source),
             stale,
         ),
+        # The rule reads writes only, and a list capped only by reads still
+        # lists every write (DR-230), so that PARTIAL is complete for it.
         "saved_files": _attribute_rule(
             attributes.get(FILE_ACCESS_ATTRIBUTE),
             lambda items: _file_violations(items, rules["saved_files"]["allowed"], source),
             stale,
+            complete=only_reads_left_out(attributes.get(FILE_ACCESS_ATTRIBUTE)),
         ),
     }
     if EGRESS in rules:
@@ -1151,7 +1158,9 @@ def _egress_rule(
     return {"state": VIOLATED, "reason": reason, "violations": [violation]}
 
 
-def _attribute_rule(attribute: Any, check: Any, stale: bool) -> dict[str, Any]:
+def _attribute_rule(attribute: Any, check: Any, stale: bool, *, complete: bool = False) -> dict[str, Any]:
+    """One ASP rule on its attribute. `complete` says a `PARTIAL` value is
+    missing nothing the rule reads, so it is judged like `ANSWERED`."""
     if not isinstance(attribute, dict):
         return {"state": UNVERIFIED, "reason": NOT_COLLECTED, "violations": []}
     status = attribute.get("status")
@@ -1166,7 +1175,7 @@ def _attribute_rule(attribute: Any, check: Any, stale: bool) -> dict[str, Any]:
         return {"state": UNVERIFIED, "reason": status or NOT_COLLECTED, "violations": []}
     if malformed:
         reason: str | None = MALFORMED_EVIDENCE
-    elif status == "PARTIAL":
+    elif status == "PARTIAL" and not complete:
         # A restarted or capped probe may have missed exactly the one item
         # that breaks the rule: the failure that looks like success (§5).
         reason = PARTIAL_NO_VIOLATION
