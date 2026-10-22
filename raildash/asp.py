@@ -740,6 +740,25 @@ _UUIDS = re.compile(r"(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 # reason (railmon `tools/scan/evidence_bundle.py`; rule pack 11 is frozen).
 # A reworded note only turns the rule off, which reports drift, not less.
 _READS_LEFT_OUT = "more distinct files than the cap (reads are left out first)"
+_FILES_MAY_BE_MISSING = ": files may be missing from this list"
+
+
+def only_reads_left_out(attribute: Any) -> bool:
+    """Whether `observed_file_access` is `PARTIAL` only because RailMon's cap
+    left reads out (DR-230): reason `SIZE_CAP_EXCEEDED`, and the note's one
+    gap is the read cap. RailMon keeps every write and exec ahead of reads,
+    and names any other gap in that note (a write or exec past the cap, a
+    path it could not name, a probe restart, stale or lost events), so such
+    a list still lists every file written. Anything else is False."""
+    if not isinstance(attribute, dict) or attribute.get("status") != "PARTIAL":
+        return False
+    note = attribute.get("note")
+    return (
+        attribute.get("reason") == "SIZE_CAP_EXCEEDED"
+        and isinstance(note, str)
+        and _FILES_MAY_BE_MISSING in note
+        and note.partition(_FILES_MAY_BE_MISSING)[0] == _READS_LEFT_OUT
+    )
 
 
 def uuid_name_template(path: str) -> str | None:

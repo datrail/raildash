@@ -476,6 +476,67 @@ def test_each_asp_rule_against_each_evidence_status(store, rule, status, items, 
         assert result["violations"][0]["detail"]["kind"] == ".zip"
 
 
+# RailMon's note on a capped file list (railmon `tools/scan/evidence_bundle.py`),
+# with each gap it can name ahead of the read cap's or after it.
+FILES_MISSING = ": files may be missing from this list"
+READS_LEFT_OUT = "more distinct files than the cap (reads are left out first)"
+FOLDED = ("; randomly named temp files are folded into one path per directory and name "
+          "pattern, with * for the random part, and Python bytecode-cache writes into one "
+          "__pycache__/*.pyc per directory")
+
+
+def _capped_files(items: str, *, reason: str = "SIZE_CAP_EXCEEDED", gaps: tuple = (READS_LEFT_OUT,),
+                  folded: str = "") -> dict:
+    field = observed(FILE_ITEMS[items], "ANSWERED", FILE_METHOD)
+    field.update(status="PARTIAL", reason=reason, note="; ".join(gaps) + FILES_MISSING + folded)
+    return field
+
+
+@pytest.mark.parametrize("folded", ["", FOLDED])
+def test_a_file_list_capped_only_by_reads_still_verifies_saved_files(store, folded):
+    # DR-230 (Kyle's OpenClaw demo): RailMon keeps every write ahead of reads,
+    # so a list that left only reads out lists every file the rule reads.
+    for items, state, count in (("clean", "held", 0), ("violating", "violated", 1)):
+        asp_id, bundle = stored(store, v1_bundle(observed_file_access=_capped_files(items, folded=folded)))
+        result = g.evaluate_asp(guardrail(), bundle, asp_id=asp_id, previous_collected_at=PREVIOUS, now=NOW)
+        rule = result["rules"]["saved_files"]
+        assert (rule["state"], rule["reason"], len(rule["violations"])) == (state, None, count)
+
+
+@pytest.mark.parametrize(
+    ("reason", "gaps"),
+    [
+        # A write or exec lost to the cap, or a file it could not name.
+        ("SIZE_CAP_EXCEEDED", (READS_LEFT_OUT, "written or run files past the cap")),
+        ("SIZE_CAP_EXCEEDED", (READS_LEFT_OUT, "a file whose path filesnoop could not read, "
+                               "or longer than the cap")),
+        ("SIZE_CAP_EXCEEDED", ("a file whose path filesnoop could not read, or longer than the cap",
+                               "a written or run file among them")),
+        # A probe gap: what opened while it was down is missing, writes too.
+        ("NO_SOURCE_ACCESS", ("filesnoop restarted 1 time (what opened while it was down is missing)",
+                              READS_LEFT_OUT)),
+        ("SIZE_CAP_EXCEEDED", ("filesnoop reported lost events", READS_LEFT_OUT)),
+        # The read cap's words under any other reason, or a note RailMon rewords.
+        ("NO_SOURCE_ACCESS", (READS_LEFT_OUT,)),
+        ("SIZE_CAP_EXCEEDED", ("more distinct files than the cap",)),
+    ],
+)
+def test_any_other_file_list_gap_keeps_saved_files_unverified(store, reason, gaps):
+    asp_id, bundle = stored(store, v1_bundle(observed_file_access=_capped_files("clean", reason=reason, gaps=gaps)))
+    result = g.evaluate_asp(guardrail(), bundle, asp_id=asp_id, previous_collected_at=PREVIOUS, now=NOW)
+    assert result["rules"]["saved_files"] == {"state": "unverified", "reason": "PARTIAL", "violations": []}
+    asp_id, bundle = stored(store, v1_bundle(observed_file_access=_capped_files("violating", reason=reason, gaps=gaps)))
+    result = g.evaluate_asp(guardrail(), bundle, asp_id=asp_id, previous_collected_at=PREVIOUS, now=NOW)
+    assert (result["rules"]["saved_files"]["state"], result["rules"]["saved_files"]["reason"]) == ("violated", "PARTIAL")
+
+
+def test_a_read_capped_file_list_on_a_stale_asp_is_still_unverified(store):
+    late = "2026-09-24T00:06:00Z"  # as in the stale test below
+    asp_id, bundle = stored(store, v1_bundle(observed_file_access=_capped_files("clean")))
+    result = g.evaluate_asp(guardrail(), bundle, asp_id=asp_id, previous_collected_at=PREVIOUS, now=late)
+    assert result["rules"]["saved_files"] == {"state": "unverified", "reason": "STALE", "violations": []}
+
+
 @pytest.mark.parametrize("rule", ["service_ports", "saved_files"])
 def test_a_stale_asp_is_unverified_but_its_violations_stay_real(store, rule):
     late = "2026-09-24T00:06:00Z"  # 6 min after a 1-min gap: bound is 5 min
