@@ -1053,7 +1053,8 @@ def evaluate_asp(
     `saved_files` on a file list capped only by reads is verified
     (`raildash.asp.only_reads_left_out`); `BLIND`,
     `FAILED`, `TEMPLATED` and a missing attribute are Unverified. A stale
-    or `PARTIAL` ASP, or one with an unreadable listener, is not verified:
+    or `PARTIAL` ASP (but for that `saved_files` exception), or one with an
+    unreadable listener, is not verified:
     its violations stay real (`state: violated`) and `reason` says why the
     rule still is not verified.
     """
@@ -1276,7 +1277,8 @@ def agent_state(
     `violated` and it has no `reason`; one missing from `rule_results` is
     not. So a rule whose latest evidence was violated but whose rows no
     longer count (acknowledged or allowed) was verified, while one violated
-    on stale or `PARTIAL` evidence was not, and its agent is Unverified."""
+    on stale or `PARTIAL` evidence (a `reason`) was not, and its agent is
+    Unverified."""
     if not has_active_guardrail:
         return STATE_NO_GUARDRAIL
     if counting_rows > 0:
