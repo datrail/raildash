@@ -909,6 +909,37 @@ def test_a_proposal_allows_python_bytecode_caches_with_one_shown_glob(store):
         assert not g.saved_file_allowed(path, allowed), path
 
 
+def test_a_proposal_and_allow_this_take_a_uuid_named_write_as_its_glob(store):
+    """DR-229 (railmon#97): OpenClaw writes `sessions.json.1.<uuid>.tmp` with
+    a fresh uuid every turn. An exact entry would be violated next turn, so
+    the name's glob is seeded, once for every uuid it covers."""
+    sessions = "/root/.openclaw/agents/main/sessions"
+    first = f"{sessions}/sessions.json.1.0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d.tmp"
+    second = f"{sessions}/sessions.json.1.FFFFFFFF-0000-4000-8000-000000000000.tmp"
+    alignment, bundle = _lock(store, v1_bundle(observed_file_access=observed(
+        [_file(first), _file(second), _file("/app/agent.log")], method=FILE_METHOD)))
+    allowed = _propose(alignment, bundle, [])["guardrail"]["rules"]["saved_files"]["allowed"]
+    glob = {"path": f"{sessions}/sessions.json.1.*.tmp"}
+    assert allowed == [g.BYTECODE_CACHE_ENTRY, {"path": "/app/agent.log", "literal": True}, glob]
+    assert g.saved_file_allowed(f"{sessions}/sessions.json.1.11111111-2222-4333-8444-555555555555.tmp", allowed)
+    for path in (f"{sessions}/sessions.json.2.0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d.tmp",
+                 f"{sessions}/sub/sessions.json.1.x.tmp", "/root/.openclaw/sessions.json.1.x.tmp"):
+        assert not g.saved_file_allowed(path, allowed), path
+
+    row = {"rule": "saved_files", "item": second, "detail": {}}
+    rules = {"saved_files": {"allowed": [g.BYTECODE_CACHE_ENTRY]}}
+    assert g.with_item_allowed(rules, row)["saved_files"]["allowed"][-1] == glob
+    # A name without a uuid, or a path RailMon already templated, stays exact.
+    # So does a name with under three letters or digits before its uuid:
+    # its glob would be (nearly) the whole directory.
+    for path in ("/app/agent.log", "/tmp/tmp*", "/proc/*/0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d",
+                 "/etc/cron.d/0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d",
+                 "/workspace/0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d.json",
+                 "/root/.0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d", "/root/x-0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d"):
+        row = {"rule": "saved_files", "item": path, "detail": {}}
+        assert g.with_item_allowed(rules, row)["saved_files"]["allowed"][-1] == {"path": path, "literal": True}
+
+
 def test_a_proposal_from_absent_declarations_says_why_its_lists_are_empty(store):
     # The real fixture as RailMon wrote it: no MCP config, no base URL.
     alignment, bundle = _lock(store, v1_bundle())

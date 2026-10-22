@@ -130,7 +130,7 @@ from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator, FormatChecker
 
-from .asp import BUNDLE_VERSION_V2, FILE_ACCESS_ATTRIBUTE, identity_problems
+from .asp import BUNDLE_VERSION_V2, FILE_ACCESS_ATTRIBUTE, identity_problems, uuid_name_template
 from .ingest import _header, legacy_exchange
 from .json_safety import (
     MAX_SAFE_JSON_BYTES,
@@ -443,6 +443,22 @@ def saved_file_allowed(path: str, entries: Iterable[Mapping[str, Any]]) -> bool:
         if matched and ("kinds" not in entry or file_kind(path) in entry["kinds"]):
             return True
     return False
+
+
+def saved_file_entry(path: str) -> dict[str, Any]:
+    """The entry a proposal or **Allow this** makes for one written path:
+    the path exactly, or, when its file name holds a uuid, that name with
+    each run of uuids as `*` in the same directory (DR-229). An agent that
+    writes `sessions.json.1.<uuid>.tmp` on every turn mints a new path each
+    time, so an exact entry would be violated again on the next turn. A name
+    with fewer than three letters or digits before its first uuid stays
+    exact: `<dir>/*`, `<dir>/*.json` or `<dir>/.*` would allow any file,
+    any file of a kind, or every hidden file in that directory."""
+    template = uuid_name_template(path)
+    prefix = template.rpartition("/")[2].partition("*")[0] if template is not None else ""
+    if sum(character.isalnum() for character in prefix) < 3:
+        return {"path": path, "literal": True}
+    return {"path": template}
 
 
 # ------------------------------------------------------------------ ports
@@ -1522,8 +1538,10 @@ def propose_guardrail(
     the proposal (the baseline's listeners, undeclared hosts and MCP servers
     it called) is listed for the user to allow with one click, and a
     declared list left empty says why. `saved_files` is the baseline's
-    written paths, each exact, after `BYTECODE_CACHE_ENTRY`, the one glob
-    seeded (a written path it already allows isn't listed again). A
+    written paths, each exact, after `BYTECODE_CACHE_ENTRY`, the one fixed
+    glob; a path whose file name holds a uuid is seeded as that name's glob
+    (`saved_file_entry`), and a written path an earlier entry already allows
+    isn't listed again. A
     multi-agent baseline gets no proposal (`reason: MULTI_AGENT`).
     """
     if is_multi_agent(bundle):
@@ -1549,8 +1567,8 @@ def propose_guardrail(
     saved: list[dict[str, Any]] = [dict(BYTECODE_CACHE_ENTRY)]
     if files.get("status") in ("ANSWERED", "PARTIAL") and isinstance(files.get("value"), list):
         for path in sorted({entry["path"] for entry in files["value"] if entry["write"]}):
-            if not kernel_interface_path(path) and not saved_file_allowed(path, [BYTECODE_CACHE_ENTRY]):
-                saved.append({"path": path, "literal": True})
+            if not kernel_interface_path(path) and not saved_file_allowed(path, saved):
+                saved.append(saved_file_entry(path))
     elif files.get("status") != "ABSENT":
         empty_because["saved_files.allowed"] = _why_empty(files)
 
@@ -1748,7 +1766,7 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
     """The rules of the version **Allow this** makes from one stored row
     (§4.5): the row's item added to its rule, as narrowly as the row names
     it. A listener is allowed by its own protocol, address and port; a path
-    as a literal entry; a host by its exact name; an MCP row by its server;
+    as a literal entry, or as its uuid glob (`saved_file_entry`); a host by its exact name; an MCP row by its server;
     a denied tool call by taking it off `denied_tool_calls`.
 
     Raises `ValueError` for a row one click can't allow: the overflow row
@@ -1767,7 +1785,7 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
         updated["service_ports"]["allowed"].append(entry)
         return updated
     if rule == "saved_files":
-        updated["saved_files"]["allowed"].append({"path": item, "literal": True})
+        updated["saved_files"]["allowed"].append(saved_file_entry(item))
         return updated
     if item == UNKNOWN_HOST:
         raise ValueError("a request with no host can't be allowed")

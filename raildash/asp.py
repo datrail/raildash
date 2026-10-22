@@ -716,11 +716,93 @@ def _window_attributes(
             continue
         before = {key: value for key, value in before.items() if key != "window"}
         after = {key: value for key, value in after.items() if key != "window"}
-        if not _window_value_drift(before.get("value"), after.get("value"), window):
+        before_value, after_value = before.get("value"), after.get("value")
+        if name == FILE_ACCESS_ATTRIBUTE:
+            before_value, after_value = _comparable_file_access(before, after_value)
+        if not _window_value_drift(before_value, after_value, window):
             before.pop("value", None)
             after.pop("value", None)
         baseline[name], current[name] = before, after
     return baseline, current
+
+
+# DR-229 (railmon#97): a file named with a fresh uuid each time, such as
+# OpenClaw's `sessions.json.1.<uuid>.tmp` written on every turn, outside the
+# temp directories RailMon folds. Within one windowed file-access comparison
+# each uuid in a file's name reads as `*`, so the same file written again
+# under a new uuid is not newly written. The directory and the rest of the
+# name still count. The price, as for RailMon's temp names: a new file named
+# like one already in the baseline but for its uuid is aligned. A run of
+# uuids is one `*`: two `*` side by side would be a `**`, which as a
+# guardrail glob crosses directories.
+_UUIDS = re.compile(r"(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})+")
+# RailMon's note on a file list whose cap left reads out, whatever its
+# reason (railmon `tools/scan/evidence_bundle.py`; rule pack 11 is frozen).
+# A reworded note only turns the rule off, which reports drift, not less.
+_READS_LEFT_OUT = "more distinct files than the cap (reads are left out first)"
+
+
+def uuid_name_template(path: str) -> str | None:
+    """`path` with each run of uuids in its file name made `*`, or None when the
+    name has none, or the path already has a `*` (RailMon's own templates),
+    which as a guardrail glob would match more than it says."""
+    if "*" in path:
+        return None
+    directory, slash, name = path.rpartition("/")
+    templated = _UUIDS.sub("*", name)
+    return directory + slash + templated if templated != name else None
+
+
+def _comparable_file_access(
+    baseline: dict[str, Any], current_value: Any
+) -> tuple[Any, Any]:
+    """Both `observed_file_access` values as a windowed comparison reads them.
+
+    Each uuid in a file name is folded (`uuid_name_template`). And when the
+    baseline's list left reads out at RailMon's cap, a current read-only
+    entry it doesn't list is dropped if it sorts after the baseline's last
+    listed read-only entry: RailMon keeps every write and exec, then reads by
+    (path, layer), so whether its window saw it is unknown, and an unknown
+    is not drift. One that sorts before that entry would have been listed,
+    so it is still newly seen. Entries are taken as RailMon sent
+    them, before folding, since that is the order its cap used.
+    """
+    before = baseline.get("value")
+    if not isinstance(before, list) or not isinstance(current_value, list):
+        return before, current_value
+
+    def read_only(entry: dict[str, Any]) -> bool:
+        return entry.get("write") is not True and entry.get("exec") is not True
+
+    def key(entry: dict[str, Any]) -> tuple[str, bool]:
+        return (entry["path"], entry.get("layer") is True)
+
+    entries = [entry for entry in before if isinstance(entry, dict) and isinstance(entry.get("path"), str)]
+    if (
+        baseline.get("status") == "PARTIAL"
+        and _READS_LEFT_OUT in str(baseline.get("note") or "")
+    ):
+        listed = {key(entry) for entry in entries}
+        last_read = max((key(entry) for entry in entries if read_only(entry)), default=None)
+        current_value = [
+            entry for entry in current_value
+            if not (
+                isinstance(entry, dict)
+                and isinstance(entry.get("path"), str)
+                and read_only(entry)
+                and key(entry) not in listed
+                and (last_read is None or key(entry) > last_read)
+            )
+        ]
+
+    def folded(value: list[Any]) -> list[Any]:
+        return [
+            {**entry, "path": uuid_name_template(entry["path"]) or entry["path"]}
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str) else entry
+            for entry in value
+        ]
+
+    return folded(before), folded(current_value)
 
 
 def _window_value_drift(before: Any, after: Any, window: dict[str, Any]) -> bool:

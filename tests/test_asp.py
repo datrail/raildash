@@ -28,6 +28,7 @@ from raildash.asp import (
     compare_alignment,
     parse_bundle,
     resolve_identity,
+    uuid_name_template,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -878,6 +879,96 @@ def test_something_newly_seen_in_the_window_is_drift():
     ]
     new_file = _windowed_v2([], [_file("/etc/passwd")])
     assert _window_drift(baseline, new_file) == [
+        (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
+    ]
+
+
+SESSIONS = "/root/.openclaw/agents/main/sessions"
+
+
+def _uuid(n: int) -> str:
+    return f"{n:08x}-4f50-4a6b-8c7d-9e0f1a2b3c4d"
+
+
+def test_a_file_rewritten_under_a_new_uuid_is_not_newly_written():
+    """DR-229 (railmon#97): a real agent writes a fresh uuid-named temp file
+    every turn; the same name with another uuid is not new."""
+    baseline = _windowed_v2([], [_file(f"{SESSIONS}/sessions.json.1.{_uuid(1)}.tmp", write=True),
+                                 _file(f"{SESSIONS}/.openclaw-trajectory-.1.{_uuid(2)}.tmp", write=True)])
+    current = _windowed_v2([], [_file(f"{SESSIONS}/sessions.json.1.{_uuid(n)}.tmp", write=True)
+                                for n in range(3, 8)]
+                           + [_file(f"{SESSIONS}/.openclaw-trajectory-.1.{_uuid(8).upper()}.tmp", write=True)])
+    assert _window_drift(baseline, current) == []
+    # The rest of the name, the directory and the access still count.
+    for path, flags in (
+        (f"{SESSIONS}/sessions.json.2.{_uuid(3)}.tmp", {"write": True}),
+        (f"{SESSIONS}/other/sessions.json.1.{_uuid(3)}.tmp", {"write": True}),
+        (f"{SESSIONS}/sessions.json.1.{_uuid(3)}.tmp", {"write": True, "exec": True}),
+        (f"{SESSIONS}/sessions.json.1.not-a-uuid.tmp", {"write": True}),
+    ):
+        assert _window_drift(baseline, _windowed_v2([], [_file(path, **flags)])) == [
+            (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
+        ], path
+    # Without a window the list is still compared exactly.
+    assert _window_drift(_windowed_v2(*_lists(baseline), window=False),
+                         _windowed_v2(*_lists(current), window=False)) != []
+
+
+@pytest.mark.parametrize(("path", "template"), [
+    (f"/s/sessions.json.1.{_uuid(1)}.tmp", "/s/sessions.json.1.*.tmp"),
+    # A run of uuids is one `*`, never a `**` that would cross directories.
+    (f"/s/{_uuid(1)}{_uuid(2)}", "/s/*"),
+    (f"/s/a{_uuid(1)}-{_uuid(2)}.tmp", "/s/a*-*.tmp"),
+    (f"/{_uuid(1)}/notes.txt", None),       # only the file name folds
+    ("/tmp/tmp*", None),                    # RailMon's own template stays
+    (f"/proc/*/{_uuid(1)}", None),
+    ("/app/agent.log", None),
+])
+def test_uuid_name_template(path, template):
+    assert uuid_name_template(path) == template
+
+
+def _capped(value: dict, *, note: str) -> dict:
+    attribute = value["sandbox"]["attributes"]["observed_file_access"]
+    attribute.update(status="PARTIAL", reason="SIZE_CAP_EXCEEDED", note=note)
+    return value
+
+
+CAPPED_NOTE = ("more distinct files than the cap (reads are left out first): "
+               "files may be missing from this list")
+
+
+def test_a_read_the_capped_baseline_could_not_list_is_not_newly_seen():
+    """DR-229 (railmon#97): RailMon keeps every write, then reads by path, up
+    to its cap. A read past the baseline's last listed read was left out,
+    seen or not, so it is not new; one before it would have been listed."""
+    files = [_file("/app/out", write=True), _file("/b/1", read=True), _file("/b/5", read=True)]
+    baseline = _capped(_windowed_v2([], files), note=CAPPED_NOTE)
+    later = _capped(_windowed_v2([], [*files[:2], _file("/c/node-cache/abc", read=True)]), note=CAPPED_NOTE)
+    assert _window_drift(baseline, later) == []
+    for current in (
+        [*files, _file("/b/3", read=True)],                # sorts before /b/5: it would be listed
+        [*files, _file("/c/new", write=True)],             # writes are never left out first
+        [*files, _file("/c/new", read=True, exec=True)],
+    ):
+        value = _capped(_windowed_v2([], current), note=CAPPED_NOTE)
+        assert _window_drift(baseline, value) == [
+            (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
+        ], current
+    # The note, not the reason, says reads were left out: a probe gap that
+    # was also unreachable is NO_SOURCE_ACCESS with the same note.
+    unreachable = copy.deepcopy(baseline)
+    unreachable["sandbox"]["attributes"]["observed_file_access"]["reason"] = "NO_SOURCE_ACCESS"
+    later_unreachable = copy.deepcopy(later)
+    later_unreachable["sandbox"]["attributes"]["observed_file_access"]["reason"] = "NO_SOURCE_ACCESS"
+    assert _window_drift(unreachable, later_unreachable) == []
+    # A baseline PARTIAL for another gap (an unnamed file) left no read out.
+    other = _capped(_windowed_v2([], files), note="a file whose path filesnoop could not read, "
+                    "or longer than the cap: files may be missing from this list")
+    later_other = copy.deepcopy(later)
+    later_other["sandbox"]["attributes"]["observed_file_access"]["note"] = (
+        other["sandbox"]["attributes"]["observed_file_access"]["note"])
+    assert _window_drift(other, later_other) == [
         (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
     ]
 

@@ -508,11 +508,57 @@ function isWindowed(change) {
     || [change.baseline, change.current].some((record) => Boolean(record && record.window));
 }
 
+// DR-229: a windowed list is shown the way the server compared it
+// (raildash.asp._comparable_file_access), so a real change isn't buried
+// under the noise that comparison ignores. A run of uuids in a file name
+// reads as `*`, and when the baseline's list says reads were left out at
+// RailMon's cap, a read it doesn't list that sorts after its last listed
+// read is left out: whether the baseline saw it is unknown.
+const UUID_RUN = /(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})+/g;
+const READS_LEFT_OUT = "more distinct files than the cap (reads are left out first)";
+
+function uuidNameTemplate(path) {
+  if (path.includes("*")) return path;
+  const cut = path.lastIndexOf("/") + 1;
+  return path.slice(0, cut) + path.slice(cut).replace(UUID_RUN, "*");
+}
+
+function foldedFileEntries(entries) {
+  const folded = new Map();
+  entries.forEach((entry) => {
+    const path = uuidNameTemplate(entry.path);
+    const key = `${entry.layer ? 1 : 0}:${path}`;
+    const seen = folded.get(key);
+    folded.set(key, seen
+      ? { ...seen, ...Object.fromEntries(FILE_OPERATIONS.map(([op]) => [op, seen[op] === true || entry[op] === true])) }
+      : { ...entry, path });
+  });
+  return folded;
+}
+
+function windowedFileEntries(before, after) {
+  const previous = [...fileEntries(before).values()];
+  let current = [...fileEntries(after).values()];
+  const readOnly = (entry) => entry.write !== true && entry.exec !== true;
+  const fileKey = (entry) => `${entry.layer ? 1 : 0}:${entry.path}`;
+  // RailMon's cap order: by path, then layer false before true.
+  const later = (a, b) => (a.path !== b.path ? a.path > b.path : Boolean(a.layer) && !b.layer);
+  if (before && before.status === "PARTIAL" && String(before.note || "").includes(READS_LEFT_OUT)) {
+    const listed = new Set(previous.map(fileKey));
+    const lastRead = previous.filter(readOnly)
+      .reduce((last, entry) => (!last || later(entry, last) ? entry : last), null);
+    current = current.filter((entry) => !(readOnly(entry) && !listed.has(fileKey(entry))
+      && (!lastRead || later(entry, lastRead))));
+  }
+  return [foldedFileEntries(previous), foldedFileEntries(current)];
+}
+
 // Rows of [label, paths], in the order a reader cares about: what the
 // sandbox started doing before what it stopped doing, writes first.
 function fileAccessChanges(before, after, windowed) {
-  const previous = fileEntries(before);
-  const current = fileEntries(after);
+  const [previous, current] = windowed
+    ? windowedFileEntries(before, after)
+    : [fileEntries(before), fileEntries(after)];
   const keys = [...new Set([...previous.keys(), ...current.keys()])];
   const gained = [];
   const lost = [];
@@ -1545,7 +1591,8 @@ function renderGuardrailProposal(proposal, refresh) {
     return section;
   }
   section.append(el("p", "muted",
-    "Proposed from the locked baseline: what it already did is allowed (plus Python's bytecode caches), and nothing is " +
+    "Proposed from the locked baseline: what it already did is allowed (plus Python's bytecode caches, and a " +
+    "file written under a fresh uuid each time by its name), and nothing is " +
     "checked until you adopt it. Every line is shown so you can see what it approves."));
   section.append(renderGuardrailPolicy(proposal.guardrail.rules));
   section.append(renderDataActionsBlocked(proposal.data_actions_blocked));
