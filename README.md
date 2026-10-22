@@ -165,6 +165,17 @@ read or opened; no longer written, run, read or opened) instead of two raw
 lists. A window list (see evidence bundle v2 below) lists only what is
 newly seen, since a quieter window is not something stopped.
 
+Two things about the file list are not drift either. A uuid in a file's
+name compares as `*`: an agent that writes `sessions.json.1.<uuid>.tmp`
+every turn writes the same file each time. The directory, the rest of the
+name and the access still count, and a new file named like a baseline one
+but for its uuid is aligned. And RailMon caps the list at 512 entries,
+keeping every write and run, then reads by path. When the baseline's list
+says reads were left out, a read that sorts after its last listed read
+could not have been listed, so whether the baseline saw it is unknown and
+it isn't drift. A new read past that point is not reported; a read that
+sorts before it, and any new write or run, still is.
+
 The value of an attribute RailMon publishes as *dynamic*
 (`raildash/schemas/attribute-groups.json`, vendored from RailMon) never takes
 part in drift. Today that is `agent_instance`, where this copy runs: the
@@ -306,6 +317,16 @@ it before adopting if you want those writes judged; a file named like a
 bytecode cache in a `__pycache__` directory isn't flagged while it's there.
 A guardrail adopted before RailDash seeded this line doesn't have it;
 **Edit** adds it.
+
+A written path whose file name holds a uuid after at least three letters
+or digits is the one exception to "exactly": the proposal allows that name
+with `*` for the uuid, in the same directory, and **Allow this** on such a
+row does the same. An agent that writes `sessions.json.1.<uuid>.tmp` every
+turn would otherwise have a new row every turn. The `*` matches any text in
+that place, so a file in that directory with the same text around it isn't
+flagged either. A name with less before its uuid (`<uuid>.json`,
+`.<uuid>`) stays exact, since its glob would allow nearly any file in the
+directory.
 
 **Egress containment.** Each agent's panel has an
 **Egress** line read from RailMon's `egress_containment`, an observed level:

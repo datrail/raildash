@@ -587,6 +587,31 @@ def test_kernel_observed_files_sit_beside_the_asked_ones_and_a_new_write_is_drif
                 for line in row.locator(".asp-file-change").all()
             }
             assert changes == {"Newly written": ["/workspace/exfil.txt"]}
+
+            # DR-229: the panel shows a uuid-named write the way the server
+            # compared it, one line for every uuid.
+            def written(path: str) -> dict:
+                return {**WROTE, "path": path}
+
+            turns = bundle("bnd-browser-turns", [WROTE, *(
+                written(f"/workspace/sessions.json.1.{n:08x}-4f50-4a6b-8c7d-9e0f1a2b3c4d.tmp")
+                for n in (1, 2))], collected_at="2026-09-24T04:00:00Z")
+            response = page.request.post(
+                f"{url}/v1/evidence-bundles", data=encode(turns),
+                headers={"X-RailDash-Token": token, "Content-Type": "application/json"},
+            )
+            assert response.status == 202, response.text()
+            page.locator("#refresh").click()
+            row = page.locator(".asp-state-card", has_text="Drift detected").first.locator(
+                ".asp-file-diff",
+                has=page.locator(".asp-diff-new", has_text="3 files [ANSWERED, observed]"),
+            )
+            row.wait_for()
+            changes = {
+                line.get_attribute("data-kind"): line.locator(".drift-label").all_inner_texts()
+                for line in row.locator(".asp-file-change").all()
+            }
+            assert changes == {"Newly written": ["/workspace/exfil.txt", "/workspace/sessions.json.1.*.tmp"]}
             assert errors == []
             browser.close()
     finally:
