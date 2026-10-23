@@ -643,7 +643,8 @@ _CODE_MODE_TOOL_NAME = re.compile(
 #   `Function` and any `constructor`, `globalThis`, `self`, `global`,
 #   `Reflect`, `this`, `import`, `require`, `prototype`, `__proto__`, and
 #   `load`, which hands back what an earlier script stored).
-# A bare word `tools` in a string counts too, which errs towards unreadable.
+# These match anywhere, a comment, a string or a property name included
+# (`x.global`, `// load`), which errs towards unreadable.
 # This reads the names a script spells; it is not a JavaScript parser, and a
 # script written to hide a call (a member name built at run time can still
 # reach `Function`) can hide it. Whatever a script says, the host of an HTTP
