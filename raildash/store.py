@@ -821,9 +821,15 @@ class Store(GuardrailCustody, DataActionsStore):
         digest = bundle_digest(raw)
         with self._write_transaction():
             # Inside the write lock, so a v2 collection landing concurrently
-            # can't slip between this check and the insert.
-            if bundle["bundle_version"] != BUNDLE_VERSION_V2 and not is_explicit_agent_key(
-                agent_key
+            # can't slip between this check and the insert. An exact replay of
+            # a bundle already stored is answered as a replay below, as before.
+            if (
+                bundle["bundle_version"] != BUNDLE_VERSION_V2
+                and not is_explicit_agent_key(agent_key)
+                and self._db.execute(
+                    "SELECT 1 FROM asps WHERE digest = ?", (digest,)
+                ).fetchone()
+                is None
             ):
                 self._refuse_unkeyed_after_v2_locked(bundle)
             identity = resolve_identity(bundle, agent_key)

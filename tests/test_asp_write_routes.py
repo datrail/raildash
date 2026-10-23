@@ -479,6 +479,21 @@ def test_a_keyed_v1_bundle_is_still_accepted_after_v2_history(client, deployment
     assert res.json()["duplicate"] is False
 
 
+def test_resending_a_stored_unkeyed_v1_bundle_after_v2_history_is_a_replay(client):
+    """RailMon resends an unchanged bundle's exact bytes. A v1 stored before
+    the sandbox's first v2 collection is still answered as a duplicate, not
+    refused: RailDash already holds it."""
+    raw = _v1_variant("bnd-dr234-replay", deployment="environment")
+    first = client.post("/v1/evidence-bundles", content=raw, headers=auth())
+    assert first.status_code == 202
+    _with_v2_history(client)
+    before = _asp_count(client)
+    again = client.post("/v1/evidence-bundles", content=raw, headers=auth())
+    assert again.status_code == 202
+    assert again.json()["duplicate"] is True
+    assert _asp_count(client) == before
+
+
 def test_unkeyed_v1_without_v2_history_is_unchanged(client):
     """A single-agent stack never sent v2, so nothing about it changes: a
     deployment identity still keys the bundle, and a bundle with none still

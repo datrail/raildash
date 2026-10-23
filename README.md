@@ -432,7 +432,11 @@ would otherwise be filed as another agent and look like success. A v1
 bundle keyed with `?agent_key=NAME` (or the header, or `asp load
 --agent-key`) is still accepted; that is how RailMon delivers each agent
 when its shared scan fails. The reserved `default` key does not count. A
-sandbox that has never sent v2 is unaffected.
+sandbox that has never sent v2 is unaffected, and resending a bundle
+already stored is still answered as a replay. A sandbox that goes back to a
+single agent keeps refusing unkeyed v1, because its v2 history stays: give
+RailMon a key (`RAIL_AGENT_KEY` or `--agent-key`), and lock a new baseline
+from the keyed ASPs.
 
 A v1 bundle compared with a v2 baseline (or the reverse) is
 `CONTRACT_MISMATCH`. v1 comparisons still emit contract v1 unchanged.
