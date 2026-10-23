@@ -627,20 +627,32 @@ def _response_body(interaction: Mapping[str, Any]) -> tuple[Any, str | None]:
 # names an MCP tool `mcp__<server>__<tool>` there as everywhere.
 CODE_MODE_TOOL = "exec"
 _LITERAL = r"""(?:"([^"\\]+)"|'([^'\\]+)'|`([^`\\$]+)`)"""
+# Each pattern starts at the literal `tools` and never has two `\s*` that
+# can match the same whitespace, so a hostile script is read in linear time.
 _CODE_MODE_TOOL_NAME = re.compile(
-    r"(?<![\w$])tools\s*(?:(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)|(?:\?\.)?\s*\[\s*"
+    r"(?<![\w$])tools(?:\s*\??\.\s*([A-Za-z_$][\w$]*)|(?:\s*\?\.)?\s*\[\s*"
     + _LITERAL + r"\s*\])"
 )
-# `tools[...]` whose subscript is not one string literal, or `tools` itself
-# handed on (aliased, destructured, spread or passed): the names the script
-# reaches can't be read from its text. So does code that can reach `tools`
-# without spelling it (`eval`, `Function`, `globalThis`, `Reflect`, `this`).
-# A bare word `tools` in a comment or a string counts too, which errs
-# towards unreadable.
+# What makes a script's names unreadable from its text:
+# - `tools[...]` whose subscript is not one string literal, or `tools` itself
+#   handed on (aliased, destructured, spread, passed, stored or `with`);
+#   `tools` followed by anything but a name or a literal subscript counts
+#   here, so a comment between `tools.` and the name does too;
+# - any `\u` (an escape can spell an identifier: `t\u006fols`);
+# - a way to reach `tools` or run built code without spelling it (`eval`,
+#   `Function` and any `constructor`, `globalThis`, `self`, `global`,
+#   `Reflect`, `this`, `import`, `require`, `prototype`, `__proto__`, and
+#   `load`, which hands back what an earlier script stored).
+# A bare word `tools` in a string counts too, which errs towards unreadable.
+# This reads the names a script spells; it is not a JavaScript parser.
+# Whatever a script says, the host of the MCP request a call makes is still
+# judged on the wire (`out_of_spec_calls`' allowed hosts).
 _CODE_MODE_DYNAMIC = re.compile(
-    r"(?<![\w$])tools\s*(?:\?\.)?\s*\[(?!\s*" + _LITERAL + r"\s*\])"
-    r"|(?<![\w$])tools(?![\w$])(?!\s*(?:\?\.|\.|\[))"
-    r"|(?<![\w$])(?:eval|Function|globalThis|Reflect|this)(?![\w$])"
+    r"(?<![\w$])tools(?:\s*\?\.)?\s*\[(?!\s*" + _LITERAL + r"\s*\])"
+    r"|(?<![\w$])tools(?![\w$])(?!\s*\??\.\s*[A-Za-z_$]|(?:\s*\?\.)?\s*\[)"
+    r"|\\u"
+    r"|(?<![\w$])(?:eval|Function|constructor|globalThis|self|global|Reflect|this|import|require"
+    r"|prototype|__proto__|load)(?![\w$])"
 )
 
 
@@ -677,8 +689,11 @@ def _add_custom_tool_call(item: Mapping[str, Any], add: Any) -> None:
         add(_DYNAMIC)
 
 
-# What `add` is handed when a code-mode script's names can't all be read.
+# What `add` is handed when a code-mode script's names can't all be read,
+# and to pair a streamed `exec` item's `.added` with its `.done`.
 _DYNAMIC = object()
+_CUSTOM_ADDED = object()
+_CUSTOM_DONE = object()
 
 
 def requested_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
@@ -730,9 +745,15 @@ def _requested_tool_calls(interaction: Mapping[str, Any], dynamic: list[bool]) -
         return {"names": [], "readable": False, "reason": reason}
     names: list[str] = []
 
+    pending: set[Any] = set()
+
     def add(name: Any) -> None:
         if name is _DYNAMIC:
             dynamic.append(True)
+        elif isinstance(name, tuple) and name[0] is _CUSTOM_ADDED:
+            pending.add(name[1])
+        elif isinstance(name, tuple) and name[0] is _CUSTOM_DONE:
+            pending.discard(name[1])
         elif isinstance(name, str) and name and name not in names:
             names.append(name)
 
@@ -796,6 +817,10 @@ def _requested_tool_calls(interaction: Mapping[str, Any], dynamic: list[bool]) -
             return {"names": names, "readable": False, "reason": reason}
     if unparsable:
         return {"names": names, "readable": False, "reason": RESPONSE_UNPARSABLE_EVENT}
+    if pending:
+        # An `exec` script that was started and never finished: the stream
+        # was cut between events, after it began.
+        return {"names": names, "readable": False, "reason": RESPONSE_TRUNCATED_EVENT}
     return {"names": names, "readable": True, "reason": None}
 
 
@@ -846,12 +871,17 @@ def _event_tool_calls(event: dict[str, Any], add: Any) -> None:
         item = event.get("item")
         if isinstance(item, dict) and item.get("type") == "function_call":
             add(item.get("name"))
-        elif (
-            isinstance(item, dict) and item.get("type") == "custom_tool_call"
-            and kind == "response.output_item.done"
-        ):
-            # Only `.done` carries the whole input; `.added`'s is empty.
-            _add_custom_tool_call(item, add)
+        elif isinstance(item, dict) and item.get("type") == "custom_tool_call":
+            # Only `.done` carries an `exec` script whole; `.added`'s input is
+            # empty. An `exec` added and never done was cut, its calls unseen.
+            key = event.get("output_index", item.get("id"))
+            if kind == "response.output_item.done":
+                add((_CUSTOM_DONE, key))
+                _add_custom_tool_call(item, add)
+            elif item.get("name") == CODE_MODE_TOOL:
+                add((_CUSTOM_ADDED, key))
+            else:
+                _add_custom_tool_call(item, add)
     for choice in _dicts(event.get("choices")):
         delta = choice.get("delta")
         for call in _dicts(delta.get("tool_calls") if isinstance(delta, dict) else None):

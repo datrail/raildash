@@ -140,6 +140,14 @@ def test_a_script_that_builds_a_tool_name_is_unreadable():
         'await globalThis["to" + "ols"].mcp__evil__send({})',
         'eval("to" + "ols.mcp__evil__send({})")',
         'new Function("return to" + "ols")().mcp__evil__send({})',
+        "(() => {}).constructor('return to' + 'ols')().mcp__evil__send({})",
+        "t\\u006fols.mcp__evil__send({})",
+        "tools.mcp\\u005f_evil__send({})",
+        "tools./**/mcp__evil__send({})",
+        "tools.// a comment\nmcp__evil__send({})",
+        "tools/**/.mcp__evil__send({})",
+        'await load("kept").mcp__evil__send({})',
+        "with (tools) { await mcp__evil__send({}) }",
     ):
         names, dynamic = g.custom_tool_call_names(_exec(code))
         assert dynamic, code
@@ -159,3 +167,49 @@ def test_another_custom_tool_asks_for_itself_with_its_input():
     [call] = tc.extract_tool_calls(stored(capture))["calls"]
     assert (call["tool"], call["arguments_bytes"]) == ("apply_patch", len("*** Begin Patch"))
     assert g.requested_tool_calls(normalise(capture))["names"] == ["apply_patch"]
+
+
+def _stream(*events: dict) -> str:
+    return "".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events)
+
+
+def test_an_exec_script_cut_before_it_was_done_is_unreadable():
+    added = {"type": "response.output_item.added", "output_index": 0,
+             "item": {"type": "custom_tool_call", "id": "ctc_1", "name": "exec", "input": ""}}
+    delta = {"type": "response.custom_tool_call_input.delta", "item_id": "ctc_1", "output_index": 0,
+             "delta": "await tools.mcp__evil__send({})"}
+    done = {"type": "response.output_item.done", "output_index": 0,
+            "item": {"type": "custom_tool_call", "id": "ctc_1", "name": "exec",
+                     "input": "await tools.mcp__evil__send({})"}}
+
+    def read(body: str) -> dict:
+        return g.requested_tool_calls(normalise({
+            "request": {"method": "POST", "headers": {"host": "chatgpt.com"}, "body": {"model": "m", "input": []}},
+            "response": {"status_code": 200, "body": {"raw": body}}}))
+
+    assert read(_stream(added, delta)) == {
+        "names": [], "readable": False, "reason": g.RESPONSE_TRUNCATED_EVENT}
+    assert read(_stream(added, delta, done)) == {
+        "names": ["mcp__evil__send"], "readable": True, "reason": None}
+
+
+def test_a_hostile_script_is_read_in_linear_time():
+    import time
+
+    for code in ("tools" + " " * 200_000 + "x", ("tools " * 40_000) + "[", "tools?." + " " * 200_000):
+        started = time.monotonic()
+        g.custom_tool_call_names(_exec(code))
+        assert time.monotonic() - started < 1.0
+
+
+def test_a_custom_tool_call_reaches_data_actions_without_other_markers(tmp_path):
+    """The store's cheap prefilter knows `custom_tool_call`: the real Codex
+    rows also say `parallel_tool_calls`, which hid that it didn't."""
+    capture = json.loads(json.dumps(CODEX[1]))
+    capture["request"]["body"].pop("parallel_tool_calls")
+    assert "tool_calls" not in json.dumps(capture) and "tool_use" not in json.dumps(capture)
+    store = Store(tmp_path / "marker.db")
+    store.upsert_session("s1")
+    store.add_interactions("s1", [normalise({**capture, "interaction_id": "real-1"})], authenticated=True)
+    assert {row["tool"] for row in store.data_action_rows(["session:s1"])} == {"mcp__demo__read_doc"}
+    store.close()

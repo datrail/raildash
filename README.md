@@ -361,10 +361,13 @@ Anthropic `tool_use` block, an OpenAI Chat `tool_calls` entry, or an OpenAI
 Responses `function_call` or `custom_tool_call`, whole or streamed. Codex's
 code mode gives the model one tool, `exec`, whose JavaScript calls every
 other tool as `tools.<name>(…)`, so each tool the script names counts as
-asked for, without its arguments. A script that reaches a tool through a
-name it builds at run time (`tools[name]`, `tools` handed on whole, `eval`)
-makes that request's tool calls unreadable, and the uploads and out-of-spec
-rules that read them stay Unverified for a while.
+asked for, without its arguments. A script that could reach a tool through
+a name it doesn't spell (`tools[name]`, `tools` handed on whole, an escape,
+`eval`, `constructor`), or one cut before it ended, makes that request's
+tool calls unreadable, and the uploads, out-of-spec calls and data actions
+rules stay Unverified for a while. The script is read, not run; whatever it
+says, the host each of its MCP requests goes to is still checked against
+out-of-spec calls' allowed hosts, on the wire.
 
 **The data-action classifier's model step.** Deterministic rules classify
 each MCP tool's data actions from its name and schema. A tool they leave

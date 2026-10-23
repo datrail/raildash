@@ -49,7 +49,9 @@ BACKFILL_SETTING = "data_actions_backfilled_v1"
 MAX_DESTINATION_VALUE_CHARS = 200
 # Cheap substrings a stored row must hold to be worth parsing for calls; a
 # POST to a known MCP endpoint is parsed whatever it holds (unreadable calls).
-_CALL_MARKERS = ("tool_use", "tool_calls", "function_call", "mcp_call", "tools/call")
+_CALL_MARKERS = (
+    "tool_use", "tool_calls", "function_call", "custom_tool_call", "mcp_call", "tools/call",
+)
 
 DATA_ACTIONS_SCHEMA = """
 -- DR-205 M1: one row per (capture, class, tool, endpoint, destination
