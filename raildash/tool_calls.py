@@ -5,8 +5,10 @@ Two kinds, kept apart as the glossary's evidence classes require:
 
 - **requested**: the model asked for the call in its reply. An Anthropic
   `tool_use` or provider-side `mcp_tool_use` block, an OpenAI Chat
-  `tool_calls[]` entry, or an OpenAI Responses `function_call` or
-  provider-side `mcp_call` item, whole or streamed. A streamed call's
+  `tool_calls[]` entry, or an OpenAI Responses `function_call`,
+  `custom_tool_call` or provider-side `mcp_call` item, whole or streamed.
+  Codex code mode's `exec` custom tool asks for the tools its script names
+  (`guardrail.custom_tool_call_names`), without their arguments. A streamed call's
   arguments are reassembled from their deltas (Anthropic `input_json_delta`,
   Chat `arguments` fragments).
 - **observed**: the call went out on the wire: a JSON-RPC `tools/call` in a
@@ -406,5 +408,13 @@ def requested_call_count(exchange: Mapping[str, Any]) -> int:
 def _responses_item(item: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any, Any]]:
     if item.get("type") == "function_call":
         yield "tool", item.get("name"), None, item.get("arguments")
+    elif item.get("type") == "custom_tool_call":
+        # Codex code mode's `exec` asks for each tool its script names; their
+        # arguments are JavaScript, not read (`g.custom_tool_call_names`).
+        # Any other custom tool's freeform input is its argument.
+        names, _ = g.custom_tool_call_names(item)
+        code_mode = item.get("name") == g.CODE_MODE_TOOL
+        for name in names:
+            yield "tool", name, None, None if code_mode else item.get("input")
     elif item.get("type") == "mcp_call":
         yield "provider", item.get("name"), item.get("server_label"), item.get("arguments")
