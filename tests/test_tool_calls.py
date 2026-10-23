@@ -85,6 +85,59 @@ def test_streamed_anthropic_and_openai_calls_are_reassembled():
     assert call["tool"] == "read_doc" and call["undeclared"] == ["x"]
 
 
+def test_streamed_gemini_calls_with_no_index_stay_apart():
+    """DR-231: Gemini's chunks send each call whole, with an id and no index;
+    keyed by index alone, a second call's name and arguments overwrote the
+    first's."""
+    calls = [{"id": f"f{n}", "type": "function", "function": {"name": name, "arguments": arguments}}
+             for n, (name, arguments) in enumerate(
+                 (("read_doc", '{"doc_id": "d1"}'), ("upload_file", '{"path": "a"}')))]
+    for chunks in ([calls], [[calls[0]], [calls[1]]]):
+        text = "".join(
+            "data: " + json.dumps({"choices": [{"index": 0, "finish_reason": "stop",
+                                                "delta": {"tool_calls": part}}]}) + "\n\n"
+            for part in chunks)
+        item = exchange("generativelanguage.googleapis.com", "/v1beta/openai/chat/completions",
+                        {"model": "m", "messages": []}, {"raw": text},
+                        response_headers={"content-type": "text/event-stream"})
+        found = tc.extract_tool_calls(stored(item))["calls"]
+        assert [(c["tool"], c["arguments_bytes"]) for c in found] == [
+            ("read_doc", len('{"doc_id": "d1"}')), ("upload_file", len('{"path": "a"}'))]
+    # A first chunk with the id and name, then fragments with neither.
+    parts = ({"id": "f0", "function": {"name": "read_doc", "arguments": '{"doc'}},
+             {"function": {"arguments": '_id": "d1"}'}})
+    text = "".join("data: " + json.dumps({"choices": [{"delta": {"tool_calls": [part]}}]}) + "\n\n"
+                   for part in parts)
+    item = exchange("api.example.com", "/v1/chat/completions", {"model": "m", "messages": []},
+                    {"raw": text}, response_headers={"content-type": "text/event-stream"})
+    [call] = tc.extract_tool_calls(stored(item))["calls"]
+    assert call["tool"] == "read_doc" and call["arguments_bytes"] == len('{"doc_id": "d1"}')
+    # A name starts a call rather than renaming one, and the nameless
+    # fragment after it continues it.
+    parts = ({"function": {"name": "read_doc", "arguments": "{}"}},
+             {"id": "f0", "function": {"name": "read_doc", "arguments": "{}"}},
+             {"function": {"name": "upload_file", "arguments": '{"pa'}},
+             {"function": {"arguments": 'th": "a"}'}})
+    text = "".join("data: " + json.dumps({"choices": [{"delta": {"tool_calls": [part]}}]}) + "\n\n"
+                   for part in parts)
+    item = exchange("api.example.com", "/v1/chat/completions", {"model": "m", "messages": []},
+                    {"raw": text}, response_headers={"content-type": "text/event-stream"})
+    assert [(c["tool"], c["arguments_bytes"]) for c in tc.extract_tool_calls(stored(item))["calls"]] == [
+        ("read_doc", 2), ("read_doc", 2), ("upload_file", len('{"path": "a"}'))]
+    # An empty name renames nothing, and a nameless fragment never joins a
+    # call numbered 0.
+    parts = ({"id": "f0", "function": {"name": "read_doc", "arguments": '{"doc'}},
+             {"id": "f0", "function": {"name": "", "arguments": '_id": "d1"}'}},
+             {"index": 0, "function": {"name": "upload_file", "arguments": "{}"}},
+             {"function": {"arguments": "{}"}})
+    text = "".join("data: " + json.dumps({"choices": [{"delta": {"tool_calls": [part]}}]}) + "\n\n"
+                   for part in parts)
+    item = exchange("api.example.com", "/v1/chat/completions", {"model": "m", "messages": []},
+                    {"raw": text}, response_headers={"content-type": "text/event-stream"})
+    assert [(c["tool"], c["arguments_bytes"]) for c in tc.extract_tool_calls(stored(item))["calls"]] == [
+        ("read_doc", len('{"doc_id": "d1"}')), ("upload_file", 2)]
+
+
 def test_responses_and_provider_side_calls():
     reply = {"output": [
         {"type": "function_call", "name": "read_doc", "arguments": json.dumps({"doc_id": "d"})},
