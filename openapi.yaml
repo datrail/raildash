@@ -582,7 +582,7 @@ paths:
         '202': {description: 'Accepted: {accepted, asp_id, duplicate}'}
         '403': {description: Missing or invalid X-RailDash-Token}
         '409': {description: This id/identity already names different stored bytes}
-        '422': {description: Malformed or unresolvable evidence bundle}
+        '422': {description: 'Malformed or unresolvable evidence bundle, or an unkeyed v1 bundle for a sandbox with keyed v2 history (body `code`: MULTI_AGENT_KEY_REQUIRED)'}
 
   /api/sessions:
     get:

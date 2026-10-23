@@ -391,3 +391,159 @@ def test_prune_accepts_a_one_off_override_without_changing_the_saved_setting(cli
     assert pruned.json()["removed"] == 2
     # The one-off override was not persisted.
     assert client.get("/api/settings/asp-retention").json()["keep_count"] != 1
+
+
+# ------------------------------------- DR-234: unkeyed v1 after keyed v2
+
+
+def _v1_variant(bundle_id: str, *, deployment: str, sandbox_name: str | None = None) -> bytes:
+    """The v1 fixture with one of the three identity shapes a v1 bundle can
+    carry: `environment` (RAIL_DEPLOYMENT/RAIL_NAMESPACE, as the fixture
+    ships), `compose` (the host-scoped Compose labels) or `none`."""
+    value = json.loads(ASP_FIXTURE.read_bytes())
+    value["bundle_id"] = bundle_id
+    if sandbox_name is not None:
+        value["sandbox_name"] = sandbox_name
+    attribute = value["attributes"]["deployment"]
+    if deployment == "compose":
+        attribute["value"] = {
+            "com.docker.compose.project": "agents",
+            "com.docker.compose.service": "shared-agents",
+        }
+    elif deployment == "none":
+        attribute["status"] = "ABSENT"
+        attribute["value"] = None
+        del attribute["authored_by"]
+    return json.dumps(value, sort_keys=True).encode()
+
+
+def _with_v2_history(client) -> None:
+    res = client.post(
+        "/v1/evidence-bundles", content=_v2_collection("bnd-dr234-v2"), headers=auth()
+    )
+    assert res.status_code == 202
+
+
+def _asp_count(client) -> int:
+    return client.get("/api/asps").json()["total"]
+
+
+def _assert_multi_agent_key_required(res) -> None:
+    assert res.status_code == 422
+    body = res.json()
+    assert body["code"] == "MULTI_AGENT_KEY_REQUIRED"
+    assert body["detail"].startswith("MULTI_AGENT_KEY_REQUIRED: ")
+
+
+@pytest.mark.parametrize("deployment", ["environment", "compose", "none"])
+def test_an_unkeyed_v1_bundle_for_a_sandbox_with_v2_history_is_refused(client, deployment):
+    """Design §5: once a sandbox has keyed v2 history, an unkeyed v1 bundle
+    for it is a partially configured multi-agent container falling back to
+    one identity. It is refused, not filed as a new or separate agent --
+    whatever deployment identity it carries."""
+    _with_v2_history(client)
+    before = _asp_count(client)
+    res = client.post(
+        "/v1/evidence-bundles",
+        content=_v1_variant(f"bnd-dr234-{deployment}", deployment=deployment),
+        headers=auth(),
+    )
+    _assert_multi_agent_key_required(res)
+    assert _asp_count(client) == before
+
+
+def test_the_reserved_default_key_does_not_key_a_v1_bundle_after_v2_history(client):
+    _with_v2_history(client)
+    for how in ({"params": {"agent_key": "default"}},
+                {"headers": {"X-RailDash-Agent-Key": "default"}}):
+        res = client.post(
+            "/v1/evidence-bundles",
+            content=_v1_variant("bnd-dr234-default", deployment="none"),
+            **{**how, "headers": {**auth(), **how.get("headers", {})}},
+        )
+        _assert_multi_agent_key_required(res)
+
+
+@pytest.mark.parametrize("deployment", ["environment", "compose", "none"])
+def test_a_keyed_v1_bundle_is_still_accepted_after_v2_history(client, deployment):
+    """RailMon's per-agent fallback, when the shared scan fails, sends each
+    agent its own v1 bundle with `?agent_key=`: that is keyed, so it lands."""
+    _with_v2_history(client)
+    res = client.post(
+        "/v1/evidence-bundles",
+        params={"agent_key": "planner"},
+        content=_v1_variant(f"bnd-dr234-keyed-{deployment}", deployment=deployment),
+        headers=auth(),
+    )
+    assert res.status_code == 202
+    assert res.json()["duplicate"] is False
+
+
+def test_resending_a_stored_unkeyed_v1_bundle_after_v2_history_is_a_replay(client):
+    """RailMon resends an unchanged bundle's exact bytes. A v1 stored before
+    the sandbox's first v2 collection is still answered as a duplicate, not
+    refused: RailDash already holds it."""
+    raw = _v1_variant("bnd-dr234-replay", deployment="environment")
+    first = client.post("/v1/evidence-bundles", content=raw, headers=auth())
+    assert first.status_code == 202
+    _with_v2_history(client)
+    before = _asp_count(client)
+    again = client.post("/v1/evidence-bundles", content=raw, headers=auth())
+    assert again.status_code == 202
+    assert again.json()["duplicate"] is True
+    assert _asp_count(client) == before
+
+
+def test_unkeyed_v1_without_v2_history_is_unchanged(client):
+    """A single-agent stack never sent v2, so nothing about it changes: a
+    deployment identity still keys the bundle, and a bundle with none still
+    gets the plain local-agent_key 422."""
+    for deployment in ("environment", "compose"):
+        res = client.post(
+            "/v1/evidence-bundles",
+            content=_v1_variant(f"bnd-dr234-single-{deployment}", deployment=deployment),
+            headers=auth(),
+        )
+        assert res.status_code == 202
+    res = client.post(
+        "/v1/evidence-bundles",
+        content=_v1_variant("bnd-dr234-single-none", deployment="none"),
+        headers=auth(),
+    )
+    assert res.status_code == 422
+    assert "code" not in res.json()
+    assert "requires a local agent_key" in res.json()["detail"]
+
+
+def test_v2_history_only_refuses_unkeyed_v1_for_the_same_sandbox(client):
+    """The refusal is per sandbox (host_id + sandbox_name), not global."""
+    _with_v2_history(client)
+    res = client.post(
+        "/v1/evidence-bundles",
+        content=_v1_variant("bnd-dr234-other", deployment="compose", sandbox_name="other-agent"),
+        headers=auth(),
+    )
+    assert res.status_code == 202
+
+
+def test_store_and_cli_refuse_the_same_unkeyed_v1_bundle(client, tmp_path, capsys):
+    """The refusal lives in `Store.load_asp`, so `raildash asp load` (no
+    HTTP) refuses it too, under the same code."""
+    from raildash import cli
+    from raildash.asp import MULTI_AGENT_KEY_REQUIRED, MultiAgentKeyRequiredError
+
+    store = app_module.store
+    store.load_asp(_v2_collection("bnd-dr234-store-v2"))
+    with pytest.raises(MultiAgentKeyRequiredError) as raised:
+        store.load_asp(_v1_variant("bnd-dr234-store", deployment="compose"))
+    assert raised.value.code == MULTI_AGENT_KEY_REQUIRED
+    assert store.load_asp(
+        _v1_variant("bnd-dr234-store", deployment="compose"), agent_key="planner"
+    )["replayed"] is False
+
+    path = tmp_path / "unkeyed.json"
+    path.write_bytes(_v1_variant("bnd-dr234-cli", deployment="environment"))
+    store.close()
+    code = cli.main(["--db", str(tmp_path / "test.db"), "asp", "load", str(path)])
+    assert code == 1
+    assert "MULTI_AGENT_KEY_REQUIRED" in capsys.readouterr().err

@@ -271,11 +271,16 @@ def test_a_lock_refuses_an_identity_every_later_compare_would_reject(tmp_path, m
 def test_a_v1_bundle_against_a_v2_baseline_is_not_comparable(tmp_path):
     # Same deployment identity, different evidence shape: comparing would
     # report every attribute as moved between scopes, so it is refused.
+    # Keyed, as RailMon's per-agent fallback sends it: an unkeyed v1 bundle
+    # for a sandbox with v2 history is refused outright (DR-234), while a
+    # keyed one still resolves to the deployment identity it carries.
     store = Store(tmp_path / "raildash.db")
     baseline = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-mixed"))
     version = store.lock_alignment(baseline["asp_id"], "v1.0")
     store.switch_alignment(version["alignment_version_id"])
-    current = store.load_asp(changed_bundle(bundle_id="bnd-custody-v1-after-v2"))
+    current = store.load_asp(
+        changed_bundle(bundle_id="bnd-custody-v1-after-v2"), agent_key="executor"
+    )
     drift = store.drift_page(current["asp_id"])
     _validate_drift(drift, 2)
     assert drift["comparable"] is False

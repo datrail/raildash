@@ -47,6 +47,7 @@ from .asp import (
     MAX_DRIFT_PAGE_SIZE,
     BundleValidationError,
     IdentityRequiredError,
+    MultiAgentKeyRequiredError,
 )
 
 STATIC = Path(__file__).parent / "static"
@@ -993,6 +994,12 @@ async def ingest_evidence_bundle(
             names a *different* stored bundle; the body was well-formed.
         422 -- the body is not a valid evidence bundle, or an unkeyed bundle
             arrived with no resolvable `agent_key`.
+        422 {"detail": "MULTI_AGENT_KEY_REQUIRED: ...",
+             "code": "MULTI_AGENT_KEY_REQUIRED"}
+            -- a v1 bundle with no explicit non-default `agent_key` for a
+            sandbox (host_id + sandbox_name) that already has a stored v2
+            collection, even one a deployment identity would key (DR-234,
+            multi-agent design §5). Nothing is stored.
     """
     header_agent_key = request.headers.get("x-raildash-agent-key")
     resolved_agent_key = agent_key or header_agent_key or None
@@ -1000,6 +1007,10 @@ async def ingest_evidence_bundle(
     db = get_store()
     try:
         result = db.load_asp(raw, agent_key=resolved_agent_key)
+    except MultiAgentKeyRequiredError as exc:
+        # `detail` stays a string like every other 422 here; `code` is the
+        # machine-readable error the design names.
+        return JSONResponse({"detail": str(exc), "code": exc.code}, status_code=422)
     except (BundleValidationError, IdentityRequiredError) as exc:
         raise HTTPException(422, str(exc)) from exc
     except ValueError as exc:

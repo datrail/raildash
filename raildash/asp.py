@@ -138,6 +138,36 @@ class IdentityRequiredError(ValueError):
     """An unkeyed bundle needs the local operator's explicit identity claim."""
 
 
+MULTI_AGENT_KEY_REQUIRED = "MULTI_AGENT_KEY_REQUIRED"
+
+
+class MultiAgentKeyRequiredError(IdentityRequiredError):
+    """An unkeyed v1 bundle for a sandbox that already has keyed v2 history.
+
+    The multi-agent design (§5) names a partially configured multi-agent
+    container falling back to one identity as the failure that most
+    resembles success, and has an unkeyed evidence upload for that sandbox
+    rejected with `MULTI_AGENT_KEY_REQUIRED` (DR-234)."""
+
+    code = MULTI_AGENT_KEY_REQUIRED
+
+    def __init__(self, host_id: str, sandbox_name: str):
+        super().__init__(
+            f"{MULTI_AGENT_KEY_REQUIRED}: sandbox {sandbox_name!r} on host {host_id!r} "
+            "already has keyed multi-agent (evidence bundle v2) history; an unkeyed v1 "
+            "bundle for it is refused rather than filed as another agent. Send a v2 "
+            "collection, or this v1 bundle with an explicit non-default agent_key"
+        )
+
+
+def is_explicit_agent_key(agent_key: str | None) -> bool:
+    """Whether a caller-supplied key names one agent: non-empty and not the
+    reserved compatibility key `default` (design §4.1)."""
+    return isinstance(agent_key, str) and bool(agent_key.strip()) and (
+        agent_key.strip() != DEFAULT_AGENT_KEY
+    )
+
+
 def bundle_digest(raw: bytes) -> str:
     """SHA-256 over the exact bytes received, without JSON reserialization."""
     return f"sha256:{hashlib.sha256(raw).hexdigest()}"

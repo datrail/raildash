@@ -220,7 +220,9 @@ Bounded to `RAILDASH_MAX_EVIDENCE_BUNDLE_BYTES` (default 1,048,576 bytes,
 mirroring Rail Center's `MAX_EVIDENCE_BUNDLE_BYTES`). Responses: `202
 {"accepted": true, "asp_id": "asp-...", "duplicate": bool}` on accept; `409`
 if an id/identity already names different stored bytes; `422` for a
-malformed or unresolvable bundle.
+malformed or unresolvable bundle, or `422` with `"code":
+"MULTI_AGENT_KEY_REQUIRED"` for an unkeyed v1 bundle sent to a multi-agent
+sandbox (see "Multi-agent collections" below).
 
 ### HTTP: the rest of custody, and local write safety
 
@@ -419,6 +421,22 @@ and `observed_file_access`) by the declarations RailMon gives them there
 (`V1_WINDOW_LISTS`, checked against RailMon's composer in CI). A re-scan of
 an unchanged agent that saw fewer hosts, or the same hosts a different
 number of times, is not drift.
+
+Once a sandbox (`host_id` + `sandbox_name`) has a stored v2 collection,
+RailDash refuses a v1 bundle for it that names no explicit agent key: `422
+{"detail": "MULTI_AGENT_KEY_REQUIRED: ...", "code":
+"MULTI_AGENT_KEY_REQUIRED"}`, and nothing is stored. That holds even when
+the bundle carries a deployment identity that would key it in a
+single-agent stack: a multi-agent container falling back to one identity
+would otherwise be filed as another agent and look like success. A v1
+bundle keyed with `?agent_key=NAME` (or the header, or `asp load
+--agent-key`) is still accepted; that is how RailMon delivers each agent
+when its shared scan fails. The reserved `default` key does not count. A
+sandbox that has never sent v2 is unaffected, and resending a bundle
+already stored is still answered as a replay. A sandbox that goes back to a
+single agent keeps refusing unkeyed v1, because its v2 history stays: give
+RailMon a key (`RAIL_AGENT_KEY` or `--agent-key`), and lock a new baseline
+from the keyed ASPs.
 
 A v1 bundle compared with a v2 baseline (or the reverse) is
 `CONTRACT_MISMATCH`. v1 comparisons still emit contract v1 unchanged.
