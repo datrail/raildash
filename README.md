@@ -345,6 +345,13 @@ includes the rule only when the baseline was contained, and **Require
 containment** adds it to any version. An ASP from before RailMon's rule pack
 11 leaves the line unknown and the rule Unverified.
 
+Containment is a property of the sandbox, so in a multi-agent sandbox
+(evidence bundle v2 with two or more agents) the line and the rule read the
+sandbox scope's `egress_containment`, which every agent in it shares. The
+rule is Held, Violated or Unverified there exactly as for one agent, with
+the same stale window. Every other rule stays Unverified in a multi-agent
+sandbox, since it can't say which agent a listener, write or request was.
+
 **The data-action classifier's model step.** Deterministic rules classify
 each MCP tool's data actions from its name and schema. A tool they leave
 unclassified can also be asked of a model, which is off unless both of these

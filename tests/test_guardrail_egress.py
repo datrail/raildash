@@ -9,6 +9,7 @@ through `Store.load_asp`, which runs the ASP hook.
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 
 import pytest
@@ -322,3 +323,116 @@ def test_starts_violated_follows_what_the_recheck_recorded(store):
     made = store.require_containment(ref)
     rule = store.guardrail_detail(ref)["rules"][g.EGRESS]
     assert made["starts_violated"] is (rule["state"] == g.VIOLATED)
+
+
+# ------------------------------------------------------------- multi-agent
+# DR-240: containment is the sandbox's, and RailMon emits it in a v2
+# bundle's sandbox scope (`SANDBOX_ATTRIBUTES`), so a multi-agent sandbox
+# is judged on that value, while every other rule stays MULTI_AGENT.
+
+
+_TWO_AGENT_IDS = itertools.count(1)
+
+
+def _two_agents(sandbox_egress=None, *, agent_egress=None, collected_at=None) -> dict:
+    """RailMon's real two-agent v2 fixture with `egress_containment` in its
+    sandbox scope (None leaves it out) and, if given, in an agent's."""
+    from test_guardrail import TWO_AGENTS_FIXTURE
+
+    value = json.loads(TWO_AGENTS_FIXTURE.read_bytes())
+    if sandbox_egress is not None:
+        value["sandbox"]["attributes"]["egress_containment"] = sandbox_egress
+    if agent_egress is not None:
+        value["agents"][0]["attributes"]["egress_containment"] = agent_egress
+    if collected_at is not None:
+        value["collected_at"] = collected_at
+    value["bundle_id"] = f"bnd-egress-two-agents-{next(_TWO_AGENT_IDS)}"
+    return value
+
+
+def _judge_two_agents(store, value, require="contained", *, now=None, previous=None):
+    _, bundle = stored(store, value)
+    assert g.is_multi_agent(bundle)
+    version = guardrail(egress_containment={"require": require})
+    version["guardrail_contract_version"] = 3
+    collected = bundle["collected_at"]
+    return g.evaluate_asp(version, bundle, asp_id="asp-2", previous_collected_at=previous,
+                          now=now or collected)
+
+
+@pytest.mark.parametrize(
+    "attribute, require, state, reason, items",
+    [
+        (egress("allow_list_enforced"), "contained", "held", None, []),
+        (egress("internal_network", peers=["squid"]), "contained", "held", None, []),
+        (egress("allow_list_enforced"), "allow_list_enforced", "held", None, []),
+        (egress("open"), "contained", "violated", None, ["open"]),
+        (egress("no_network"), "allow_list_enforced", "violated", None, ["no_network"]),
+        (egress("open", "PARTIAL"), "contained", "unverified", g.PARTIAL_NO_VIOLATION, []),
+        (egress("open", "FAILED"), "contained", "unverified", "FAILED", []),
+        (None, "contained", "unverified", g.NOT_COLLECTED, []),
+    ],
+)
+def test_a_multi_agent_sandbox_is_judged_on_its_sandbox_scoped_level(
+    store, attribute, require, state, reason, items
+):
+    result = _judge_two_agents(store, _two_agents(attribute), require)
+    assert result["multi_agent"] is True
+    egress_result = result["rules"][g.EGRESS]
+    assert (egress_result["state"], egress_result["reason"]) == (state, reason)
+    assert [v["item"] for v in egress_result["violations"]] == items
+    for violation in egress_result["violations"]:
+        assert violation["source"] == {"kind": "asp", "id": "asp-2"}
+    # Every other rule keeps its multi-agent Unverified, in the evaluator
+    # and in the roll-up, request rules included.
+    for rule in g.RULES:
+        assert result["rules"][rule] == {"state": "unverified", "reason": g.MULTI_AGENT, "violations": []}
+    states = g.rule_states(result, g.request_rules_status(
+        now=NOW, last_heartbeat_at=NOW, last_unattributed_at=None, last_tool_calls_unreadable_at=None),
+        g.contract_rules({"rules": {g.EGRESS: {}}}))
+    assert {rule: (s["state"], s["reason"]) for rule, s in states.items()} == {
+        **{rule: ("unverified", g.MULTI_AGENT) for rule in g.RULES}, g.EGRESS: (state, reason),
+    }
+
+
+def test_a_stale_multi_agent_asp_leaves_held_unverified_and_a_violation_real(store):
+    later = "2026-09-25T00:00:00Z"
+    held = _judge_two_agents(store, _two_agents(egress("no_network")), now=later)
+    assert held["stale"] is True
+    assert (held["rules"][g.EGRESS]["state"], held["rules"][g.EGRESS]["reason"]) == ("unverified", g.STALE)
+    broken = _judge_two_agents(store, _two_agents(egress("open")), now=later)["rules"][g.EGRESS]
+    assert (broken["state"], broken["reason"], len(broken["violations"])) == ("violated", g.STALE, 1)
+
+
+def test_a_multi_agent_sandbox_reads_only_the_sandbox_scope(store):
+    """An agent-scoped value names one agent, not the sandbox: it isn't read."""
+    result = _judge_two_agents(store, _two_agents(agent_egress=egress("allow_list_enforced")))
+    assert (result["rules"][g.EGRESS]["state"], result["rules"][g.EGRESS]["reason"]) == (
+        "unverified", g.NOT_COLLECTED)
+
+
+def test_a_multi_agent_version_without_the_rule_stays_all_multi_agent(store):
+    _, bundle = stored(store, _two_agents(egress("open")))
+    result = g.evaluate_asp(guardrail(), bundle, asp_id="a", previous_collected_at=None, now=NOW)
+    assert g.EGRESS not in result["rules"]
+    assert {r["reason"] for r in result["rules"].values()} == {g.MULTI_AGENT}
+
+
+def test_a_multi_agent_sandbox_records_and_shows_an_egress_violation(store):
+    from test_guardrail_custody import _now
+
+    alignment, ref = baseline(store, _two_agents(egress("allow_list_enforced"), collected_at=_now()))
+    rules = {**guardrail()["rules"], g.EGRESS: {"require": "contained"}}
+    store.adopt_guardrail(alignment["alignment_version_id"], rules)
+    live(store)
+    detail = store.guardrail_detail(ref)
+    assert detail["rules"][g.EGRESS] == {"state": "held", "reason": None}
+    for rule in g.RULES:
+        assert detail["rules"][rule] == {"state": "unverified", "reason": g.MULTI_AGENT}
+    assert detail["state"] == g.STATE_UNVERIFIED
+    assert detail["egress"]["reading"]["multi_agent"] is True
+    load(store, _two_agents(egress("open"), collected_at=_now()))
+    assert rows(store, ref)[(g.EGRESS, "open")]["counts"]
+    detail = store.guardrail_detail(ref)
+    assert detail["rules"][g.EGRESS]["state"] == "violated"
+    assert detail["state"] == g.STATE_VIOLATED

@@ -101,7 +101,9 @@ a violation or an Unverified, never a Held:
   rule unverified (`MALFORMED_EVIDENCE`), alongside any violation a
   readable one shows.
 - A v2 bundle counts as multi-agent when it lists two or more agents,
-  whatever their `discovery_status`; a proposal from one is refused.
+  whatever their `discovery_status`; a proposal from one is refused. Its
+  `egress_containment` rule is still judged, on the sandbox scope's value
+  (DR-240): containment is the sandbox's, shared by every agent in it.
 - An attributed request that matches the identity of more than one active
   guardrail is treated as unattributed, and one that matches none belongs to
   an agent without a guardrail (it is not checked, and is not unattributed).
@@ -995,7 +997,8 @@ def is_multi_agent(bundle: Mapping[str, Any]) -> bool:
 
 def _attributes(bundle: Mapping[str, Any]) -> dict[str, Any]:
     """One single-agent view of an ASP's attributes: v1's own, or a v2
-    bundle's sandbox scope (listeners, files) over its one agent's."""
+    bundle's sandbox scope (listeners, files, egress) over its one agent's.
+    A multi-agent bundle's view is its sandbox scope alone."""
     if bundle.get("bundle_version") != BUNDLE_VERSION_V2:
         return dict(bundle.get("attributes") or {})
     agents = bundle.get("agents") or []
@@ -1044,8 +1047,11 @@ def evaluate_asp(
     `bundle` is what `raildash.asp.parse_bundle` returns for the stored
     bytes; the caller has matched its identity to the guardrail's.
     Returns `{"multi_agent": bool, "stale": bool, "rules": {...}}`. A
-    multi-agent bundle evaluates nothing and makes every rule the version
-    has Unverified; `rule_states` carries that over the request rules.
+    multi-agent bundle makes every rule the version has Unverified
+    (`MULTI_AGENT`), and `rule_states` carries that over the request rules,
+    with one exception (DR-240): `egress_containment` is a property of the
+    sandbox, which RailMon emits in a v2 bundle's sandbox scope, so it is
+    judged there exactly as on a single agent, staleness included.
 
     Per rule, from the attribute's status: `ANSWERED` and `ABSENT` are
     verified; `PARTIAL` is violated when a listed item breaks the rule (a
@@ -1058,19 +1064,19 @@ def evaluate_asp(
     its violations stay real (`state: violated`) and `reason` says why the
     rule still is not verified.
     """
-    if is_multi_agent(bundle):
-        return {
-            "multi_agent": True,
-            "stale": False,
-            "rules": {
-                rule: {"state": UNVERIFIED, "reason": MULTI_AGENT, "violations": []}
-                for rule in contract_rules(guardrail)
-            },
-        }
     stale = asp_is_stale(newest_received_at or bundle["collected_at"], previous_collected_at, now)
+    # A multi-agent view holds the sandbox scope only (`_attributes`).
     attributes = _attributes(bundle)
     source = {"kind": "asp", "id": asp_id}
     rules = guardrail["rules"]
+    if is_multi_agent(bundle):
+        results = {
+            rule: {"state": UNVERIFIED, "reason": MULTI_AGENT, "violations": []}
+            for rule in contract_rules(guardrail)
+        }
+        if EGRESS in rules:
+            results[EGRESS] = _egress_rule(attributes.get(EGRESS_ATTRIBUTE), rules[EGRESS], stale, source)
+        return {"multi_agent": True, "stale": stale, "rules": results}
     results = {
         "service_ports": _attribute_rule(
             attributes.get(LISTENERS_ATTRIBUTE),
@@ -1244,11 +1250,15 @@ def rule_states(
     """Every rule's latest results: the ASP rules from `evaluate_asp`
     (Unverified `NOT_COLLECTED` when no ASP has been evaluated) and the
     request rules from `request_rules_status`, except that a multi-agent ASP
-    makes every rule Unverified (multi-agent)."""
+    makes every rule Unverified (multi-agent) but the sandbox-scoped
+    `egress_containment`, which keeps its own result (DR-240)."""
     rules = tuple(rules)
     if asp_result is not None and asp_result.get("multi_agent"):
-        multi = next(iter(asp_result["rules"].values()))
-        return {rule: dict(asp_result["rules"].get(rule, multi)) for rule in rules}
+        multi = {"state": UNVERIFIED, "reason": MULTI_AGENT, "violations": []}
+        return {
+            rule: dict(asp_result["rules"].get(rule, multi) if rule == EGRESS else multi)
+            for rule in rules
+        }
     states: dict[str, dict[str, Any]] = {}
     for rule in (r for r in rules if r in ALL_ASP_RULES):
         result = (asp_result or {}).get("rules", {}).get(rule)

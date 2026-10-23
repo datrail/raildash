@@ -1237,7 +1237,8 @@ function renderEgressLine(egress) {
 function renderRequireContainment(agentRef, egress, refresh) {
   const section = el("div", "guardrail-require-egress");
   const reading = (egress && egress.reading) || {};
-  if (reading.status === "ANSWERED" && reading.level && !reading.contained && !reading.multi_agent) {
+  // A multi-agent sandbox is judged on its own level too (DR-240).
+  if (reading.status === "ANSWERED" && reading.level && !reading.contained) {
     section.append(el("p", "hint", "This agent isn't contained now, so a version that requires it starts Violated."));
   }
   section.append(guardrailButton("Require containment", async () => {
