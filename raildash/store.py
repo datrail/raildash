@@ -45,6 +45,7 @@ from .asp import (
     DEFAULT_DRIFT_PAGE_SIZE,
     BundleValidationError,
     FILE_ACCESS_ATTRIBUTE,
+    IdentityRequiredError,
     MAX_DRIFT_PAGE_SIZE,
     MultiAgentKeyRequiredError,
     bundle_digest,
@@ -823,29 +824,38 @@ class Store(GuardrailCustody, DataActionsStore):
             # Inside the write lock, so a v2 collection landing concurrently
             # can't slip between this check and the insert. An exact replay of
             # a bundle already stored is answered as a replay below, as before.
-            if (
-                bundle["bundle_version"] != BUNDLE_VERSION_V2
-                and not is_explicit_agent_key(agent_key)
-                and self._db.execute(
-                    "SELECT 1 FROM asps WHERE digest = ?", (digest,)
-                ).fetchone()
-                is None
-            ):
-                self._refuse_unkeyed_after_v2_locked(bundle)
-            identity = resolve_identity(bundle, agent_key)
-            identity_kind, identity_value = self._identity_columns(identity)
             existing = self._db.execute(
                 "SELECT * FROM asps WHERE digest = ?", (digest,)
             ).fetchone()
+            is_v1 = bundle["bundle_version"] != BUNDLE_VERSION_V2
+            multi_agent = is_v1 and self._sandbox_has_v2_history_locked(bundle)
+            if existing is None and multi_agent and not is_explicit_agent_key(agent_key):
+                raise MultiAgentKeyRequiredError(bundle["host_id"], bundle["sandbox_name"])
+            identity = resolve_identity(bundle, agent_key, multi_agent=multi_agent)
+            identity_kind, identity_value = self._identity_columns(identity)
             if existing is not None:
-                if (
-                    existing["identity_kind"] != identity_kind
-                    or existing["identity_value"] != identity_value
-                ):
+                # An exact replay keeps the identity it was stored under. A
+                # keyed v1 bundle stored before its sandbox had v2 history
+                # (under its deployment identity), or while it had some
+                # (under its key), resolves under the other precedence once
+                # that changes (DR-243); either is still the same bytes from
+                # the same caller. A different key is still refused.
+                stored = (existing["identity_kind"], existing["identity_value"])
+                candidates = {(identity_kind, identity_value)}
+                if is_v1 and is_explicit_agent_key(agent_key):
+                    try:
+                        other = resolve_identity(bundle, agent_key, multi_agent=not multi_agent)
+                    except IdentityRequiredError:
+                        pass
+                    else:
+                        candidates.add(self._identity_columns(other))
+                if stored not in candidates:
                     raise ValueError(
                         "exact bundle is already stored under a different agent identity"
                     )
-                self._guardrail_asp_received(existing["asp_id"], identity_kind, identity_value)
+                self._guardrail_asp_received(
+                    existing["asp_id"], existing["identity_kind"], existing["identity_value"]
+                )
                 return self._asp_summary(existing, replayed=True)
             collision = self._db.execute(
                 "SELECT digest FROM asps WHERE bundle_id = ?", (bundle["bundle_id"],)
@@ -884,20 +894,25 @@ class Store(GuardrailCustody, DataActionsStore):
         self._secure_database_files()
         return self._asp_summary(row, replayed=False)
 
-    def _refuse_unkeyed_after_v2_locked(self, bundle: dict[str, Any]) -> None:
-        """DR-234, design §5: once a sandbox (host_id + sandbox_name) has a
-        stored v2 collection, a v1 bundle for it that names no explicit
-        non-default `agent_key` is refused with MULTI_AGENT_KEY_REQUIRED --
-        whether or not a deployment identity would otherwise key it -- rather
-        than filed as a separate agent. A sandbox with no v2 history (every
-        single-agent stack) is unaffected."""
-        keyed = self._db.execute(
+    def _sandbox_has_v2_history_locked(self, bundle: dict[str, Any]) -> bool:
+        """Whether the bundle's sandbox (host_id + sandbox_name) is
+        multi-agent: it has a stored v2 collection. Read inside the write
+        lock, so a v2 collection landing concurrently can't slip between
+        this check and the insert.
+
+        For such a sandbox, a v1 bundle that names no explicit non-default
+        `agent_key` is refused with MULTI_AGENT_KEY_REQUIRED (DR-234, design
+        §5) -- whether or not a deployment identity would otherwise key it --
+        rather than filed as a separate agent, and one that names one is
+        filed under that key rather than its deployment identity (DR-243).
+        A sandbox with no v2 history (every single-agent stack) is
+        unaffected; an exact replay of a stored bundle is answered as a
+        replay."""
+        return self._db.execute(
             "SELECT 1 FROM asps WHERE host_id = ? AND sandbox_name = ? "
             "AND bundle_version = ? LIMIT 1",
             (bundle["host_id"], bundle["sandbox_name"], BUNDLE_VERSION_V2),
-        ).fetchone()
-        if keyed is not None:
-            raise MultiAgentKeyRequiredError(bundle["host_id"], bundle["sandbox_name"])
+        ).fetchone() is not None
 
     def _compare_active_locked(
         self, asp_id: str, raw: bytes, identity_kind: str, identity_value: str

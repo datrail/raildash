@@ -259,7 +259,7 @@ def test_a_lock_refuses_an_identity_every_later_compare_would_reject(tmp_path, m
     monkeypatch.setattr(
         store_module,
         "resolve_identity",
-        lambda bundle, agent_key=None: {"kind": "local_agent_keys", "value": ["executor\n"]},
+        lambda bundle, agent_key=None, **_: {"kind": "local_agent_keys", "value": ["executor\n"]},
     )
     store = Store(tmp_path / "raildash.db")
     loaded = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-bad-identity"))
@@ -268,21 +268,21 @@ def test_a_lock_refuses_an_identity_every_later_compare_would_reject(tmp_path, m
     store.close()
 
 
-def test_a_v1_bundle_against_a_v2_baseline_is_not_comparable(tmp_path):
+def test_a_v2_bundle_against_a_v1_baseline_is_not_comparable(tmp_path):
     # Same deployment identity, different evidence shape: comparing would
     # report every attribute as moved between scopes, so it is refused.
-    # Keyed, as RailMon's per-agent fallback sends it: an unkeyed v1 bundle
-    # for a sandbox with v2 history is refused outright (DR-234), while a
-    # keyed one still resolves to the deployment identity it carries.
+    # The v1 baseline is locked while the sandbox is still single-agent, so
+    # it is filed under its deployment identity, which the v2 collection
+    # shares. (Once the sandbox has v2 history, a keyed v1 bundle files
+    # under its key instead, DR-243, so it never meets the v2 baseline.)
     store = Store(tmp_path / "raildash.db")
-    baseline = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-mixed"))
+    baseline = store.load_asp(changed_bundle(bundle_id="bnd-custody-v1-before-v2"))
     version = store.lock_alignment(baseline["asp_id"], "v1.0")
     store.switch_alignment(version["alignment_version_id"])
-    current = store.load_asp(
-        changed_bundle(bundle_id="bnd-custody-v1-after-v2"), agent_key="executor"
-    )
+    current = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-mixed"))
+    assert current["agent_identity"] == baseline["agent_identity"]
     drift = store.drift_page(current["asp_id"])
-    _validate_drift(drift, 2)
+    _validate_drift(drift, 1)  # the baseline's contract decides the version
     assert drift["comparable"] is False
     assert drift["reason"] == "CONTRACT_MISMATCH"
     store.close()

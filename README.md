@@ -186,7 +186,9 @@ answering is drift. The ASP keeps the value; "Inspect evidence" shows it.
 
 For a bundle without a complete deployment or host-scoped Compose identity,
 pass `--agent-key NAME` to `asp load` (HTTP: `?agent_key=NAME` or an
-`X-RailDash-Agent-Key` header, see below). Replaying identical bytes is
+`X-RailDash-Agent-Key` header, see below). A deployment identity wins over
+the key, except in a multi-agent sandbox (see "Multi-agent collections"
+below). Replaying identical bytes is
 idempotent; reusing a bundle ID with different bytes is rejected. `asp export`
 preserves the exact received bytes, and `asp drift-export` writes full
 baseline/current evidence. Both refuse public output directories and create
@@ -431,9 +433,15 @@ single-agent stack: a multi-agent container falling back to one identity
 would otherwise be filed as another agent and look like success. A v1
 bundle keyed with `?agent_key=NAME` (or the header, or `asp load
 --agent-key`) is still accepted; that is how RailMon delivers each agent
-when its shared scan fails. The reserved `default` key does not count. A
-sandbox that has never sent v2 is unaffected, and resending a bundle
-already stored is still answered as a replay. A sandbox that goes back to a
+when its shared scan fails. It is filed under that key, even when it also
+carries a deployment identity: every agent in the container shares that
+identity, so filing under it would mix their ASPs into one agent and show
+false drift. The reserved `default` key does not count. A sandbox that has
+never sent v2 is unaffected: there the deployment identity still wins over
+a key, so no locked baseline moves. Resending a bundle already stored is
+still answered as a replay under the identity it was stored under, even if
+the sandbox gained v2 history since; resending it under a different key is
+a `409`. A sandbox that goes back to a
 single agent keeps refusing unkeyed v1, because its v2 history stays: give
 RailMon a key (`RAIL_AGENT_KEY` or `--agent-key`), and lock a new baseline
 from the keyed ASPs.

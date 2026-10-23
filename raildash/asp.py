@@ -396,9 +396,21 @@ def _semantic_problems_v2(bundle: dict[str, Any]) -> list[str]:
 
 
 def resolve_identity(
-    bundle: dict[str, Any], agent_key: str | None = None
+    bundle: dict[str, Any],
+    agent_key: str | None = None,
+    *,
+    multi_agent: bool = False,
 ) -> dict[str, Any]:
     """Resolve identity by contract precedence, never by resemblance.
+
+    `multi_agent` says the bundle's sandbox is multi-agent (the store has v2
+    history for its host_id + sandbox_name, DR-234). There an explicit
+    non-default `agent_key` on a v1 bundle wins over its deployment identity
+    (DR-243): RailMon's per-agent fallback sends each agent of one container
+    its own keyed v1 bundle, and the container's deployment identity, shared
+    by all of them, would interleave their ASPs. Otherwise (every
+    single-agent sandbox) the deployment identity wins as before, so no
+    locked baseline moves.
 
     v2's shared `deployment` fact (when present) lives in `sandbox.attributes`
     rather than the bundle's own top-level `attributes` (see the v2 schema's
@@ -412,6 +424,8 @@ def resolve_identity(
     a single-item case of it.
     """
     is_v2 = bundle.get("bundle_version") == BUNDLE_VERSION_V2
+    if multi_agent and not is_v2 and is_explicit_agent_key(agent_key):
+        return _local_agent_key_identity(agent_key)
     attributes = bundle["sandbox"]["attributes"] if is_v2 else bundle["attributes"]
     deployment = attributes.get("deployment") or {}
     value = deployment.get("value") if deployment.get("status") == "ANSWERED" else {}
@@ -438,6 +452,12 @@ def resolve_identity(
             "kind": "local_agent_keys",
             "value": [agent["agent_key"] for agent in bundle["agents"]],
         }
+    return _local_agent_key_identity(agent_key)
+
+
+def _local_agent_key_identity(agent_key: str | None) -> dict[str, Any]:
+    """v1's caller-keyed identity, for a bundle no deployment identity keys
+    (or, in a multi-agent sandbox, one with an explicit key)."""
     if not isinstance(agent_key, str) or not agent_key:
         raise IdentityRequiredError("unkeyed bundle requires a local agent_key")
     if agent_key != agent_key.strip():
@@ -539,9 +559,13 @@ def compare_alignment(
         if expected_identity["kind"] == "local_agent_key"
         else None
     )
+    # A keyed alignment's bundles were filed under their key, which in a
+    # multi-agent sandbox wins over a deployment identity they also carry
+    # (DR-243); a key comes only from that identity, so this is exact.
+    keyed = baseline_key is not None
     try:
-        baseline_identity = resolve_identity(baseline, baseline_key)
-        current_identity = resolve_identity(current, current_agent_key)
+        baseline_identity = resolve_identity(baseline, baseline_key, multi_agent=keyed)
+        current_identity = resolve_identity(current, current_agent_key, multi_agent=keyed)
     except IdentityRequiredError:
         return not_comparable("IDENTITY_MISMATCH")
     if baseline_identity != expected_identity:
