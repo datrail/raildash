@@ -956,7 +956,7 @@ components:
                 properties:
                   status: {enum: [ANSWERED, ABSENT, TEMPLATED, PARTIAL, BLIND, FAILED]}
                   reason: {type: [string, 'null']}
-                  tier: {type: string, description: "observed for RailMon's filesnoop"}
+                  tier: {type: string, description: "observed for RailMon's file probe (railmon files)"}
                   authored_by: {type: [string, 'null']}
                   note: {type: [string, 'null']}
                   files:

@@ -2246,7 +2246,7 @@ function kernelFileSource(source) {
   if (notCollected) {
     block.append(el("p", "kernel-file-not-collected",
       "Not collected: RailMon ran no file probe for this scan, so there are no files to show. " +
-      "That is expected unless RailMon is given filesnoop's events; it is not an error."));
+      "That is expected unless RailMon's scan reads its file probe's events (railmon files); it is not an error."));
   }
   const [glyph, tone] = EVIDENCE_STATUS[evidence.status] || ["?", "pill-none"];
   const qualifiers = el("div", "kernel-file-qualifiers");

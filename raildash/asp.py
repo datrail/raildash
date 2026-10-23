@@ -791,7 +791,7 @@ def _window_attributes(
 # guardrail glob crosses directories.
 _UUIDS = re.compile(r"(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})+")
 # RailMon's note on a file list whose cap left reads out, whatever its
-# reason (railmon `tools/scan/evidence_bundle.py`, unchanged through rule pack 12).
+# reason (railmon `tools/scan/evidence_bundle.py`, unchanged through rule pack 13).
 # A reworded note only turns the rule off, which reports drift, not less.
 _READS_LEFT_OUT = "more distinct files than the cap (reads are left out first)"
 _FILES_MAY_BE_MISSING = ": files may be missing from this list"

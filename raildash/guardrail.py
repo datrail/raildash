@@ -471,7 +471,7 @@ def saved_file_entry(path: str) -> dict[str, Any]:
 def listener_allowed(listener: Mapping[str, Any], entries: Iterable[Mapping[str, Any]]) -> bool:
     """Whether one `observed_listeners` item matches an allowed entry.
 
-    `"ephemeral"` matches only listensnoop's `ephemeral` and never a number.
+    `"ephemeral"` matches only RailMon's `ephemeral` and never a number.
     An entry without `addr` matches any address; `0.0.0.0` and `::` both
     mean every address and match each other.
     """

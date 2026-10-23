@@ -150,7 +150,7 @@ at most once, so repeating the action reuses its alignment version.
 
 A capture's profile lists the files its tool calls *asked* to read or write
 (**Files · asked**, from the captured conversation). Beside it,
-**Files · kernel-observed** lists what RailMon's filesnoop saw the sandbox
+**Files · kernel-observed** lists what RailMon's file probe (`railmon files`) saw the sandbox
 actually open: the `observed_file_access` attribute (path, read, write, exec,
 layer) of the latest ASP received for each sandbox the capture names, or, for
 a capture that names no sandbox (a single-agent RailMon), the latest ASP of
