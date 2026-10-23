@@ -365,9 +365,10 @@ asked for, without its arguments. A script that could reach a tool through
 a name it doesn't spell (`tools[name]`, `tools` handed on whole, an escape,
 `eval`, `constructor`), or one cut before it ended, makes that request's
 tool calls unreadable, and the uploads, out-of-spec calls and data actions
-rules stay Unverified for a while. The script is read, not run; whatever it
-says, the host each of its MCP requests goes to is still checked against
-out-of-spec calls' allowed hosts, on the wire.
+rules stay Unverified for a while. The script is read, not run, so a script
+written to hide a call can still hide it. Whatever it says, the host each
+HTTP MCP request goes to is still checked against out-of-spec calls' allowed
+hosts on the wire; a stdio MCP server's calls don't cross the wire.
 
 **The data-action classifier's model step.** Deterministic rules classify
 each MCP tool's data actions from its name and schema. A tool they leave

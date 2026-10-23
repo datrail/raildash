@@ -644,9 +644,11 @@ _CODE_MODE_TOOL_NAME = re.compile(
 #   `Reflect`, `this`, `import`, `require`, `prototype`, `__proto__`, and
 #   `load`, which hands back what an earlier script stored).
 # A bare word `tools` in a string counts too, which errs towards unreadable.
-# This reads the names a script spells; it is not a JavaScript parser.
-# Whatever a script says, the host of the MCP request a call makes is still
-# judged on the wire (`out_of_spec_calls`' allowed hosts).
+# This reads the names a script spells; it is not a JavaScript parser, and a
+# script written to hide a call (a member name built at run time can still
+# reach `Function`) can hide it. Whatever a script says, the host of an HTTP
+# MCP server's request is still judged on the wire (`out_of_spec_calls`'
+# allowed hosts); a stdio server's calls never touch the wire.
 _CODE_MODE_DYNAMIC = re.compile(
     r"(?<![\w$])tools(?:\s*\?\.)?\s*\[(?!\s*" + _LITERAL + r"\s*\])"
     r"|(?<![\w$])tools(?![\w$])(?!\s*\??\.\s*[A-Za-z_$]|(?:\s*\?\.)?\s*\[)"
@@ -874,7 +876,7 @@ def _event_tool_calls(event: dict[str, Any], add: Any) -> None:
         elif isinstance(item, dict) and item.get("type") == "custom_tool_call":
             # Only `.done` carries an `exec` script whole; `.added`'s input is
             # empty. An `exec` added and never done was cut, its calls unseen.
-            key = event.get("output_index", item.get("id"))
+            key = item.get("id") or event.get("output_index")
             if kind == "response.output_item.done":
                 add((_CUSTOM_DONE, key))
                 _add_custom_tool_call(item, add)
