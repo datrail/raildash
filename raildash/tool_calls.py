@@ -317,7 +317,8 @@ def _requested(exchange: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any, Any
     """`(kind, name, server, arguments)` for each call the reply asks for;
     kind is `tool` or `provider`."""
     anthropic: dict[int, dict[str, Any]] = {}
-    chat: dict[tuple[int, int], dict[str, Any]] = {}
+    chat: dict[tuple[int, Any], dict[str, Any]] = {}
+    current: dict[int, Any] = {}  # per choice, the index-less call being streamed
     for value in ts._response_messages(exchange):
         if not isinstance(value, dict):
             continue
@@ -359,14 +360,25 @@ def _requested(exchange: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any, Any
                 # OpenAI numbers each call and sends its id only on the first
                 # chunk. Gemini leaves the number out and sends each call
                 # whole, with its id, so the id tells two calls apart there.
-                call_index: Any = call.get("index")
-                if not isinstance(call_index, int):
-                    call_id = call.get("id")
-                    call_index = ("id", call_id) if isinstance(call_id, str) and call_id else 0
-                entry = chat.setdefault((position, call_index), {"name": None, "arguments": []})
+                # With neither, a name starts a call and a nameless fragment
+                # continues the current one, so no call renames another.
                 function = call.get("function")
+                call_index: Any = call.get("index")
+                if isinstance(call_index, int):
+                    current.pop(position, None)
+                else:
+                    call_id = call.get("id")
+                    if isinstance(call_id, str) and call_id:
+                        call_index = ("id", call_id)
+                    elif isinstance(function, dict) and isinstance(function.get("name"), str) \
+                            and function["name"]:
+                        call_index = ("n", len(chat))
+                    else:
+                        call_index = current.get(position, ("n", -1))
+                    current[position] = call_index
+                entry = chat.setdefault((position, call_index), {"name": None, "arguments": []})
                 if isinstance(function, dict):
-                    if isinstance(function.get("name"), str):
+                    if isinstance(function.get("name"), str) and function["name"]:
                         entry["name"] = function["name"]
                     if isinstance(function.get("arguments"), str):
                         entry["arguments"].append(function["arguments"])
@@ -382,8 +394,9 @@ def _requested(exchange: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any, Any
 
 
 def requested_call_count(exchange: Mapping[str, Any]) -> int:
-    """How many named calls the reply asks for, whole or streamed: the
-    calls `extract_tool_calls` lists as requested, before `MAX_CALLS`."""
+    """How many named calls the reply asks for, whole or streamed, read as
+    `extract_tool_calls` reads a model's reply but whatever the request
+    was, and before `MAX_CALLS`."""
     return sum(
         1 for kind, name, server, _ in _requested(exchange)
         if call_name(kind, name, server) is not None
