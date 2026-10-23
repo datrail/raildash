@@ -356,7 +356,13 @@ def _requested(exchange: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any, Any
             position = choice.get("index") if isinstance(choice.get("index"), int) else position
             delta = choice.get("delta")
             for call in ts._dicts(delta.get("tool_calls") if isinstance(delta, dict) else None):
-                call_index = call.get("index") if isinstance(call.get("index"), int) else 0
+                # OpenAI numbers each call and sends its id only on the first
+                # chunk. Gemini leaves the number out and sends each call
+                # whole, with its id, so the id tells two calls apart there.
+                call_index: Any = call.get("index")
+                if not isinstance(call_index, int):
+                    call_id = call.get("id")
+                    call_index = ("id", call_id) if isinstance(call_id, str) and call_id else 0
                 entry = chat.setdefault((position, call_index), {"name": None, "arguments": []})
                 function = call.get("function")
                 if isinstance(function, dict):
@@ -373,6 +379,15 @@ def _requested(exchange: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any, Any
             yield "tool", block.get("name"), None, arguments
     for entry in chat.values():
         yield "tool", entry["name"], None, "".join(entry["arguments"])
+
+
+def requested_call_count(exchange: Mapping[str, Any]) -> int:
+    """How many named calls the reply asks for, whole or streamed: the
+    calls `extract_tool_calls` lists as requested, before `MAX_CALLS`."""
+    return sum(
+        1 for kind, name, server, _ in _requested(exchange)
+        if call_name(kind, name, server) is not None
+    )
 
 
 def _responses_item(item: Mapping[str, Any]) -> Iterator[tuple[str, Any, Any, Any]]:

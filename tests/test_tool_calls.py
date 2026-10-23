@@ -85,6 +85,26 @@ def test_streamed_anthropic_and_openai_calls_are_reassembled():
     assert call["tool"] == "read_doc" and call["undeclared"] == ["x"]
 
 
+def test_streamed_gemini_calls_with_no_index_stay_apart():
+    """DR-231: Gemini's chunks send each call whole, with an id and no index;
+    keyed by index alone, a second call's name and arguments overwrote the
+    first's."""
+    calls = [{"id": f"f{n}", "type": "function", "function": {"name": name, "arguments": arguments}}
+             for n, (name, arguments) in enumerate(
+                 (("read_doc", '{"doc_id": "d1"}'), ("upload_file", '{"path": "a"}')))]
+    for chunks in ([calls], [[calls[0]], [calls[1]]]):
+        text = "".join(
+            "data: " + json.dumps({"choices": [{"index": 0, "finish_reason": "stop",
+                                                "delta": {"tool_calls": part}}]}) + "\n\n"
+            for part in chunks)
+        item = exchange("generativelanguage.googleapis.com", "/v1beta/openai/chat/completions",
+                        {"model": "m", "messages": []}, {"raw": text},
+                        response_headers={"content-type": "text/event-stream"})
+        found = tc.extract_tool_calls(stored(item))["calls"]
+        assert [(c["tool"], c["arguments_bytes"]) for c in found] == [
+            ("read_doc", len('{"doc_id": "d1"}')), ("upload_file", len('{"path": "a"}'))]
+
+
 def test_responses_and_provider_side_calls():
     reply = {"output": [
         {"type": "function_call", "name": "read_doc", "arguments": json.dumps({"doc_id": "d"})},

@@ -323,6 +323,23 @@ def _count_tool_calls(body: Any) -> int:
     return count
 
 
+def _count_reply_tool_calls(exchange: dict[str, Any]) -> int:
+    """Tool calls the reply asks for, `_count_tool_calls` for a JSON body.
+
+    RailMon keeps a body that isn't one JSON value, a server-sent event
+    stream above all, as `{"raw": text}`. Its calls arrive in chunks, so
+    they are counted the way data actions read them (`tool_calls`), which
+    reassembles each call once.
+    """
+    response = exchange.get("response")
+    body = response.get("body") if isinstance(response, dict) else None
+    if isinstance(body, dict) and set(body) == {"raw"}:
+        from .tool_calls import requested_call_count
+
+        return requested_call_count(exchange)
+    return _count_tool_calls(body)
+
+
 def _model(body: Any) -> str | None:
     if isinstance(body, dict):
         model = body.get("model")
@@ -547,7 +564,7 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
         "request_size": _size(legacy.get("request_size")),
         "response_size": _size(legacy.get("response_size")),
         "model": _model(request_body) or _model(response_body),
-        "tool_calls": _count_tool_calls(request_body) + _count_tool_calls(response_body),
+        "tool_calls": _count_tool_calls(request_body) + _count_reply_tool_calls(legacy),
         "has_ticket": int(interaction_has_ticket(interaction)),
         "request_media_type": request_media_type(request),
         "content_kinds": ",".join(request_content_kinds(request)),
