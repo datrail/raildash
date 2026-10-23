@@ -999,9 +999,11 @@ class GuardrailCustody:
                 kind, value, rules, derived_from=contract["derived_from"]["alignment_version_id"],
                 created_by="require_containment", detail={"require": require},
             )
-            # What the re-check actually recorded, not the raw reading: a
-            # multi-agent sandbox, an unreadable level or a stale ASP isn't
-            # a violation, and a row already acknowledged stays so.
+            # What the re-check actually recorded, not the raw reading: an
+            # unreadable level or a stale one that meets the rule isn't a
+            # violation, and a row already
+            # acknowledged stays so. A multi-agent sandbox is judged on its
+            # sandbox-scoped level like any other (DR-240).
             summary, _, _ = self._state_locked(kind, value, None)
             return {
                 **self._version_view(created, active=True),
