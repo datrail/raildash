@@ -358,15 +358,17 @@ are set:
 
 Only a tool's schema is sent (its name, description and argument schema),
 never a captured value. A redirect is refused, not followed, so the key
-can't reach another host. The answer counts only when every action is from
+can't reach another host; with `HTTP_PROXY` set, a plain `http://` URL goes
+through that proxy, so use `https://` or `NO_PROXY` for a remote model. The answer counts only when every action is from
 the closed set, and its `read` is weak. Until an answer arrives the tool is
 `unclassified`, the safe direction.
 
-**Downgrading.** A guardrail version with `data_actions` (contract v2) or
-`egress_containment` (contract v3) needs a RailDash that knows that
-contract, `0.2.0-rc.1` or later. Before running an older RailDash on the
-same database, switch each agent to a version without those rules, or
-**Turn off**.
+**Downgrading.** `0.2.0-rc.1` is the first published RailDash with the
+Data Guardrail, including `data_actions` (contract v2) and
+`egress_containment` (contract v3); `0.1.0` has no guardrail and ignores
+it. A source build from between the two may know contract v1 only: before
+running one on the same database, switch each agent to a version without
+those rules, or **Turn off**.
 
 `RAILDASH_GUARDRAIL_MAX_OPEN_ROWS` (default 1000) caps the unacknowledged
 rows per agent before further items count in one overflow row, and
