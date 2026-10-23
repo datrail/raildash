@@ -46,9 +46,11 @@ from .asp import (
     BundleValidationError,
     FILE_ACCESS_ATTRIBUTE,
     MAX_DRIFT_PAGE_SIZE,
+    MultiAgentKeyRequiredError,
     bundle_digest,
     compare_alignment,
     identity_problems,
+    is_explicit_agent_key,
     parse_bundle,
     resolve_identity,
 )
@@ -816,10 +818,16 @@ class Store(GuardrailCustody, DataActionsStore):
     def load_asp(self, raw: bytes, *, agent_key: str | None = None) -> dict[str, Any]:
         """Validate and atomically retain exact evidence bytes as an immutable ASP."""
         bundle = parse_bundle(raw)
-        identity = resolve_identity(bundle, agent_key)
-        identity_kind, identity_value = self._identity_columns(identity)
         digest = bundle_digest(raw)
         with self._write_transaction():
+            # Inside the write lock, so a v2 collection landing concurrently
+            # can't slip between this check and the insert.
+            if bundle["bundle_version"] != BUNDLE_VERSION_V2 and not is_explicit_agent_key(
+                agent_key
+            ):
+                self._refuse_unkeyed_after_v2_locked(bundle)
+            identity = resolve_identity(bundle, agent_key)
+            identity_kind, identity_value = self._identity_columns(identity)
             existing = self._db.execute(
                 "SELECT * FROM asps WHERE digest = ?", (digest,)
             ).fetchone()
@@ -869,6 +877,21 @@ class Store(GuardrailCustody, DataActionsStore):
             row = self._db.execute("SELECT * FROM asps WHERE asp_id = ?", (asp_id,)).fetchone()
         self._secure_database_files()
         return self._asp_summary(row, replayed=False)
+
+    def _refuse_unkeyed_after_v2_locked(self, bundle: dict[str, Any]) -> None:
+        """DR-234, design §5: once a sandbox (host_id + sandbox_name) has a
+        stored v2 collection, a v1 bundle for it that names no explicit
+        non-default `agent_key` is refused with MULTI_AGENT_KEY_REQUIRED --
+        whether or not a deployment identity would otherwise key it -- rather
+        than filed as a separate agent. A sandbox with no v2 history (every
+        single-agent stack) is unaffected."""
+        keyed = self._db.execute(
+            "SELECT 1 FROM asps WHERE host_id = ? AND sandbox_name = ? "
+            "AND bundle_version = ? LIMIT 1",
+            (bundle["host_id"], bundle["sandbox_name"], BUNDLE_VERSION_V2),
+        ).fetchone()
+        if keyed is not None:
+            raise MultiAgentKeyRequiredError(bundle["host_id"], bundle["sandbox_name"])
 
     def _compare_active_locked(
         self, asp_id: str, raw: bytes, identity_kind: str, identity_value: str
