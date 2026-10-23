@@ -1371,7 +1371,7 @@ class Store(GuardrailCustody, DataActionsStore):
         """The files the kernel saw a capture's sandbox open, beside it (DR-154).
 
         A capture's tool calls say which files the model *asked* for
-        (`observed_profile`'s `file_access`). RailMon's filesnoop says which
+        (`observed_profile`'s `file_access`). RailMon's file probe says which
         files the sandbox actually opened, in the `observed_file_access`
         attribute of the ASPs it delivers. This returns that attribute,
         unchanged in kind and kept apart from the asked list, from the latest
