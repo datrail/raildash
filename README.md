@@ -440,8 +440,9 @@ false drift. The reserved `default` key does not count. A sandbox that has
 never sent v2 is unaffected: there the deployment identity still wins over
 a key, so no locked baseline moves. Resending a bundle already stored is
 still answered as a replay under the identity it was stored under, even if
-the sandbox gained v2 history since; resending it under a different key is
-a `409`. A sandbox that goes back to a
+the sandbox gained v2 history since. Resending a bundle stored under a key
+with a different key is a `409`; one stored under its deployment identity
+is still that identity's replay, whatever key comes with it. A sandbox that goes back to a
 single agent keeps refusing unkeyed v1, because its v2 history stays: give
 RailMon a key (`RAIL_AGENT_KEY` or `--agent-key`), and lock a new baseline
 from the keyed ASPs.
