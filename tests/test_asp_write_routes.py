@@ -547,3 +547,97 @@ def test_store_and_cli_refuse_the_same_unkeyed_v1_bundle(client, tmp_path, capsy
     code = cli.main(["--db", str(tmp_path / "test.db"), "asp", "load", str(path)])
     assert code == 1
     assert "MULTI_AGENT_KEY_REQUIRED" in capsys.readouterr().err
+
+
+# ------------------- DR-243: an explicit agent_key in a multi-agent sandbox
+
+
+def _ingest(client, raw: bytes, agent_key: str | None = None):
+    return client.post(
+        "/v1/evidence-bundles",
+        params={"agent_key": agent_key} if agent_key is not None else {},
+        content=raw,
+        headers=auth(),
+    )
+
+
+def _identity_of(client, asp_id: str) -> dict:
+    asps = client.get("/api/asps", params={"limit": 100}).json()["items"]
+    return next(asp["agent_identity"] for asp in asps if asp["asp_id"] == asp_id)
+
+
+@pytest.mark.parametrize("deployment", ["environment", "compose"])
+def test_keyed_v1_fallback_bundles_in_a_multi_agent_sandbox_land_per_agent(client, deployment):
+    """RailMon's per-agent fallback (shared scan failed) sends each agent of
+    one container its own v1 bundle with `?agent_key=`. The container's
+    deployment identity is shared by every agent in it, so in a sandbox with
+    v2 history the explicit key is the more specific identity and wins;
+    otherwise both agents' ASPs would interleave under one identity."""
+    _with_v2_history(client)
+    landed = {}
+    for key in ("executor", "planner"):
+        res = _ingest(client, _v1_variant(f"bnd-dr243-{deployment}-{key}", deployment=deployment), key)
+        assert res.status_code == 202
+        landed[key] = _identity_of(client, res.json()["asp_id"])
+    assert landed == {
+        "executor": {"kind": "local_agent_key", "value": "executor"},
+        "planner": {"kind": "local_agent_key", "value": "planner"},
+    }
+
+
+def test_a_keyed_v1_bundle_without_v2_history_keeps_its_deployment_identity(client):
+    """A single-agent sandbox (no v2 history) keeps today's precedence, so
+    no locked baseline moves: the deployment identity wins over the key."""
+    res = _ingest(client, _v1_variant("bnd-dr243-single", deployment="compose"), "planner")
+    assert res.status_code == 202
+    assert _identity_of(client, res.json()["asp_id"]) == {
+        "kind": "deployment_compose",
+        "value": {"host_id": json.loads(ASP_FIXTURE.read_bytes())["host_id"],
+                  "project": "agents", "service": "shared-agents"},
+    }
+
+
+def test_a_v1_bundle_stored_before_v2_history_replays_under_its_stored_identity(client):
+    """An exact replay keeps resolving to the identity it was stored under:
+    a keyed bundle filed under its deployment identity before the sandbox
+    went multi-agent is still a duplicate afterwards, not a 409."""
+    raw = _v1_variant("bnd-dr243-replay", deployment="compose")
+    first = _ingest(client, raw, "planner")
+    assert first.status_code == 202
+    _with_v2_history(client)
+    again = _ingest(client, raw, "planner")
+    assert again.status_code == 202
+    assert again.json() == {**first.json(), "duplicate": True}
+
+
+def test_a_keyed_replay_under_another_key_is_still_refused(client):
+    """The replay check still refuses filing the same bytes under a
+    different agent: stored as `planner`, resent as `executor`, is a 409."""
+    _with_v2_history(client)
+    raw = _v1_variant("bnd-dr243-other-key", deployment="compose")
+    assert _ingest(client, raw, "planner").status_code == 202
+    assert _ingest(client, raw, "planner").json()["duplicate"] is True
+    res = _ingest(client, raw, "executor")
+    assert res.status_code == 409
+
+
+def test_a_locked_keyed_fallback_asp_compares_the_next_keyed_fallback(client):
+    """A baseline locked from a keyed fallback bundle that also carries
+    Compose labels compares the agent's next fallback bundle, not
+    ALIGNMENT_INTEGRITY_FAILED or IDENTITY_MISMATCH."""
+    _with_v2_history(client)
+    baseline = _ingest(client, _v1_variant("bnd-dr243-lock-a", deployment="compose"), "planner")
+    locked = client.post(
+        f"/api/asps/{baseline.json()['asp_id']}/lock", json={"version": "v1.0"}, headers=auth()
+    )
+    assert locked.status_code == 201
+    switched = client.post(
+        f"/api/alignments/{locked.json()['alignment_version_id']}/switch", headers=auth()
+    )
+    assert switched.status_code == 200
+    value = json.loads(_v1_variant("bnd-dr243-lock-b", deployment="compose"))
+    value["attributes"]["declared_destinations"]["value"] = ["moved.example"]
+    current = _ingest(client, json.dumps(value, sort_keys=True).encode(), "planner")
+    drift = client.get(f"/api/asps/{current.json()['asp_id']}/drift").json()
+    assert drift["comparable"] is True
+    assert drift["has_drift"] is True

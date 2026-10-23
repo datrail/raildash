@@ -276,6 +276,25 @@ def test_unkeyed_or_half_keyed_bundle_requires_explicit_local_agent_key():
         resolve_identity(value, " developer-agent ")
 
 
+def test_an_explicit_agent_key_wins_over_deployment_only_in_a_multi_agent_sandbox():
+    """DR-243: a v1 bundle carrying both a deployment identity and an
+    explicit non-default key files under the key only when its sandbox is
+    multi-agent; single-agent precedence is unchanged."""
+    value = bundle()
+    deployment = {"kind": "deployment_environment",
+                  "value": {"deployment": "payments-agent", "namespace": "production"}}
+    assert resolve_identity(value, "planner") == deployment
+    assert resolve_identity(value, "planner", multi_agent=True) == {
+        "kind": "local_agent_key",
+        "value": "planner",
+    }
+    # The reserved key and no key never override it.
+    assert resolve_identity(value, "default", multi_agent=True) == deployment
+    assert resolve_identity(value, None, multi_agent=True) == deployment
+    # A v2 collection's identity is never a caller's key.
+    assert resolve_identity(_v2_bundle(), "planner", multi_agent=True)["kind"] != "local_agent_key"
+
+
 def test_local_agent_key_is_enforced_end_to_end_for_unkeyed_copies():
     baseline = bundle()
     current = bundle()
