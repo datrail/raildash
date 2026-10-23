@@ -345,6 +345,29 @@ includes the rule only when the baseline was contained, and **Require
 containment** adds it to any version. An ASP from before RailMon's rule pack
 11 leaves the line unknown and the rule Unverified.
 
+**The data-action classifier's model step.** Deterministic rules classify
+each MCP tool's data actions from its name and schema. A tool they leave
+unclassified can also be asked of a model, which is off unless both of these
+are set:
+
+| Variable | Meaning |
+| --- | --- |
+| `RAILDASH_CLASSIFIER_MODEL_URL` | An OpenAI-compatible API base URL, a local model's or a provider's, e.g. `http://127.0.0.1:11434/v1`. |
+| `RAILDASH_CLASSIFIER_MODEL` | The model to ask. |
+| `RAILDASH_CLASSIFIER_API_KEY_FILE` | Optional: a file holding the API key. It is never logged and is sent only to that URL. |
+
+Only a tool's schema is sent (its name, description and argument schema),
+never a captured value. A redirect is refused, not followed, so the key
+can't reach another host. The answer counts only when every action is from
+the closed set, and its `read` is weak. Until an answer arrives the tool is
+`unclassified`, the safe direction.
+
+**Downgrading.** A guardrail version with `data_actions` (contract v2) or
+`egress_containment` (contract v3) needs a RailDash that knows that
+contract, `0.2.0-rc.1` or later. Before running an older RailDash on the
+same database, switch each agent to a version without those rules, or
+**Turn off**.
+
 `RAILDASH_GUARDRAIL_MAX_OPEN_ROWS` (default 1000) caps the unacknowledged
 rows per agent before further items count in one overflow row, and
 `RAILDASH_GUARDRAIL_ACK_RETENTION_DAYS` (default 30) is how long an
