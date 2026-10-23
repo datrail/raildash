@@ -238,6 +238,9 @@ RESPONSE_TOO_LARGE = "RESPONSE_TOO_LARGE"
 RESPONSE_UNSCANNABLE = "RESPONSE_UNSCANNABLE"
 RESPONSE_UNPARSABLE_EVENT = "RESPONSE_UNPARSABLE_EVENT"
 RESPONSE_TRUNCATED_EVENT = "RESPONSE_TRUNCATED_EVENT"
+# A Codex code-mode script reaches a tool through a name it builds at run
+# time, so which tools it calls can't be read from its text (DR-239).
+RESPONSE_CODE_MODE_DYNAMIC = "RESPONSE_CODE_MODE_DYNAMIC"
 _SSE_LINE_END = re.compile(r"\r\n|\r|\n")
 # How deep a stored row may nest before even its response is unreadable:
 # far past the 128 levels a shown row allows, well inside what the stdlib
@@ -618,8 +621,74 @@ def _response_body(interaction: Mapping[str, Any]) -> tuple[Any, str | None]:
     return body, None
 
 
+# Codex's code mode (DR-239): the model's only tool is a Responses
+# `custom_tool_call` named `exec` whose `input` is JavaScript, and the script
+# calls every other tool, MCP ones included, as `tools.<name>(…)`. Codex
+# names an MCP tool `mcp__<server>__<tool>` there as everywhere.
+CODE_MODE_TOOL = "exec"
+_LITERAL = r"""(?:"([^"\\]+)"|'([^'\\]+)'|`([^`\\$]+)`)"""
+_CODE_MODE_TOOL_NAME = re.compile(
+    r"(?<![\w$])tools\s*(?:(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)|(?:\?\.)?\s*\[\s*"
+    + _LITERAL + r"\s*\])"
+)
+# `tools[...]` whose subscript is not one string literal, or `tools` itself
+# handed on (aliased, destructured, spread or passed): the names the script
+# reaches can't be read from its text. So does code that can reach `tools`
+# without spelling it (`eval`, `Function`, `globalThis`, `Reflect`, `this`).
+# A bare word `tools` in a comment or a string counts too, which errs
+# towards unreadable.
+_CODE_MODE_DYNAMIC = re.compile(
+    r"(?<![\w$])tools\s*(?:\?\.)?\s*\[(?!\s*" + _LITERAL + r"\s*\])"
+    r"|(?<![\w$])tools(?![\w$])(?!\s*(?:\?\.|\.|\[))"
+    r"|(?<![\w$])(?:eval|Function|globalThis|Reflect|this)(?![\w$])"
+)
+
+
+def custom_tool_call_names(item: Mapping[str, Any]) -> tuple[list[str], bool]:
+    """`(names, dynamic)` for one OpenAI Responses `custom_tool_call` item.
+
+    Codex code mode's `exec` asks for the tools its script names as
+    `tools.<name>` or `tools["<name>"]`, in order, deduplicated; `dynamic`
+    says the script also reaches `tools` in a way whose names can't be read
+    (`_CODE_MODE_DYNAMIC`). Any other custom tool asks for itself. A script
+    that names no tool (it only reads `ALL_TOOLS`, say) asks for nothing.
+    """
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        return [], False
+    if name != CODE_MODE_TOOL:
+        return [name], False
+    code = item.get("input")
+    if not isinstance(code, str):
+        return [], False
+    names: list[str] = []
+    for match in _CODE_MODE_TOOL_NAME.finditer(code):
+        found = next(group for group in match.groups() if group is not None)
+        if found not in names:
+            names.append(found)
+    return names, _CODE_MODE_DYNAMIC.search(code) is not None
+
+
+def _add_custom_tool_call(item: Mapping[str, Any], add: Any) -> None:
+    names, dynamic = custom_tool_call_names(item)
+    for name in names:
+        add(name)
+    if dynamic:
+        add(_DYNAMIC)
+
+
+# What `add` is handed when a code-mode script's names can't all be read.
+_DYNAMIC = object()
+
+
 def requested_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
     """The tool calls the model asked for in this request's response.
+
+    An OpenAI Responses `custom_tool_call` counts too, whole or as a stream's
+    `response.output_item.done` item: Codex code mode's `exec` asks for the
+    tools its script names (`custom_tool_call_names`). A script that reaches
+    a tool through a name built at run time makes the response unreadable
+    (`RESPONSE_CODE_MODE_DYNAMIC`), the names it does spell kept.
 
     Returns `{"names": [...], "readable": bool, "reason": str | None}`,
     names in order and deduplicated. `readable: False` means the response
@@ -648,13 +717,23 @@ def requested_tool_calls(interaction: Mapping[str, Any]) -> dict[str, Any]:
     Text with no `event:` or `data:` field at all (an HTML error page) is
     readable and asks for nothing.
     """
+    dynamic: list[bool] = []
+    result = _requested_tool_calls(interaction, dynamic)
+    if dynamic and result["readable"]:
+        return {**result, "readable": False, "reason": RESPONSE_CODE_MODE_DYNAMIC}
+    return result
+
+
+def _requested_tool_calls(interaction: Mapping[str, Any], dynamic: list[bool]) -> dict[str, Any]:
     body, reason = _response_body(interaction)
     if reason is not None:
         return {"names": [], "readable": False, "reason": reason}
     names: list[str] = []
 
     def add(name: Any) -> None:
-        if isinstance(name, str) and name and name not in names:
+        if name is _DYNAMIC:
+            dynamic.append(True)
+        elif isinstance(name, str) and name and name not in names:
             names.append(name)
 
     if not isinstance(body, dict):
@@ -752,6 +831,8 @@ def _message_tool_calls(body: dict[str, Any], add: Any) -> None:
     for item in _dicts(body.get("output")):
         if item.get("type") == "function_call":
             add(item.get("name"))
+        elif item.get("type") == "custom_tool_call":
+            _add_custom_tool_call(item, add)
 
 
 def _event_tool_calls(event: dict[str, Any], add: Any) -> None:
@@ -765,6 +846,12 @@ def _event_tool_calls(event: dict[str, Any], add: Any) -> None:
         item = event.get("item")
         if isinstance(item, dict) and item.get("type") == "function_call":
             add(item.get("name"))
+        elif (
+            isinstance(item, dict) and item.get("type") == "custom_tool_call"
+            and kind == "response.output_item.done"
+        ):
+            # Only `.done` carries the whole input; `.added`'s is empty.
+            _add_custom_tool_call(item, add)
     for choice in _dicts(event.get("choices")):
         delta = choice.get("delta")
         for call in _dicts(delta.get("tool_calls") if isinstance(delta, dict) else None):

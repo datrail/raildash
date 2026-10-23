@@ -356,6 +356,16 @@ rule is Held, Violated or Unverified there exactly as for one agent, with
 the same stale window. Every other rule stays Unverified in a multi-agent
 sandbox, since it can't say which agent a listener, write or request was.
 
+**Which calls a reply asks for.** A model's reply asks for a call with an
+Anthropic `tool_use` block, an OpenAI Chat `tool_calls` entry, or an OpenAI
+Responses `function_call` or `custom_tool_call`, whole or streamed. Codex's
+code mode gives the model one tool, `exec`, whose JavaScript calls every
+other tool as `tools.<name>(…)`, so each tool the script names counts as
+asked for, without its arguments. A script that reaches a tool through a
+name it builds at run time (`tools[name]`, `tools` handed on whole, `eval`)
+makes that request's tool calls unreadable, and the uploads and out-of-spec
+rules that read them stay Unverified for a while.
+
 **The data-action classifier's model step.** Deterministic rules classify
 each MCP tool's data actions from its name and schema. A tool they leave
 unclassified can also be asked of a model, which is off unless both of these
