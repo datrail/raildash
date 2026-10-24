@@ -191,6 +191,21 @@ BEGIN SELECT RAISE(ABORT, 'guardrail versions are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS guardrail_versions_immutable_delete
 BEFORE DELETE ON guardrail_versions
 BEGIN SELECT RAISE(ABORT, 'guardrail versions are immutable'); END;
+
+-- DR-248 (DR-194 M2): each OpenShell policy imported for an agent, as
+-- `raildash.openshell_policy.parse_policy` reads it (endpoints only, no
+-- credential field). Beside the ASP, never in it: no ASP, baseline or
+-- guardrail version refers to a row here. The newest row is the policy.
+CREATE TABLE IF NOT EXISTS openshell_policies (
+    policy_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    identity_kind  TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    imported_at    TEXT NOT NULL,
+    source         TEXT NOT NULL,
+    record_json    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS openshell_policies_identity
+    ON openshell_policies(identity_kind, identity_value, policy_id);
 """
 
 
@@ -725,6 +740,7 @@ class GuardrailCustody:
             guardrail_version_id="grd-proposed",
             version=self._next_version_label(kind, value),
             created_at=self._receive_time(),
+            openshell_policy=self._openshell_policy_locked(kind, value),
         )
         result["data_actions_blocked"] = []
         if result["guardrail"] is not None:
@@ -977,6 +993,48 @@ class GuardrailCustody:
             "reading": reading,
             "proxy_declared": declared if isinstance(declared, dict) else None,
         }
+
+    def _openshell_policy_locked(self, kind: str, value: str) -> dict[str, Any] | None:
+        """The agent's newest imported OpenShell policy record, with when
+        and how it arrived, or None."""
+        row = self._db.execute(
+            "SELECT imported_at, source, record_json FROM openshell_policies "
+            "WHERE identity_kind = ? AND identity_value = ? ORDER BY policy_id DESC LIMIT 1",
+            (kind, value),
+        ).fetchone()
+        if row is None:
+            return None
+        return {**json.loads(row["record_json"]), "imported_at": row["imported_at"], "source": row["source"]}
+
+    def _openshell_policy_view_locked(self, kind: str, value: str) -> dict[str, Any] | None:
+        """The Egress line's OpenShell rows (DR-194 §4.3): the newest
+        record and whether it is older than DR-184's stale window, past
+        which the line says "as of <time>" rather than showing it as now."""
+        record = self._openshell_policy_locked(kind, value)
+        if record is None:
+            return None
+        age = _instant(self._receive_time()) - _instant(record["imported_at"])
+        return {**record, "stale": age > g.STALE_MAX}
+
+    def import_openshell_policy(self, ref: str, raw: bytes) -> dict[str, Any]:
+        """**Import OpenShell policy** (DR-248): store an uploaded policy as
+        the agent's newest. Raises `PolicyImportError` for a file that
+        isn't one, and stores nothing then, so the policy
+        RailDash already held stays shown."""
+        record = osp.parse_policy(raw)
+        with self._write_transaction():
+            kind, value = self._resolve_agent_ref(ref)
+            at = self._receive_time()
+            self._db.execute(
+                "INSERT INTO openshell_policies (identity_kind, identity_value, imported_at, source, record_json) "
+                "VALUES (?, ?, ?, 'import', ?)",
+                (kind, value, at, json.dumps(record, ensure_ascii=False, sort_keys=True)),
+            )
+            self._event(kind, value, "import_openshell_policy", None, {
+                "revision": record["revision"], "digest": record["digest"],
+                "endpoints": len(record["endpoints"]),
+            })
+            return {"agent_ref": ref, **self._openshell_policy_view_locked(kind, value)}
 
     def require_containment(self, ref: str, require: str = "contained") -> dict[str, Any]:
         """**Require containment** (DR-207 §4.4): a new v3 version, the
@@ -1372,6 +1430,7 @@ class GuardrailCustody:
                 "agent_identity": self._identity_object(kind, value),
                 "data_actions_offer_available": self._data_actions_offer_available_locked(kind, value),
                 "egress": self._egress_locked(kind, value),
+                "openshell_policy": self._openshell_policy_view_locked(kind, value),
                 **summary,
                 "active": self._version_view(active, active=True) if active is not None else None,
                 "rows": rows,
@@ -1388,3 +1447,4 @@ class GuardrailCustody:
 # first.
 from . import guardrail as g  # noqa: E402
 from . import data_actions_store as das  # noqa: E402
+from . import openshell_policy as osp  # noqa: E402

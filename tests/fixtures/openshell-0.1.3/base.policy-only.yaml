@@ -1,0 +1,65 @@
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /bin
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /etc
+    - /var/log
+    - /opt
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+landlock:
+  compatibility: best_effort
+network_policies:
+  example_wildcard:
+    name: example-wildcard
+    endpoints:
+      - host: "*.example.com"
+        ports:
+          - 443
+          - 8443
+        protocol: rest
+        enforcement: audit
+        access: read-write
+    binaries:
+      - path: /usr/local/bin/python3.13
+  github_api:
+    name: github-api-readonly
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - path: /usr/local/bin/python3.13
+  github_uploads:
+    name: github-uploads
+    endpoints:
+      - host: uploads.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: /repos/**
+          - allow:
+              method: POST
+              path: /repos/*/*/releases/*/assets
+    binaries:
+      - path: /usr/local/bin/python3.13
+  raw_content:
+    name: raw-content
+    endpoints:
+      - host: raw.githubusercontent.com
+        port: 443
+    binaries:
+      - path: /usr/local/bin/python3.13
+      - path: /usr/bin/curl

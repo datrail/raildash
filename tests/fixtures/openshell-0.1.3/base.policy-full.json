@@ -1,0 +1,120 @@
+{
+  "active_version": 1,
+  "config_revision": 17165487876660386661,
+  "hash": "e55f61f2e1bd980f8020f718a49a860212652f3c25f279111ea9f2a3a9f56df2",
+  "policy": {
+    "filesystem_policy": {
+      "include_workdir": true,
+      "read_only": [
+        "/bin",
+        "/usr",
+        "/lib",
+        "/proc",
+        "/dev/urandom",
+        "/etc",
+        "/var/log",
+        "/opt"
+      ],
+      "read_write": [
+        "/sandbox",
+        "/tmp",
+        "/dev/null"
+      ]
+    },
+    "landlock": {
+      "compatibility": "best_effort"
+    },
+    "network_policies": {
+      "example_wildcard": {
+        "binaries": [
+          {
+            "path": "/usr/local/bin/python3.13"
+          }
+        ],
+        "endpoints": [
+          {
+            "access": "read-write",
+            "enforcement": "audit",
+            "host": "*.example.com",
+            "ports": [
+              443,
+              8443
+            ],
+            "protocol": "rest"
+          }
+        ],
+        "name": "example-wildcard"
+      },
+      "github_api": {
+        "binaries": [
+          {
+            "path": "/usr/local/bin/python3.13"
+          }
+        ],
+        "endpoints": [
+          {
+            "access": "read-only",
+            "enforcement": "enforce",
+            "host": "api.github.com",
+            "port": 443,
+            "protocol": "rest"
+          }
+        ],
+        "name": "github-api-readonly"
+      },
+      "github_uploads": {
+        "binaries": [
+          {
+            "path": "/usr/local/bin/python3.13"
+          }
+        ],
+        "endpoints": [
+          {
+            "enforcement": "enforce",
+            "host": "uploads.github.com",
+            "port": 443,
+            "protocol": "rest",
+            "rules": [
+              {
+                "allow": {
+                  "method": "GET",
+                  "path": "/repos/**"
+                }
+              },
+              {
+                "allow": {
+                  "method": "POST",
+                  "path": "/repos/*/*/releases/*/assets"
+                }
+              }
+            ]
+          }
+        ],
+        "name": "github-uploads"
+      },
+      "raw_content": {
+        "binaries": [
+          {
+            "path": "/usr/local/bin/python3.13"
+          },
+          {
+            "path": "/usr/bin/curl"
+          }
+        ],
+        "endpoints": [
+          {
+            "host": "raw.githubusercontent.com",
+            "port": 443
+          }
+        ],
+        "name": "raw-content"
+      }
+    },
+    "version": 1
+  },
+  "policy_source": "sandbox",
+  "sandbox": "fx-base",
+  "scope": "sandbox",
+  "status": "effective",
+  "version": 1
+}

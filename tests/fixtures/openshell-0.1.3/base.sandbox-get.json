@@ -1,0 +1,176 @@
+{
+  "annotations": {
+    "internal.openshell.ai/auth-epoch": "1",
+    "internal.openshell.ai/gateway-token-id": "c2640811-d629-4549-a888-c8566b6feefa",
+    "internal.openshell.ai/runtime-generation": "9362356e-b650-4a42-8029-8f2c3d6b3dc6"
+  },
+  "conditions": [
+    {
+      "last_transition_time": "",
+      "message": "Supervisor session connected",
+      "reason": "DependenciesReady",
+      "status": "True",
+      "type": "Ready"
+    },
+    {
+      "last_transition_time": "",
+      "message": "",
+      "reason": "ConfigurationAccepted",
+      "status": "True",
+      "type": "ConfigurationReady"
+    }
+  ],
+  "configuration_admission": {
+    "config_revision": 17165487876660386661,
+    "error": "",
+    "policy_hash": "e55f61f2e1bd980f8020f718a49a860212652f3c25f279111ea9f2a3a9f56df2",
+    "policy_version": 1,
+    "provider_env_revision": 3176606324465211593,
+    "state": "accepted"
+  },
+  "created_at": "2026-10-24 18:55:41",
+  "created_from_workload_template": null,
+  "current_policy_version": 1,
+  "endpoint_statuses": [],
+  "exit_code": null,
+  "host_key_fingerprint": "SHA256:k+/gzQnXwchrFgtPn7yeIDoN4r4Q6CQLolMSx52KQ3k",
+  "id": "9cdc2e03-93d3-4eb0-9594-3f73a93b6c76",
+  "labels": {},
+  "main_process_instance_id": "eaae463c-1712-4329-8795-3295c312b0eb",
+  "main_process_started_at_ms": 1792868142303,
+  "name": "fx-base",
+  "next_restart_at_ms": 0,
+  "phase": "Ready",
+  "policy": {
+    "filesystem_policy": {
+      "include_workdir": true,
+      "read_only": [
+        "/bin",
+        "/usr",
+        "/lib",
+        "/proc",
+        "/dev/urandom",
+        "/etc",
+        "/var/log",
+        "/opt"
+      ],
+      "read_write": [
+        "/sandbox",
+        "/tmp",
+        "/dev/null"
+      ]
+    },
+    "landlock": {
+      "compatibility": "best_effort"
+    },
+    "network_policies": {
+      "example_wildcard": {
+        "binaries": [
+          {
+            "path": "/usr/local/bin/python3.13"
+          }
+        ],
+        "endpoints": [
+          {
+            "access": "read-write",
+            "enforcement": "audit",
+            "host": "*.example.com",
+            "ports": [
+              443,
+              8443
+            ],
+            "protocol": "rest"
+          }
+        ],
+        "name": "example-wildcard"
+      },
+      "github_api": {
+        "binaries": [
+          {
+            "path": "/usr/local/bin/python3.13"
+          }
+        ],
+        "endpoints": [
+          {
+            "access": "read-only",
+            "enforcement": "enforce",
+            "host": "api.github.com",
+            "port": 443,
+            "protocol": "rest"
+          }
+        ],
+        "name": "github-api-readonly"
+      },
+      "github_uploads": {
+        "binaries": [
+          {
+            "path": "/usr/local/bin/python3.13"
+          }
+        ],
+        "endpoints": [
+          {
+            "enforcement": "enforce",
+            "host": "uploads.github.com",
+            "port": 443,
+            "protocol": "rest",
+            "rules": [
+              {
+                "allow": {
+                  "method": "GET",
+                  "path": "/repos/**"
+                }
+              },
+              {
+                "allow": {
+                  "method": "POST",
+                  "path": "/repos/*/*/releases/*/assets"
+                }
+              }
+            ]
+          }
+        ],
+        "name": "github-uploads"
+      },
+      "raw_content": {
+        "binaries": [
+          {
+            "path": "/usr/local/bin/python3.13"
+          },
+          {
+            "path": "/usr/bin/curl"
+          }
+        ],
+        "endpoints": [
+          {
+            "host": "raw.githubusercontent.com",
+            "port": 443
+          }
+        ],
+        "name": "raw-content"
+      }
+    },
+    "version": 1
+  },
+  "policy_source": "sandbox",
+  "provisioning": {
+    "admission_start_time": "2026-10-24T18:55:42.268Z",
+    "attempt_id": "2bb18841-6fc0-406b-a8ee-532e397b995a",
+    "cleanup_completed_time": null,
+    "cleanup_error": "",
+    "cleanup_retry_time": null,
+    "configuration_change_id": "9fb4101b3376a5b08b6d868fc7dff6f6711bccbafa75aa3870144bab7854f5cd",
+    "configuration_change_time": "2026-10-24T18:55:41.878Z",
+    "deadline": null,
+    "driver_operation_id": "c48a75cf-90e7-4874-b812-3b334ba5d965",
+    "driver_operation_pending": false,
+    "first_rejection_time": null,
+    "phase": "ready",
+    "preparation_deadline": "2026-10-24T19:25:41.878Z",
+    "timeout_time": null
+  },
+  "resource_version": 10,
+  "restart_count": 0,
+  "restart_policy": "never",
+  "revision": 1,
+  "workspace": "default"
+}

@@ -1675,6 +1675,7 @@ def propose_guardrail(
     guardrail_version_id: str,
     version: str,
     created_at: str,
+    openshell_policy: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The §4.4 first guardrail from a locked baseline.
 
@@ -1693,6 +1694,15 @@ def propose_guardrail(
     (`saved_file_entry`), and a written path an earlier entry already allows
     isn't listed again. A
     multi-agent baseline gets no proposal (`reason: MULTI_AGENT`).
+
+    `openshell_policy` is the agent's imported OpenShell policy record
+    (`raildash.openshell_policy`), or None. When the baseline reads as
+    contained by OpenShell, it seeds the proposal (DR-194 §4.4, DR-248):
+    its hosts join `out_of_spec_calls.allowed_hosts`, wildcards kept, and a
+    host the agent sent a body to stays out of `uploads.allowed_hosts` when
+    every endpoint covering it refuses a body, so that attempt is listed as
+    a would-be violation instead. The answer's `openshell` says what came
+    from the policy, with its revision.
     """
     if is_multi_agent(bundle):
         return {"guardrail": None, "would_be_violations": [], "empty_because": {}, "reason": MULTI_AGENT}
@@ -1701,6 +1711,14 @@ def propose_guardrail(
     source = {"kind": "asp", "id": alignment["asp"]["asp_id"]}
     would_be: list[dict[str, Any]] = []
     empty_because: dict[str, dict[str, Any]] = {}
+
+    egress = egress_reading(attributes.get(EGRESS_ATTRIBUTE))
+    seed = None
+    if (
+        openshell_policy is not None and egress is not None
+        and egress["level"] == "allow_list_enforced" and egress.get("enforcer") == "openshell"
+    ):
+        seed = _osp.proposal_seed(openshell_policy)
 
     upload_hosts: set[str] = set()
     endpoint = attributes.get("inference_endpoint") or {}
@@ -1711,6 +1729,9 @@ def propose_guardrail(
     for request in requests:
         host = normalize_host(request.get("host"))
         if carries_body(request) and host is not None and _is_host_pattern(host):
+            if seed is not None and _osp.refuses_body(openshell_policy, host):
+                seed["withheld_upload_hosts"].add(host)
+                continue
             upload_hosts.add(host)
 
     files = attributes.get(FILE_ACCESS_ATTRIBUTE) or {}
@@ -1722,7 +1743,6 @@ def propose_guardrail(
     elif files.get("status") != "ABSENT":
         empty_because["saved_files.allowed"] = _why_empty(files)
 
-    egress = egress_reading(attributes.get(EGRESS_ATTRIBUTE))
     ports: list[dict[str, Any]] = []
     if egress is not None and egress["level"] == "allow_list_enforced" and egress.get("enforcer") == "openshell":
         ports = [dict(entry) for entry in OPENSHELL_DNS_ENTRIES]
@@ -1742,6 +1762,12 @@ def propose_guardrail(
         empty_because["out_of_spec_calls.allowed_mcp_servers"] = _why_empty(
             attributes.get("mcp_servers_declared") or {}
         )
+    allowed_hosts = declared_hosts
+    if seed is not None:
+        allowed_hosts = sorted(set(declared_hosts) | set(seed["hosts"]))
+        if seed["hosts"]:
+            # Seeded after all, so the list's empty reason no longer holds.
+            empty_because.pop("out_of_spec_calls.allowed_hosts", None)
 
     guardrail = {
         "guardrail_contract_version": GUARDRAIL_CONTRACT_VERSION,
@@ -1759,7 +1785,7 @@ def propose_guardrail(
             "saved_files": {"allowed": saved},
             "service_ports": {"allowed": ports},
             "out_of_spec_calls": {
-                "allowed_hosts": declared_hosts,
+                "allowed_hosts": allowed_hosts,
                 "allowed_mcp_servers": declared_servers,
                 "seeded_from_declared": {"hosts": declared_hosts, "mcp_servers": declared_servers},
             },
@@ -1782,6 +1808,13 @@ def propose_guardrail(
         if not carries_body(request):
             continue
         host = normalize_host(request.get("host"))
+        if seed is not None and host in seed["withheld_upload_hosts"]:
+            for found in evaluate_request(guardrail, request)["uploads"]:
+                if found["detail"].get("kind") == "host" and ("uploads", found["item"]) not in {
+                    (v["rule"], v["item"]) for v in would_be
+                }:
+                    would_be.append(found)
+            continue
         if host is None or not _is_host_pattern(host):
             item = UNKNOWN_HOST if host is None else host
             if ("uploads", item) not in {(v["rule"], v["item"]) for v in would_be}:
@@ -1792,13 +1825,18 @@ def propose_guardrail(
                         request_size=request.get("request_size"), max_request_bytes=None,
                     )
                 )
-    return {
+    result = {
         "guardrail": validate_guardrail(guardrail),
         "would_be_violations": would_be,
         "empty_because": empty_because,
         "reason": None,
         "egress": egress,
     }
+    if seed is not None:
+        result["openshell"] = _osp.seed_view(
+            seed, openshell_policy, guardrail["rules"]["uploads"]["allowed_hosts"]
+        )
+    return result
 
 
 def _declared_lists(attributes: Mapping[str, Any]) -> tuple[list[str] | None, list[str] | None]:
@@ -2023,3 +2061,7 @@ def _required_instant(value: datetime | str, where: str) -> datetime:
     if parsed is None:
         raise ValueError(f"{where}: must be a timezone-aware date-time")
     return parsed
+
+
+# Last, as a module reference: `raildash.openshell_policy` reads this module.
+from . import openshell_policy as _osp  # noqa: E402

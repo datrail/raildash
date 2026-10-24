@@ -1309,7 +1309,7 @@ const EGRESS_WORDS = {
   host_process: ["Open", "a host process, not in a container"],
 };
 
-function renderEgressLine(egress) {
+function renderEgressLine(egress, policyHeld = false) {
   const line = el("p", "guardrail-egress");
   line.dataset.key = "egress";
   line.append(el("strong", null, "Egress: "));
@@ -1323,7 +1323,10 @@ function renderEgressLine(egress) {
   } else if (!reading.level) {
     line.append(document.createTextNode(`unknown (${guardrailReason(reading.status) || "not collected"})`));
   } else {
-    const [word, why] = EGRESS_WORDS[reading.level] || ["Unknown", reading.level];
+    let [word, why] = EGRESS_WORDS[reading.level] || ["Unknown", reading.level];
+    if (policyHeld && reading.level === "allow_list_enforced") {
+      why = "it should not reach outside hosts itself; OpenShell enforces an allow-list (the imported policy is below)";
+    }
     line.append(el("span", reading.contained ? "guardrail-egress-contained" : "guardrail-egress-open", word),
       document.createTextNode(`: ${why}`));
     if (reading.level === "internal_network") {
@@ -1345,6 +1348,108 @@ function renderEgressLine(egress) {
       ` · declares a proxy (${names.map((name) => `${name}=${proxy[name]}`).join(", ") || "NO_PROXY only"})${note} — declared`));
   }
   return line;
+}
+
+// DR-248 (DR-194 M2): OpenShell's own record of the sandbox's network
+// policy, as the user imported it, under the Egress line. It is declared by
+// the operator, a different author from the agent, and is shown beside what
+// RailMon observed, never merged into it.
+function describeOpenshellEndpoint(endpoint) {
+  const where = endpoint.host || `any host in ${endpoint.allowed_ips.join(", ")}`;
+  const ports = endpoint.ports.length ? `:${endpoint.ports.join(",")}` : "";
+  const parts = [`${where}${ports}${endpoint.path ? endpoint.path : ""}`];
+  if (endpoint.host && endpoint.allowed_ips.length) parts.push(`only at ${endpoint.allowed_ips.join(", ")}`);
+  parts.push(endpoint.binaries.length ? endpoint.binaries.join(", ") : "no binary");
+  let access = endpoint.access
+    || (endpoint.rules.length ? `${endpoint.rules.length} rule${endpoint.rules.length === 1 ? "" : "s"}` : null)
+    || (endpoint.protocol ? endpoint.protocol : "any traffic (L4)");
+  if (endpoint.deny_rules) access += `, ${endpoint.deny_rules} deny`;
+  parts.push(access);
+  if (endpoint.enforcement) parts.push(endpoint.enforcement);
+  const text = parts.join(" · ");
+  return endpoint.provider ? `${text} (provider ${endpoint.provider})` : text;
+}
+
+function renderOpenshellPolicy(agentRef, policy, offerImport, refresh) {
+  const section = el("div", "guardrail-openshell");
+  section.dataset.key = "openshell-policy";
+  if (policy) {
+    const source = policy.policy_source === "global" ? "OpenShell's global policy" : "OpenShell's policy";
+    const revision = policy.revision ? ` revision ${policy.revision}` : "";
+    // Past the stale window an import may no longer be what OpenShell
+    // enforces, so it is dated rather than shown as now (design §5).
+    const when = policy.stale
+      ? `as of ${fmtDateTime(policy.imported_at)}, when it was imported`
+      : `imported ${fmtDateTime(policy.imported_at)}`;
+    section.append(el("p", "muted", `${source}${revision}, ${when} — declared by the operator`));
+    const list = el("ul", "guardrail-openshell-endpoints");
+    policy.endpoints.forEach((endpoint) => list.append(el("li", null, describeOpenshellEndpoint(endpoint))));
+    if (!policy.endpoints.length) list.append(el("li", "muted", "no network rules: it allows no outside host"));
+    section.append(list);
+  }
+  if (offerImport) section.append(renderOpenshellImport(agentRef, Boolean(policy), refresh));
+  return section;
+}
+
+// The import: the file `openshell sandbox get <name> --policy-only` prints,
+// sent as it is. A file that isn't a policy is refused with what was wrong,
+// and the policy already held stays.
+function renderOpenshellImport(agentRef, held, refresh) {
+  const wrap = el("span", "guardrail-action");
+  const input = el("input");
+  input.type = "file";
+  input.accept = ".yaml,.yml,.json,text/yaml,application/json";
+  input.hidden = true;
+  const button = el("button", "btn btn-quiet", held ? "Import a newer policy" : "Import OpenShell policy");
+  button.type = "button";
+  button.dataset.key = "openshell-import";
+  button.title = "The output of: openshell sandbox get <name> --policy-only";
+  const status = el("span", "asp-status-msg");
+  status.setAttribute("aria-live", "polite");
+  button.addEventListener("click", () => input.click());
+  input.addEventListener("change", async () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (!file) return;
+    guardrailBusy += 1;
+    setInlineStatus(status, `Importing ${file.name}…`);
+    try {
+      const result = await postRawBody(
+        `/api/guardrails/${encodeURIComponent(agentRef)}/openshell-policy`, await file.arrayBuffer());
+      setInlineStatus(status, `Imported ${result.endpoints.length} endpoint${result.endpoints.length === 1 ? "" : "s"}.`, "ok");
+      refresh();
+    } catch (error) {
+      setInlineStatus(status, `Not imported: ${error.message}`, "err");
+    } finally {
+      guardrailBusy -= 1;
+    }
+  });
+  wrap.append(button, input, status);
+  return wrap;
+}
+
+// DR-248: what a proposal took from the imported OpenShell policy (§4.4),
+// each host marked with the policy's revision.
+function renderOpenshellSeed(seed) {
+  const notes = el("ul", "guardrail-notes guardrail-openshell-seed");
+  const mark = seed.revision ? `revision ${seed.revision}` : `imported ${fmtDateTime(seed.imported_at)}`;
+  if (seed.hosts.length) {
+    notes.append(el("li", "muted", `Hosts it may call from OpenShell's policy (${mark}): ` +
+      seed.hosts.map((entry) => `${entry.host} (${entry.rules.join(", ")})`).join(", ")));
+  }
+  if (seed.upload_hosts.length) {
+    notes.append(el("li", "muted",
+      `Uploads to ${seed.upload_hosts.join(", ")}: the agent sent a body there, and OpenShell's policy allows one.`));
+  }
+  if (seed.withheld_upload_hosts.length) {
+    notes.append(el("li", "muted",
+      `Not uploads: ${seed.withheld_upload_hosts.join(", ")}. The agent sent a body there, ` +
+      "but OpenShell's policy allows none, so it's listed below rather than approved."));
+  }
+  seed.not_representable.forEach((entry) => {
+    notes.append(el("li", "muted", `Not in the proposal: ${entry.endpoint} (${entry.rule}): ${entry.reason}.`));
+  });
+  return notes;
 }
 
 // DR-207: **Require containment** on a version that doesn't, warning first
@@ -1711,6 +1816,7 @@ function renderGuardrailProposal(proposal, refresh) {
     "file written under a fresh uuid each time by its name), and nothing is " +
     "checked until you adopt it. Every line is shown so you can see what it approves."));
   section.append(renderGuardrailPolicy(proposal.guardrail.rules, openshellEnforced(proposal.egress)));
+  if (proposal.openshell) section.append(renderOpenshellSeed(proposal.openshell));
   section.append(renderDataActionsBlocked(proposal.data_actions_blocked));
   const emptyBecause = Object.entries(proposal.empty_because || {});
   if (emptyBecause.length) {
@@ -1805,6 +1911,11 @@ function renderGuardrailHistory(events) {
     const words = [event.action.replaceAll("_", " ")];
     if (event.detail.version) words.push(event.detail.version);
     if (event.detail.item) words.push(event.detail.item);
+    // An OpenShell policy import (DR-248).
+    if (typeof event.detail.endpoints === "number") {
+      const revision = event.detail.revision ? `revision ${event.detail.revision}, ` : "";
+      words.push(`(${revision}${event.detail.endpoints} endpoint${event.detail.endpoints === 1 ? "" : "s"})`);
+    }
     // Allow all records every item it added (DR-202).
     if (Array.isArray(event.detail.items)) {
       const shown = event.detail.items.slice(0, 5).join(", ");
@@ -1937,7 +2048,13 @@ async function loadGuardrails(focusKey = null) {
       return;
     }
 
-    card.append(renderEgressLine(detail.egress));
+    card.append(renderEgressLine(detail.egress, Boolean(detail.openshell_policy)));
+    // The import is offered where OpenShell contains the agent; a policy
+    // already held is shown whatever the newest ASP says.
+    const contained = openshellEnforced(detail.egress && detail.egress.reading);
+    if (contained || detail.openshell_policy) {
+      card.append(renderOpenshellPolicy(detail.agent_ref, detail.openshell_policy, contained, refresh));
+    }
     if (detail.active) {
       card.append(renderGuardrailRules(detail.rules));
       if (!detail.active.guardrail.rules.egress_containment && detail.egress) {

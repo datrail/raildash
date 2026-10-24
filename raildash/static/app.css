@@ -947,3 +947,7 @@ pre {
   .detail { animation: slide-in 160ms ease-out; }
   @keyframes slide-in { from { transform: translateX(14px); opacity: 0; } }
 }
+/* DR-248: OpenShell's imported policy under the Egress line. */
+.guardrail-openshell { margin: 2px 0 6px; font-size: 11.5px; }
+.guardrail-openshell p { margin: 0; }
+.guardrail-openshell-endpoints { margin: 2px 0 4px; padding-left: 18px; font: 11.5px var(--mono); overflow-wrap: anywhere; }

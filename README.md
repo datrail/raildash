@@ -312,6 +312,7 @@ token, including both reads:
 | `POST /api/guardrails/{agent_ref}/data-actions/dismiss` `{}` | Dismiss the *Add data actions* offer; it isn't offered again |
 | `GET /api/data-actions/tool?name=...` | One tool's classification (actions, reasons) and the schemas behind it, for the panel's **Why** |
 | `POST /api/guardrails/{agent_ref}/egress-containment` `{}` or `{"require": "allow_list_enforced"}` | Require containment: a new version that requires the agent's egress be contained; `starts_violated` says whether the newest ASP already fails it |
+| `POST /api/guardrails/{agent_ref}/openshell-policy` (the file as saved) | Import OpenShell policy: store the output of `openshell sandbox get <name> --policy-only` (or a `-o json` view) as the agent's policy; 422 says what was wrong with a file that isn't one |
 
 The proposal allows each written path of the baseline exactly, plus one
 glob it always shows: `**/__pycache__/*.pyc`, Python's bytecode caches.
@@ -348,6 +349,23 @@ with the optional `egress_containment` rule (`{"require": "contained"}` or
 includes the rule only when the baseline was contained, and **Require
 containment** adds it to any version. An ASP from before RailMon's rule pack
 11 leaves the line unknown and the rule Unverified.
+
+**OpenShell's policy.** For an agent OpenShell contains, the Egress line
+offers **Import OpenShell policy**: upload what `openshell sandbox get
+<name> --policy-only` prints (or its `sandbox get -o json` / `policy get
+--full -o json` view). The line then lists each endpoint the policy allows,
+with its ports, binaries, access or rules and `enforce`/`audit`, labels a
+provider's rules with the provider, and says when it was imported, as
+"as of" once it is older than the two-hour stale window. The policy is
+declared by the operator and sits beside the ASP: it changes no ASP,
+baseline or guardrail version, and only the endpoints are kept, so a
+credential a policy carries is never stored. A file that isn't a policy is
+refused with what was wrong, and the policy already held stays. While
+RailDash holds one, a proposal adds the policy's hosts to the hosts the
+agent may call (a wildcard kept, an endpoint with only `allowed_ips` or a
+wildcard form the guardrail can't write listed instead), and a host the
+agent sent a body to stays out of **Uploads to** when the policy allows it
+no body there, so that attempt shows as a would-be violation.
 
 Containment is a property of the sandbox, so in a multi-agent sandbox
 (evidence bundle v2 with two or more agents) the line and the rule read the
