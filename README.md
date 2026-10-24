@@ -312,6 +312,8 @@ token, including both reads:
 | `POST /api/guardrails/{agent_ref}/data-actions/dismiss` `{}` | Dismiss the *Add data actions* offer; it isn't offered again |
 | `GET /api/data-actions/tool?name=...` | One tool's classification (actions, reasons) and the schemas behind it, for the panel's **Why** |
 | `POST /api/guardrails/{agent_ref}/egress-containment` `{}` or `{"require": "allow_list_enforced"}` | Require containment: a new version that requires the agent's egress be contained; `starts_violated` says whether the newest ASP already fails it |
+| `POST /v1/openshell/sandboxes/{sandbox}/policy` (`policy get --full -o json`) | `railmon openshell`: a sandbox's policy revision, read as an import is, shown for every agent whose ASP names that sandbox |
+| `POST /v1/openshell/sandboxes/{sandbox}/denials` `{"denials": [...], "partial": ...}` | `railmon openshell`: the denials its supervisor logged; a line already stored is skipped |
 | `POST /api/guardrails/{agent_ref}/openshell-policy` (the file as saved) | Import OpenShell policy: store the output of `openshell sandbox get <name> --policy-only` (or a `-o json` view) as the agent's policy; 422 says what was wrong with a file that isn't one |
 
 The proposal allows each written path of the baseline exactly, plus one
@@ -366,6 +368,18 @@ agent may call (a wildcard kept, an endpoint with only `allowed_ips` or a
 wildcard form the guardrail can't write listed instead), and a host the
 agent sent a body to stays out of **Uploads to** when the policy allows it
 no body there, so that attempt shows as a would-be violation.
+
+RailMon's opt-in `railmon openshell` collector posts the same policy
+whenever the sandbox loads a new revision, so the line shows "read by the
+collector" instead, together with what OpenShell's supervisor refused:
+**Blocked by OpenShell** lists the last 24 hours of denials for the agent's
+sandbox (its ASPs' `sandbox_name`), grouped by host, port and binary. Hosts
+outside the guardrail come first, marked "tried an out-of-spec host;
+OpenShell blocked it". A span the collector couldn't show was complete (its
+first poll, a log that had moved on, a full log buffer, a failed poll) says
+"denials may be missing between … and …". A denial is OpenShell's report,
+not a violation: nothing left the sandbox, and no guardrail state changes.
+Denials are kept for a week.
 
 Containment is a property of the sandbox, so in a multi-agent sandbox
 (evidence bundle v2 with two or more agents) the line and the rule read the

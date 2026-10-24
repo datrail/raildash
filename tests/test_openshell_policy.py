@@ -387,3 +387,134 @@ def test_an_inference_host_the_policy_allows_no_body_is_withheld_too(store):
     assert "api.openai.com" not in proposal["guardrail"]["rules"]["uploads"]["allowed_hosts"]
     assert proposal["openshell"]["withheld_upload_hosts"] == ["api.anthropic.com", "api.openai.com"]
     assert proposal["openshell"]["upload_hosts"] == []
+
+
+# --------------------------------------------------- the collector (DR-249)
+
+# What `railmon openshell` posts for the recorded sandbox: its policy as the
+# collector strips it, and the first poll of its log (railmon's parser over
+# the recorded `openshell logs` output, tests/fixtures there).
+COLLECTOR_POLICY = fixture("collector-policy.json")
+COLLECTOR_DENIALS = json.loads(fixture("collector-denials.json"))
+SANDBOX = "fixture-agent"  # test_guardrail's v1 fixture's sandbox_name
+
+
+def test_the_collectors_policy_shows_for_the_agent_its_sandbox_holds(store):
+    _, ref = baseline(store, asp(egress_containment=egress()))
+    answer = store.record_openshell_policy(SANDBOX, COLLECTOR_POLICY)
+    assert (answer["revision"], answer["endpoints"]) == (1, 4)
+    shown = store.guardrail_detail(ref)["openshell_policy"]
+    assert (shown["source"], shown["revision"], shown["policy_source"]) == ("collector", 1, "sandbox")
+    assert shown["digest"] == osp.parse_policy(fixture("base.policy-full.json"))["digest"]
+    # The newest wins, whichever way it came.
+    store.import_openshell_policy(ref, fixture("mcp.policy-only.yaml"))
+    assert store.guardrail_detail(ref)["openshell_policy"]["source"] == "import"
+    store.record_openshell_policy(SANDBOX, COLLECTOR_POLICY)
+    assert store.guardrail_detail(ref)["openshell_policy"]["source"] == "collector"
+    # Another sandbox's policy is not this agent's.
+    store.record_openshell_policy("someone-else", fixture("global.policy-get-global.json"))
+    assert store.guardrail_detail(ref)["openshell_policy"]["sandbox"] == "fx-base"
+    with pytest.raises(osp.PolicyImportError, match="sandbox name"):
+        store.record_openshell_policy("bad name", COLLECTOR_POLICY)
+    with pytest.raises(osp.PolicyImportError):
+        store.record_openshell_policy(SANDBOX, b'{"active_version": 2}')
+
+
+def test_blocked_by_openshell_groups_the_denials_and_shows_the_partial_span(store):
+    _, ref = baseline(store, asp(egress_containment=egress()))
+    assert store.guardrail_detail(ref)["openshell_denials"] is None
+    # Stamped now, so they fall inside the 24 h shown.
+    body = json.loads(json.dumps(COLLECTOR_DENIALS))
+    now = store._receive_time()  # noqa: SLF001
+    for denial in body["denials"]:
+        denial["at"] = now
+    body["partial"]["to"] = now
+    answer = store.record_openshell_denials(SANDBOX, body)
+    assert (answer["stored"], answer["duplicates"], answer["partial"]) == (3, 0, True)
+    # The overlapping next poll posts the same lines again: stored once.
+    again = store.record_openshell_denials(SANDBOX, {"denials": body["denials"], "partial": None})
+    assert (again["stored"], again["duplicates"]) == (0, 3)
+    shown = store.guardrail_detail(ref)["openshell_denials"]
+    assert shown["partial"] == [{"from": None, "to": now, "reasons": ["first_poll"]}]
+    groups = {(grp["host"], grp["port"], grp["binary"]): grp for grp in shown["groups"]}
+    assert set(groups) == {("api.github.com", 443, None), ("example.org", 443, "/usr/local/bin/python3.13"),
+                           ("169.254.169.254", 80, "/usr/local/bin/python3.13")}
+    l7 = groups[("api.github.com", 443, None)]
+    assert l7["requests"] == ["POST /markdown"] and l7["count"] == 1
+    assert l7["reasons"] == ["L7_REQUEST deny POST api.github.com:443/markdown reason=POST /markdown not permitted by policy"]
+    # Against the proposal's hosts (the fixture declares none), all three
+    # are outside the guardrail.
+    assert all(grp["outside_guardrail"] is True for grp in shown["groups"])
+
+
+def test_a_denial_changes_no_guardrail_state(store):
+    alignment, ref = baseline(store, asp(egress_containment=egress()))
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    before = store.guardrail_detail(ref)
+    body = json.loads(json.dumps(COLLECTOR_DENIALS))
+    now = store._receive_time()  # noqa: SLF001
+    for denial in body["denials"]:
+        denial["at"] = now
+    store.record_openshell_denials(SANDBOX, body)
+    after = store.guardrail_detail(ref)
+    assert (after["state"], after["rules"], after["rows"]) == (before["state"], before["rules"], before["rows"])
+    assert after["openshell_denials"]["groups"]
+
+
+def test_old_denials_leave_the_view_and_then_the_database(store):
+    _, ref = baseline(store, asp(egress_containment=egress()))
+    store.record_openshell_denials(SANDBOX, {"denials": [
+        {"at": "2020-01-01T00:00:00Z", "hash": "a" * 32, "kind": "net", "host": "old.example.com"}], "partial": None})
+    # Older than the retention week: pruned in the same post.
+    assert store._db.execute("SELECT count(*) FROM openshell_denials").fetchone()[0] == 0  # noqa: SLF001
+    assert store.guardrail_detail(ref)["openshell_denials"] is None
+
+
+@pytest.mark.parametrize(("body", "message"), [
+    ([], "the body must be"),
+    ({"denials": [], "extra": 1}, "the body must be"),
+    ({"denials": [{"at": "2026-10-24T00:00:00Z", "hash": "a" * 32, "kind": "dns"}]}, "kind"),
+    ({"denials": [{"at": "2026-10-24T00:00:00Z", "hash": "XYZ", "kind": "net"}]}, "hash"),
+    ({"denials": [{"at": "yesterday", "hash": "a" * 32, "kind": "net"}]}, "date-time"),
+    ({"denials": [{"at": "2026-10-24T00:00:00", "hash": "a" * 32, "kind": "net"}]}, "time zone"),
+    ({"denials": [{"at": "2026-10-24T00:00:00Z", "hash": "a" * 32, "kind": "net", "port": 0}]}, "TCP port"),
+    ({"denials": [{"at": "2026-10-24T00:00:00Z", "hash": "a" * 32, "kind": "net", "host": "x" * 254}]}, "at most 253"),
+    ({"denials": [{"at": "2026-10-24T00:00:00Z", "hash": "a" * 32, "kind": "net", "token": "x"}]}, "unknown fields"),
+    ({"denials": [], "partial": {"to": "2026-10-24T00:00:00Z", "reasons": ["bored"]}}, "partial.reasons"),
+    ({"denials": [], "partial": {"to": "2026-10-24T00:00:00Z", "reasons": []}}, "partial.reasons"),
+])
+def test_a_denials_post_that_isnt_one_is_refused(body, message):
+    with pytest.raises(osp.PolicyImportError, match=message):
+        osp.parse_denials(body)
+
+
+def test_the_collector_routes_are_token_gated(store, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from raildash import app as app_module
+
+    baseline(store, asp(egress_containment=egress()))
+    monkeypatch.setattr(app_module, "store", store)
+    client = TestClient(app_module.app)
+    headers = {"X-RailDash-Token": app_module.LOCAL_TOKEN}
+    policy = f"/v1/openshell/sandboxes/{SANDBOX}/policy"
+    denials = f"/v1/openshell/sandboxes/{SANDBOX}/denials"
+    assert client.post(policy, content=COLLECTOR_POLICY).status_code == 403
+    assert client.post(denials, json=COLLECTOR_DENIALS).status_code == 403
+    assert client.post(policy, content=COLLECTOR_POLICY, headers=headers).status_code == 201
+    answer = client.post(denials, json=COLLECTOR_DENIALS, headers=headers)
+    assert answer.status_code == 201 and answer.json()["stored"] == 3
+    assert client.post(denials, content=json.dumps(COLLECTOR_DENIALS), headers=headers).status_code == 415
+    assert client.post(denials, json={"denials": "x"}, headers=headers).status_code == 422
+    assert client.post("/v1/openshell/sandboxes/bad%20name/policy", content=COLLECTOR_POLICY,
+                       headers=headers).status_code == 422
+    assert client.post(policy, content=b'{"version": 1}', headers=headers).status_code == 422
+
+
+def test_only_the_newest_collector_policies_are_kept(store):
+    from raildash import guardrail_store
+
+    for _ in range(guardrail_store.OPENSHELL_POLICIES_KEPT + 5):
+        store.record_openshell_policy(SANDBOX, COLLECTOR_POLICY)
+    count = store._db.execute("SELECT count(*) FROM openshell_sandbox_policies").fetchone()[0]  # noqa: SLF001
+    assert count == guardrail_store.OPENSHELL_POLICIES_KEPT

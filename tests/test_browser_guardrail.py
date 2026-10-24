@@ -33,12 +33,12 @@ ROOT = Path(__file__).parent.parent
 TIMEOUT = 20_000  # the page polls every 5 s
 
 
-def _post(url: str, path: str, token: str, body: bytes) -> None:
+def _post(url: str, path: str, token: str, body: bytes, ok: tuple[int, ...] = (200, 202)) -> None:
     request = Request(f"{url}{path}", data=body, method="POST", headers={
         "Content-Type": "application/json", "X-RailDash-Token": token,
     })
     with urlopen(request, timeout=5) as response:
-        assert response.status in (200, 202), response.status
+        assert response.status in ok, response.status
 
 
 def _capture(url: str, token: str, host: str, name: str) -> None:
@@ -542,6 +542,67 @@ def test_an_imported_openshell_policy_shows_on_the_egress_line_and_seeds_the_pro
             expect(seed).to_contain_text("api.github.com (_provider_fx_pypi, github_api)")
             expect(card.locator(".guardrail-proposal .guardrail-policy")).to_contain_text("*.example.com")
             expect(section.get_by_role("button", name="Import a newer policy")).to_be_visible()
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_blocked_by_openshell_shows_the_collectors_denials(tmp_path):
+    """DR-249: what `railmon openshell` posts (the policy and the first
+    poll's denials of the recorded sandbox) shows under the Egress line."""
+    from test_guardrail_egress import egress
+
+    fixtures = Path(__file__).parent / "fixtures" / "openshell-0.1.3"
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    value = asp(listeners=[DEMO_LISTENER], egress_containment=egress("allow_list_enforced"))
+    store.make_baseline(store.load_asp(json.dumps(value).encode())["asp_id"], "v1.0")
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        token = Path(f"{database}.token").read_text().strip()
+        _post(url, "/v1/openshell/sandboxes/fixture-agent/policy", token,
+              (fixtures / "collector-policy.json").read_bytes(), ok=(201,))
+        body = json.loads((fixtures / "collector-denials.json").read_text())
+        for denial in body["denials"]:
+            denial["at"] = _now()
+        body["partial"]["to"] = _now()
+        _post(url, "/v1/openshell/sandboxes/fixture-agent/denials", token, json.dumps(body).encode(), ok=(201,))
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            expect(card.locator(".guardrail-openshell")).to_contain_text(
+                "OpenShell's policy revision 1, read by the collector", timeout=TIMEOUT)
+            denials = card.locator(".guardrail-openshell-denials")
+            expect(denials).to_contain_text("Blocked by OpenShell (last 24 h)")
+            expect(denials).to_contain_text("Denials may be missing between the collector's start and")
+            expect(denials).to_contain_text("(the collector started)")
+            rows = denials.locator(".guardrail-openshell-denial-list li")
+            expect(rows).to_have_count(3)
+            expect(rows.filter(has_text="api.github.com:443")).to_contain_text("binary not logged · 1 time")
+            expect(rows.filter(has_text="api.github.com:443")).to_contain_text("POST /markdown")
+            expect(rows.filter(has_text="example.org:443")).to_contain_text(
+                "/usr/local/bin/python3.13 · 1 time")
+            expect(rows.filter(has_text="example.org:443")).to_contain_text(
+                "tried an out-of-spec host; OpenShell blocked it")
             assert errors == []
             browser.close()
     finally:

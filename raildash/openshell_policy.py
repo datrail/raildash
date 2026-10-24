@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 import yaml
@@ -388,3 +390,79 @@ def seed_view(
         "withheld_upload_hosts": sorted(seed["withheld_upload_hosts"]),
         "not_representable": seed["not_representable"],
     }
+
+
+# ------------------------------------------------------------- the collector
+
+# DR-249 (DR-194 M3): what `railmon openshell` posts. A sandbox is named as
+# OpenShell names it (container_ref's SANDBOX_NAME in RailMon).
+SANDBOX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
+MAX_DENIALS_PER_POST = 2_000
+# Why a batch can't show it holds every denial (design §4.2).
+PARTIAL_REASONS = ("first_poll", "gap", "full_buffer", "poll_failed")
+DENIAL_KINDS = ("net", "http")
+_HASH = re.compile(r"^[0-9a-f]{16,64}$")
+_TEXT_LIMITS = {"host": 253, "method": 32, "path": 2048, "binary": 4096, "policy": 253, "reason": 1024}
+
+
+def check_sandbox(name: str) -> str:
+    if not SANDBOX_NAME.match(name):
+        raise PolicyImportError("not an OpenShell sandbox name")
+    return name
+
+
+def _instant_text(value: Any, where: str) -> str:
+    if not isinstance(value, str):
+        raise PolicyImportError(f"{where}: not a date-time")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise PolicyImportError(f"{where}: not a date-time") from exc
+    if parsed.tzinfo is None:
+        raise PolicyImportError(f"{where}: no time zone")
+    return parsed.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def parse_denials(body: Any) -> dict[str, Any]:
+    """One collector post of denials, checked: `{"denials": [...],
+    "partial": None | {"from", "to", "reasons"}}`. Each denial is what the
+    collector parsed from one `DENIED` line of the sandbox's log: `at`,
+    `hash` (the line's, which dedupes a line seen twice), `kind`
+    (`net`/`http`) and the line's host, port, method, path, binary, policy
+    and reason, each optional. Raises `PolicyImportError`."""
+    if not isinstance(body, dict) or set(body) - {"denials", "partial"}:
+        raise PolicyImportError("the body must be {\"denials\": [...], \"partial\": ...}")
+    denials = body.get("denials")
+    if not isinstance(denials, list) or len(denials) > MAX_DENIALS_PER_POST:
+        raise PolicyImportError(f"denials must be a list of at most {MAX_DENIALS_PER_POST}")
+    out = []
+    for index, denial in enumerate(denials):
+        where = f"denials[{index}]"
+        if not isinstance(denial, dict) or set(denial) - {"at", "hash", "kind", *_TEXT_LIMITS, "port"}:
+            raise PolicyImportError(f"{where}: unknown fields")
+        if denial.get("kind") not in DENIAL_KINDS:
+            raise PolicyImportError(f"{where}.kind: net or http")
+        if not isinstance(denial.get("hash"), str) or not _HASH.match(denial["hash"]):
+            raise PolicyImportError(f"{where}.hash: hex")
+        row = {"at": _instant_text(denial.get("at"), f"{where}.at"), "hash": denial["hash"], "kind": denial["kind"]}
+        for field, limit in _TEXT_LIMITS.items():
+            value = denial.get(field)
+            if value is not None and (not isinstance(value, str) or len(value) > limit):
+                raise PolicyImportError(f"{where}.{field}: a string of at most {limit}")
+            row[field] = value
+        port = denial.get("port")
+        row["port"] = None if port is None else _port(port, f"{where}.port")
+        out.append(row)
+    partial = body.get("partial")
+    if partial is not None:
+        if not isinstance(partial, dict) or set(partial) - {"from", "to", "reasons"}:
+            raise PolicyImportError("partial: {\"from\", \"to\", \"reasons\"}")
+        reasons = partial.get("reasons")
+        if not isinstance(reasons, list) or not reasons or any(r not in PARTIAL_REASONS for r in reasons):
+            raise PolicyImportError(f"partial.reasons: some of {', '.join(PARTIAL_REASONS)}")
+        partial = {
+            "from": None if partial.get("from") is None else _instant_text(partial["from"], "partial.from"),
+            "to": _instant_text(partial.get("to"), "partial.to"),
+            "reasons": sorted(set(reasons)),
+        }
+    return {"denials": out, "partial": partial}

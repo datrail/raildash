@@ -298,8 +298,11 @@ paths:
         Each row says whether it `counts`, which version allows it
         (`allowed_by`), and whether it is a counting row Allow this alone
         could allow (`allowable`), the rows Allow all takes (DR-202).
-        `openshell_policy` is the agent's newest imported OpenShell policy, or
-        null (DR-248), and a proposal seeded from it carries `openshell`.
+        `openshell_policy` is the agent's newest OpenShell policy, imported or
+        from railmon openshell, or null (DR-248, DR-249), and a proposal seeded
+        from it carries `openshell`. `openshell_denials` is Blocked by OpenShell:
+        the last 24 h of denials for the agent's sandbox, grouped, with
+        `partial` spans, or null.
       parameters:
         - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
         - {$ref: '#/components/parameters/RailDashToken'}
@@ -399,6 +402,52 @@ paths:
         '404': {description: No such id}
         '409': {description: No guardrail is active, or it already requires this}
         '422': {description: require is not contained or allow_list_enforced}
+
+  /v1/openshell/sandboxes/{sandbox}/policy:
+    post:
+      operationId: ingestOpenshellPolicy
+      summary: A sandbox's policy revision from railmon openshell
+      description: >-
+        Token-gated (DR-249). The body is what `openshell policy get <sandbox> --full -o json`
+        prints, as the collector strips it. Read as importOpenshellPolicy reads a file, so only
+        the endpoints and the revision are kept. It is the policy of every agent whose ASP names
+        this sandbox (`sandbox_name`), unless an import is newer.
+      parameters:
+        - {name: sandbox, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {type: object}}
+      responses:
+        '201': {description: '{sandbox, received_at, revision, digest, endpoints}'}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '413': {description: Body over 256 KiB}
+        '422': {description: Not a sandbox name, or not a readable policy}
+
+  /v1/openshell/sandboxes/{sandbox}/denials:
+    post:
+      operationId: ingestOpenshellDenials
+      summary: Denials OpenShell's supervisor logged for a sandbox, from railmon openshell
+      description: >-
+        Token-gated (DR-249). `{"denials": [{"at", "hash", "kind": "net"|"http", "host", "port",
+        "method", "path", "binary", "policy", "reason"}], "partial": null | {"from", "to",
+        "reasons": [first_poll|gap|full_buffer|poll_failed]}}`, at most 2,000 denials. A line
+        already stored for the sandbox (same hash) is skipped. getGuardrail's `openshell_denials`
+        shows the last 24 h; a denial changes no guardrail state.
+      parameters:
+        - {name: sandbox, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/json: {schema: {type: object, required: [denials]}}
+      responses:
+        '201': {description: '{sandbox, stored, duplicates, partial}'}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '413': {description: Body over 2 MiB}
+        '415': {description: Not application/json}
+        '422': {description: Not a sandbox name, or a body that isn't a denials post}
 
   /api/guardrails/{agent_ref}/openshell-policy:
     post:

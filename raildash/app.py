@@ -70,6 +70,9 @@ MAX_CONTROL_BODY_BYTES = 4_096
 # A guardrail version's rules (adopt, edit): its saved-file and host lists
 # are the user's own, so larger than a control body, still bounded.
 MAX_GUARDRAIL_BODY_BYTES = 256 * 1024
+# DR-249: one collector post holds at most 2,000 denials of a few hundred
+# bytes each.
+MAX_OPENSHELL_DENIALS_BODY_BYTES = 2 * 1024 * 1024
 # DR-120: RailDash's own ingest bound for `POST /v1/evidence-bundles`, mirroring
 # Rail Center's MAX_EVIDENCE_BUNDLE_BYTES default (config.py there). Separately
 # configurable from the fixed MAX_ASP_BUNDLE_BYTES that `asp.parse_bundle`
@@ -1280,6 +1283,42 @@ async def api_import_openshell_policy(agent_ref: str, request: Request) -> dict[
         return await run_in_threadpool(
             _guardrail_call, get_store().import_openshell_policy, agent_ref, raw
         )
+    except osp.PolicyImportError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post(
+    "/v1/openshell/sandboxes/{sandbox}/policy",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def ingest_openshell_policy(sandbox: str, request: Request) -> dict[str, Any]:
+    """A policy revision `railmon openshell` read from OpenShell's gateway
+    for one sandbox (DR-249): the JSON `openshell policy get <sandbox>
+    --full -o json` prints. Read as an import is, so only endpoint fields
+    are kept; 422 for a body that isn't a policy. It shows on the Egress
+    line of every agent whose ASP names the sandbox (`sandbox_name`)."""
+    raw = await _bounded_raw_body(request, osp.MAX_POLICY_BYTES)
+    try:
+        return await run_in_threadpool(get_store().record_openshell_policy, sandbox, raw)
+    except osp.PolicyImportError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post(
+    "/v1/openshell/sandboxes/{sandbox}/denials",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def ingest_openshell_denials(sandbox: str, request: Request) -> dict[str, Any]:
+    """Denials `railmon openshell` parsed from one sandbox's log (DR-249):
+    `{"denials": [{"at", "hash", "kind", "host", "port", "method", "path",
+    "binary", "policy", "reason"}], "partial": null | {"from", "to",
+    "reasons"}}`. A line already stored (same hash) is skipped. A denial is
+    OpenShell's report and changes no guardrail state."""
+    body = await _json_body(request, max_bytes=MAX_OPENSHELL_DENIALS_BODY_BYTES)
+    try:
+        return await run_in_threadpool(get_store().record_openshell_denials, sandbox, body)
     except osp.PolicyImportError as exc:
         raise HTTPException(422, str(exc)) from exc
 
