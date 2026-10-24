@@ -1699,9 +1699,9 @@ def propose_guardrail(
     (`raildash.openshell_policy`), or None. When the baseline reads as
     contained by OpenShell, it seeds the proposal (DR-194 §4.4, DR-248):
     its hosts join `out_of_spec_calls.allowed_hosts`, wildcards kept, and a
-    host the agent sent a body to stays out of `uploads.allowed_hosts` when
-    every endpoint covering it refuses a body, so that attempt is listed as
-    a would-be violation instead. The answer's `openshell` says what came
+    host that would seed `uploads.allowed_hosts` (the base URL's, or one the
+    agent sent a body to) stays out when every endpoint covering it refuses
+    a body; a body the agent sent there is listed as a would-be violation. The answer's `openshell` says what came
     from the policy, with its revision.
     """
     if is_multi_agent(bundle):

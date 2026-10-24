@@ -1442,12 +1442,12 @@ function renderOpenshellSeed(seed) {
   }
   if (seed.upload_hosts.length) {
     notes.append(el("li", "muted",
-      `Uploads to ${seed.upload_hosts.join(", ")}: the agent sent a body there, and OpenShell's policy allows one.`));
+      `Uploads to ${seed.upload_hosts.join(", ")}: OpenShell's policy allows a body there too.`));
   }
   if (seed.withheld_upload_hosts.length) {
     notes.append(el("li", "muted",
-      `Not uploads: ${seed.withheld_upload_hosts.join(", ")}. The agent sent a body there, ` +
-      "but OpenShell's policy allows none, so it's listed below rather than approved."));
+      `Not uploads: ${seed.withheld_upload_hosts.join(", ")}. OpenShell's policy allows no body there, ` +
+      "so it isn't approved; a body the agent did send there is listed below."));
   }
   seed.not_representable.forEach((entry) => {
     notes.append(el("li", "muted", `Not in the proposal: ${entry.endpoint} (${entry.rule}): ${entry.reason}.`));
