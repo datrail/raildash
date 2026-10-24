@@ -1239,8 +1239,13 @@ function listOrNone(values, describe = (v) => v) {
   return values && values.length ? values.map(describe).join(", ") : "none";
 }
 
+// The listeners a proposal for an agent in an OpenShell sandbox allows
+// (raildash.guardrail.OPENSHELL_DNS_ENTRIES): OpenShell's own DNS.
+const OPENSHELL_DNS_ADDR = "127.0.0.53";
+
 function describePort(entry) {
-  return `${entry.protocol}/${entry.addr || "any address"}/${entry.port}`;
+  const dns = entry.addr === OPENSHELL_DNS_ADDR && entry.port === 53 ? " (OpenShell's DNS)" : "";
+  return `${entry.protocol}/${entry.addr || "any address"}/${entry.port}${dns}`;
 }
 
 // The glob every proposal seeds (raildash.guardrail.BYTECODE_CACHE_ENTRY).

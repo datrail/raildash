@@ -207,6 +207,49 @@ def test_the_proposal_requires_containment_only_from_a_contained_baseline(store)
         assert g.guardrail_problems(proposal["guardrail"]) == []
 
 
+OPENSHELL_DNS = [{"protocol": "tcp", "addr": "127.0.0.53", "port": 53, "process": "openshell-sandb"},
+                 {"protocol": "udp", "addr": "127.0.0.53", "port": 53, "process": "openshell-sandb"}]
+
+
+def test_the_proposal_for_an_openshell_agent_allows_openshells_dns(store):
+    """DR-247 (DR-194 M1): OpenShell answers the sandbox's DNS on
+    127.0.0.53:53 in the agent's own container. The ASP lists those
+    listeners; the proposal allows them, and only them, so adopting it is
+    Violated by the agent's own port alone."""
+    from test_guardrail import DEMO_LISTENER
+
+    alignment, ref = baseline(store, asp(listeners=[DEMO_LISTENER, *OPENSHELL_DNS],
+                                         egress_containment=egress("allow_list_enforced")))
+    proposal = store.guardrail_detail(ref)["proposal"]
+    assert proposal["guardrail"]["rules"]["service_ports"] == {"allowed": [
+        {"protocol": "tcp", "addr": "127.0.0.53", "port": 53},
+        {"protocol": "udp", "addr": "127.0.0.53", "port": 53},
+    ]}
+    assert [v["item"] for v in proposal["would_be_violations"] if v["rule"] == "service_ports"] == [
+        "tcp/127.0.0.1/8443"]
+    assert g.guardrail_problems(proposal["guardrail"]) == []
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    live(store)
+    assert {item for rule, item in rows(store, ref) if rule == "service_ports"} == {"tcp/127.0.0.1/8443"}
+
+
+def test_only_an_agent_openshell_contains_gets_the_dns_entries(store):
+    # The same listeners in a container nothing contains, or one on an
+    # internal network, are the agent's own and stay violations.
+    for index, level in enumerate(("open", "internal_network")):
+        _, ref = baseline(store, asp(listeners=OPENSHELL_DNS, deployment=f"agent-{index}",
+                                     egress_containment=egress(level)))
+        proposal = store.guardrail_detail(ref)["proposal"]
+        assert proposal["guardrail"]["rules"]["service_ports"] == {"allowed": []}, level
+        assert sorted(v["item"] for v in proposal["would_be_violations"] if v["rule"] == "service_ports") == [
+            "tcp/127.0.0.53/53", "udp/127.0.0.53/53"], level
+    # allow_list_enforced from another enforcer (none today) gets nothing either.
+    other = egress("allow_list_enforced")
+    other["value"]["enforcer"] = None
+    _, ref = baseline(store, asp(listeners=OPENSHELL_DNS, deployment="agent-other", egress_containment=other))
+    assert store.guardrail_detail(ref)["proposal"]["guardrail"]["rules"]["service_ports"] == {"allowed": []}
+
+
 # ----------------------------------------------------------------- custody
 
 
