@@ -679,10 +679,13 @@ async function renderDriftExplained(aspId) {
 // the top.
 const openAspEvidence = new Map();
 
-// Drop a poll's panel that was built before an open or hide click. An explicit
-// load (an action's, a pager's) still draws, and the next poll shows the view.
-function supersedeAspPoll() {
-  if (aspKeyedLoads === 0) aspAlignmentGeneration++;
+// A click lands on the panel on screen while another may be being built, so
+// each swap, and each bundle that arrives, matches every toggle on screen to
+// this map.
+function syncAspEvidence(root, key = null) {
+  root.querySelectorAll(".asp-inspect").forEach((wrap) => {
+    if (key === null || wrap.dataset.evidenceKey === key) wrap.syncEvidence();
+  });
 }
 
 function fetchAspBundle(aspId) {
@@ -690,7 +693,8 @@ function fetchAspBundle(aspId) {
 }
 
 async function renderInspectToggle(key, aspId) {
-  const wrap = el("div");
+  const wrap = el("div", "asp-inspect");
+  wrap.dataset.evidenceKey = key;
   const button = el("button", "btn btn-quiet", "Inspect evidence");
   button.type = "button";
   let view = null;
@@ -704,6 +708,17 @@ async function renderInspectToggle(key, aspId) {
     wrap.append(view);
     button.textContent = "Hide evidence";
   };
+  const hide = () => {
+    view.remove();
+    view = null;
+    button.textContent = "Inspect evidence";
+  };
+  wrap.syncEvidence = () => {
+    const open = openAspEvidence.get(key);
+    const wanted = Boolean(open && open.aspId === aspId);
+    if (wanted && !view) show(open);
+    if (!wanted && view) hide();
+  };
   const fail = (message) => {
     error = errorMessage(message);
     wrap.append(error);
@@ -713,11 +728,8 @@ async function renderInspectToggle(key, aspId) {
   button.addEventListener("click", async () => {
     if (pending) return;
     if (view) {
-      view.remove();
-      view = null;
       openAspEvidence.delete(key);
-      button.textContent = "Inspect evidence";
-      supersedeAspPoll();  // a panel built before this click would reopen it
+      hide();
       return;
     }
     if (error) error.remove();
@@ -725,14 +737,8 @@ async function renderInspectToggle(key, aspId) {
     try {
       const open = { aspId, bundle: await fetchAspBundle(aspId), scrollTop: 0 };
       openAspEvidence.set(key, open);
-      if (wrap.isConnected) {
-        show(open);
-        supersedeAspPoll();  // a panel built before the bundle came would close it
-      } else {
-        // A redraw replaced this card while the bundle loaded; the next draw
-        // shows it on the card now on screen.
-        loadAspAlignments().catch((err) => console.error(err));
-      }
+      // A redraw may have replaced this card while the bundle loaded.
+      syncAspEvidence($("asp-alignment-body"), key);
     } catch (err) {
       fail(err.message);
     } finally {
@@ -1109,10 +1115,13 @@ async function drawAspAlignments(focusKey, focusAction) {
   });
   // A poll that changes nothing leaves the panel alone, so a selection or a
   // find-in-page match in an open evidence view survives it.
+  // Counts finished draws, swapped or left alone; the browser tests wait on it.
+  body.dataset.draws = String(Number(body.dataset.draws || 0) + 1);
   const unchanged = panel.childNodes.length === body.childNodes.length
     && [...panel.childNodes].every((node, index) => node.isEqualNode(body.childNodes[index]));
   if (focusKey === null && unchanged) return;
   body.replaceChildren(...panel.childNodes);
+  syncAspEvidence(body);
   body.querySelectorAll(".asp-bundle-view").forEach((view) => {
     const open = openAspEvidence.get(view.dataset.evidenceKey);
     if (open) view.scrollTop = open.scrollTop;
