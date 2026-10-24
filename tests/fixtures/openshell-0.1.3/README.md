@@ -19,6 +19,8 @@ directory.
 | `global.policy-only.yaml` | A sandbox's `--policy-only` while a global policy is set: the global one, indistinguishable in YAML |
 | `global.sandbox-get.json` | `sandbox get -o json` then: `policy_source: global` |
 | `global.policy-get-global.json` | `policy get --global --full -o json` (`scope: global`) |
+| `collector-policy.json` | `base.policy-full.json`'s policy as `railmon openshell` posts it (DR-249): railmon's `strip_policy` over the same recorded output |
+| `collector-denials.json` | The first poll's denials post: railmon's parser over the base sandbox's recorded `openshell logs --source sandbox` (an L7 `POST` denial, an L4 host no rule names, the metadata address) |
 | `missing-sandbox.stderr.txt` | What `--policy-only` prints for a sandbox that doesn't exist (stderr; stdout is empty) |
 
 One value is not verbatim: the `internal.openshell.ai/gateway-token-id`

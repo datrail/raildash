@@ -1,0 +1,104 @@
+{
+ "active_version": 1,
+ "version": 1,
+ "hash": "e55f61f2e1bd980f8020f718a49a860212652f3c25f279111ea9f2a3a9f56df2",
+ "policy_source": "sandbox",
+ "scope": "sandbox",
+ "sandbox": "fx-base",
+ "policy": {
+  "version": 1,
+  "network_policies": {
+   "example_wildcard": {
+    "name": "example-wildcard",
+    "endpoints": [
+     {
+      "host": "*.example.com",
+      "ports": [
+       443,
+       8443
+      ],
+      "protocol": "rest",
+      "enforcement": "audit",
+      "access": "read-write",
+      "rules": [],
+      "deny_rules": []
+     }
+    ],
+    "binaries": [
+     {
+      "path": "/usr/local/bin/python3.13"
+     }
+    ]
+   },
+   "github_api": {
+    "name": "github-api-readonly",
+    "endpoints": [
+     {
+      "host": "api.github.com",
+      "port": 443,
+      "protocol": "rest",
+      "enforcement": "enforce",
+      "access": "read-only",
+      "rules": [],
+      "deny_rules": []
+     }
+    ],
+    "binaries": [
+     {
+      "path": "/usr/local/bin/python3.13"
+     }
+    ]
+   },
+   "github_uploads": {
+    "name": "github-uploads",
+    "endpoints": [
+     {
+      "host": "uploads.github.com",
+      "port": 443,
+      "protocol": "rest",
+      "enforcement": "enforce",
+      "rules": [
+       {
+        "allow": {
+         "method": "GET",
+         "path": "/repos/**"
+        }
+       },
+       {
+        "allow": {
+         "method": "POST",
+         "path": "/repos/*/*/releases/*/assets"
+        }
+       }
+      ],
+      "deny_rules": []
+     }
+    ],
+    "binaries": [
+     {
+      "path": "/usr/local/bin/python3.13"
+     }
+    ]
+   },
+   "raw_content": {
+    "name": "raw-content",
+    "endpoints": [
+     {
+      "host": "raw.githubusercontent.com",
+      "port": 443,
+      "rules": [],
+      "deny_rules": []
+     }
+    ],
+    "binaries": [
+     {
+      "path": "/usr/local/bin/python3.13"
+     },
+     {
+      "path": "/usr/bin/curl"
+     }
+    ]
+   }
+  }
+ }
+}

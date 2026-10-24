@@ -106,6 +106,11 @@ GUARDRAIL_ACK_RETENTION_DAYS = 30
 # 24 h before the lock, newest first.
 PROPOSAL_MAX_REQUESTS = 5_000
 MAX_GUARDRAIL_EVENTS_SHOWN = 100
+# DR-249: Blocked by OpenShell shows a day of denials (design §4.3), and
+# keeps a week, for an agent whose page isn't open every day.
+OPENSHELL_DENIALS_SHOWN = timedelta(hours=24)
+OPENSHELL_DENIAL_RETENTION = timedelta(days=7)
+OPENSHELL_DENIAL_GROUPS_SHOWN = 50
 OVERFLOW_RULE = "(overflow)"
 OVERFLOW_ITEM = "(overflow)"
 # Identity columns of a mark that applies to every agent.
@@ -206,6 +211,45 @@ CREATE TABLE IF NOT EXISTS openshell_policies (
 );
 CREATE INDEX IF NOT EXISTS openshell_policies_identity
     ON openshell_policies(identity_kind, identity_value, policy_id);
+
+-- DR-249 (DR-194 M3): what `railmon openshell` posts, keyed by the sandbox's
+-- name, which an ASP of an agent in it carries as `sandbox_name` (DR-247).
+-- Policy revisions as parse_policy reads them; the denials OpenShell's
+-- supervisor logged, one row per log line; and the spans a batch couldn't
+-- show it held every denial for (PARTIAL).
+CREATE TABLE IF NOT EXISTS openshell_sandbox_policies (
+    policy_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    sandbox     TEXT NOT NULL,
+    received_at TEXT NOT NULL,
+    record_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS openshell_sandbox_policies_sandbox
+    ON openshell_sandbox_policies(sandbox, policy_id);
+CREATE TABLE IF NOT EXISTS openshell_denials (
+    denial_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sandbox   TEXT NOT NULL,
+    at        TEXT NOT NULL,
+    line_hash TEXT NOT NULL,
+    kind      TEXT NOT NULL,
+    host      TEXT,
+    port      INTEGER,
+    method    TEXT,
+    path      TEXT,
+    binary    TEXT,
+    policy    TEXT,
+    reason    TEXT,
+    UNIQUE(sandbox, line_hash)
+);
+CREATE INDEX IF NOT EXISTS openshell_denials_sandbox_at ON openshell_denials(sandbox, at);
+CREATE TABLE IF NOT EXISTS openshell_denial_gaps (
+    gap_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    sandbox      TEXT NOT NULL,
+    received_at  TEXT NOT NULL,
+    gap_from     TEXT,
+    gap_to       TEXT NOT NULL,
+    reasons_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS openshell_denial_gaps_sandbox ON openshell_denial_gaps(sandbox, gap_to);
 """
 
 
@@ -994,17 +1038,134 @@ class GuardrailCustody:
             "proxy_declared": declared if isinstance(declared, dict) else None,
         }
 
+    def _sandbox_names(self, kind: str, value: str) -> list[str]:
+        """The sandbox names this agent's ASPs carry: where the collector's
+        posts for it are filed (DR-249)."""
+        return sorted({name for _, name in self._sandboxes(kind, value) if name})
+
     def _openshell_policy_locked(self, kind: str, value: str) -> dict[str, Any] | None:
-        """The agent's newest imported OpenShell policy record, with when
-        and how it arrived, or None."""
+        """The agent's newest OpenShell policy record, imported (DR-248) or
+        posted by the collector for one of its sandboxes (DR-249), with when
+        and how it arrived (`imported_at`, `source`), or None."""
+        found = []
         row = self._db.execute(
             "SELECT imported_at, source, record_json FROM openshell_policies "
             "WHERE identity_kind = ? AND identity_value = ? ORDER BY policy_id DESC LIMIT 1",
             (kind, value),
         ).fetchone()
-        if row is None:
+        if row is not None:
+            found.append((row["imported_at"], row["source"], row["record_json"]))
+        for sandbox in self._sandbox_names(kind, value):
+            row = self._db.execute(
+                "SELECT received_at, record_json FROM openshell_sandbox_policies "
+                "WHERE sandbox = ? ORDER BY policy_id DESC LIMIT 1",
+                (sandbox,),
+            ).fetchone()
+            if row is not None:
+                found.append((row["received_at"], "collector", row["record_json"]))
+        if not found:
             return None
-        return {**json.loads(row["record_json"]), "imported_at": row["imported_at"], "source": row["source"]}
+        at, source, record = max(found, key=lambda item: item[0])
+        return {**json.loads(record), "imported_at": at, "source": source}
+
+    def record_openshell_policy(self, sandbox: str, raw: bytes) -> dict[str, Any]:
+        """A policy revision `railmon openshell` read from OpenShell's
+        gateway (`policy get --full -o json`) for one sandbox (DR-249).
+        Read as an import is (`parse_policy`): only endpoint fields are
+        kept, and a body that isn't a policy is refused and stores nothing."""
+        osp.check_sandbox(sandbox)
+        record = osp.parse_policy(raw)
+        with self._write_transaction():
+            at = self._receive_time()
+            self._db.execute(
+                "INSERT INTO openshell_sandbox_policies (sandbox, received_at, record_json) VALUES (?, ?, ?)",
+                (sandbox, at, json.dumps(record, ensure_ascii=False, sort_keys=True)),
+            )
+            return {"sandbox": sandbox, "received_at": at, "revision": record["revision"],
+                    "digest": record["digest"], "endpoints": len(record["endpoints"])}
+
+    def record_openshell_denials(self, sandbox: str, body: Any) -> dict[str, Any]:
+        """Denials `railmon openshell` parsed from one sandbox's log, and the
+        span it couldn't show was complete (DR-249, design §4.2). A line
+        posted again (the poll windows overlap) is stored once. Rows older
+        than `OPENSHELL_DENIAL_RETENTION` go. A denial is OpenShell's report,
+        not a violation: nothing here changes a guardrail's state (Lebin's
+        §7 Q1 is open)."""
+        osp.check_sandbox(sandbox)
+        batch = osp.parse_denials(body)
+        with self._write_transaction():
+            now = self._receive_time()
+            before = self._db.total_changes
+            self._db.executemany(
+                """INSERT OR IGNORE INTO openshell_denials
+                       (sandbox, at, line_hash, kind, host, port, method, path, binary, policy, reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [(sandbox, d["at"], d["hash"], d["kind"], d["host"], d["port"], d["method"],
+                  d["path"], d["binary"], d["policy"], d["reason"]) for d in batch["denials"]],
+            )
+            stored = self._db.total_changes - before
+            partial = batch["partial"]
+            if partial is not None:
+                self._db.execute(
+                    "INSERT INTO openshell_denial_gaps (sandbox, received_at, gap_from, gap_to, reasons_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (sandbox, now, partial["from"], partial["to"], json.dumps(partial["reasons"])),
+                )
+            cutoff = self._receive_time(_instant(now) - OPENSHELL_DENIAL_RETENTION)
+            self._db.execute("DELETE FROM openshell_denials WHERE at < ?", (cutoff,))
+            self._db.execute("DELETE FROM openshell_denial_gaps WHERE gap_to < ?", (cutoff,))
+            return {"sandbox": sandbox, "stored": stored, "duplicates": len(batch["denials"]) - stored,
+                    "partial": partial is not None}
+
+    def _openshell_denials_locked(self, kind: str, value: str, allowed_hosts: list[str] | None) -> dict[str, Any] | None:
+        """**Blocked by OpenShell** (design §4.3): the last 24 h of denials
+        for the agent's sandboxes, grouped by host, port and binary, hosts
+        outside the guardrail (`allowed_hosts`, the version in force's or
+        the proposal's; None when there is neither) first, then the newest.
+        With the spans a batch couldn't show were complete. None when the
+        collector has posted nothing for any of its sandboxes in that time."""
+        sandboxes = self._sandbox_names(kind, value)
+        if not sandboxes:
+            return None
+        since = self._receive_time(_instant(self._receive_time()) - OPENSHELL_DENIALS_SHOWN)
+        marks = ",".join("?" * len(sandboxes))
+        rows = self._db.execute(
+            f"SELECT * FROM openshell_denials WHERE sandbox IN ({marks}) AND at >= ? ORDER BY at DESC",
+            (*sandboxes, since),
+        ).fetchall()
+        gaps = self._db.execute(
+            f"SELECT gap_from, gap_to, reasons_json FROM openshell_denial_gaps "
+            f"WHERE sandbox IN ({marks}) AND gap_to >= ? ORDER BY gap_to DESC LIMIT 20",
+            (*sandboxes, since),
+        ).fetchall()
+        if not rows and not gaps:
+            return None
+        groups: dict[tuple[Any, Any, Any], dict[str, Any]] = {}
+        for row in rows:
+            key = (row["host"], row["port"], row["binary"])
+            group = groups.get(key)
+            if group is None:
+                host = g.normalize_host(row["host"])
+                group = groups[key] = {
+                    "host": row["host"], "port": row["port"], "binary": row["binary"],
+                    "count": 0, "last_at": row["at"], "requests": [], "reasons": [],
+                    "outside_guardrail": None if allowed_hosts is None or host is None
+                    else not g.host_allowed(host, allowed_hosts),
+                }
+            group["count"] += 1
+            request = f"{row['method']} {row['path']}" if row["method"] else None
+            if request and request not in group["requests"] and len(group["requests"]) < 5:
+                group["requests"].append(request)
+            if row["reason"] and row["reason"] not in group["reasons"] and len(group["reasons"]) < 3:
+                group["reasons"].append(row["reason"])
+        ordered = sorted(groups.values(), key=lambda grp: grp["last_at"], reverse=True)
+        ordered.sort(key=lambda grp: grp["outside_guardrail"] is not True)
+        return {
+            "groups": ordered[:OPENSHELL_DENIAL_GROUPS_SHOWN],
+            "more_groups": max(0, len(ordered) - OPENSHELL_DENIAL_GROUPS_SHOWN),
+            "partial": [{"from": gap["gap_from"], "to": gap["gap_to"], "reasons": json.loads(gap["reasons_json"])}
+                        for gap in gaps],
+        }
 
     def _openshell_policy_view_locked(self, kind: str, value: str) -> dict[str, Any] | None:
         """The Egress line's OpenShell rows (DR-194 §4.3): the newest
@@ -1432,6 +1593,13 @@ class GuardrailCustody:
                 "data_actions_offer_available": self._data_actions_offer_available_locked(kind, value),
                 "egress": self._egress_locked(kind, value),
                 "openshell_policy": self._openshell_policy_view_locked(kind, value),
+                "openshell_denials": self._openshell_denials_locked(
+                    kind, value,
+                    json.loads(active["contract_json"])["rules"]["out_of_spec_calls"]["allowed_hosts"]
+                    if active is not None else
+                    proposal["guardrail"]["rules"]["out_of_spec_calls"]["allowed_hosts"]
+                    if proposal is not None and proposal.get("guardrail") is not None else None,
+                ),
                 **summary,
                 "active": self._version_view(active, active=True) if active is not None else None,
                 "rows": rows,

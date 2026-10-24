@@ -1,0 +1,47 @@
+{
+ "denials": [
+  {
+   "at": "2026-10-24T19:09:47.502Z",
+   "hash": "fcc46c8ce5dd1d8cecb1da2ade36f1bd",
+   "kind": "http",
+   "host": "api.github.com",
+   "port": 443,
+   "method": "POST",
+   "path": "/markdown",
+   "binary": null,
+   "policy": "github_api",
+   "reason": "L7_REQUEST deny POST api.github.com:443/markdown reason=POST /markdown not permitted by policy"
+  },
+  {
+   "at": "2026-10-24T19:09:47.507Z",
+   "hash": "e833ca0df9c4ee9290542f5df28dbe94",
+   "kind": "net",
+   "host": "example.org",
+   "port": 443,
+   "method": null,
+   "path": null,
+   "binary": "/usr/local/bin/python3.13",
+   "policy": null,
+   "reason": "transparent_tcp_policy_denied"
+  },
+  {
+   "at": "2026-10-24T19:09:47.509Z",
+   "hash": "4ff7c18b3ec55aae677ee8bc80e58519",
+   "kind": "net",
+   "host": "169.254.169.254",
+   "port": 80,
+   "method": null,
+   "path": null,
+   "binary": "/usr/local/bin/python3.13",
+   "policy": null,
+   "reason": "transparent_tcp_policy_denied"
+  }
+ ],
+ "partial": {
+  "from": null,
+  "to": "2026-10-24T19:09:27.081Z",
+  "reasons": [
+   "first_poll"
+  ]
+ }
+}

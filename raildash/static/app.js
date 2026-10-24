@@ -1378,9 +1378,11 @@ function renderOpenshellPolicy(agentRef, policy, offerImport, refresh) {
     const revision = policy.revision ? ` revision ${policy.revision}` : "";
     // Past the stale window an import may no longer be what OpenShell
     // enforces, so it is dated rather than shown as now (design §5).
+    // Imported by the user (DR-248), or read by `railmon openshell` (DR-249).
+    const how = policy.source === "collector" ? "read by the collector" : "imported";
     const when = policy.stale
-      ? `as of ${fmtDateTime(policy.imported_at)}, when it was imported`
-      : `imported ${fmtDateTime(policy.imported_at)}`;
+      ? `as of ${fmtDateTime(policy.imported_at)}, when it was ${how}`
+      : `${how} ${fmtDateTime(policy.imported_at)}`;
     section.append(el("p", "muted", `${source}${revision}, ${when} — declared by the operator`));
     const list = el("ul", "guardrail-openshell-endpoints");
     policy.endpoints.forEach((endpoint) => list.append(el("li", null, describeOpenshellEndpoint(endpoint))));
@@ -1388,6 +1390,52 @@ function renderOpenshellPolicy(agentRef, policy, offerImport, refresh) {
     section.append(list);
   }
   if (offerImport) section.append(renderOpenshellImport(agentRef, Boolean(policy), refresh));
+  return section;
+}
+
+// DR-249 (design §4.3): what OpenShell's supervisor refused, as
+// `railmon openshell` read it from the sandbox's log. Reported by OpenShell,
+// never merged into what RailMon observed, and not a violation: nothing left
+// the sandbox.
+const OPENSHELL_PARTIAL_WORDS = {
+  first_poll: "the collector started",
+  gap: "older lines had left OpenShell's log",
+  full_buffer: "OpenShell's log was full",
+  poll_failed: "a poll failed",
+};
+
+function renderOpenshellDenials(denials) {
+  const section = el("section", "guardrail-openshell-denials");
+  section.dataset.key = "openshell-denials";
+  section.append(el("h5", null, "Blocked by OpenShell (last 24 h)"));
+  section.append(el("p", "muted",
+    "Reported by OpenShell's supervisor. A denial isn't a violation: nothing left the sandbox."));
+  denials.partial.forEach((span) => {
+    const from = span.from ? fmtDateTime(span.from) : "the collector's start";
+    section.append(el("p", "hint", `Denials may be missing between ${from} and ${fmtDateTime(span.to)} ` +
+      `(${span.reasons.map((reason) => OPENSHELL_PARTIAL_WORDS[reason] || reason).join(", ")}).`));
+  });
+  if (!denials.groups.length) {
+    section.append(el("p", "muted", "No denials."));
+    return section;
+  }
+  const list = el("ul", "guardrail-openshell-denial-list");
+  denials.groups.forEach((group) => {
+    const item = el("li");
+    const where = `${group.host || "(no host)"}${group.port ? `:${group.port}` : ""}`;
+    item.append(el("code", null, where));
+    const parts = [group.binary || "binary not logged",
+      `${group.count} time${group.count === 1 ? "" : "s"}, last ${fmtDateTime(group.last_at)}`];
+    if (group.requests.length) parts.push(group.requests.join(", "));
+    if (group.reasons.length) parts.push(group.reasons.join("; "));
+    item.append(el("span", "muted", ` · ${parts.join(" · ")}`));
+    if (group.outside_guardrail) {
+      item.append(el("span", "guardrail-egress-open", " — tried an out-of-spec host; OpenShell blocked it"));
+    }
+    list.append(item);
+  });
+  section.append(list);
+  if (denials.more_groups) section.append(el("p", "muted", `and ${denials.more_groups} more`));
   return section;
 }
 
@@ -2058,6 +2106,7 @@ async function loadGuardrails(focusKey = null) {
     if (contained || detail.openshell_policy) {
       card.append(renderOpenshellPolicy(detail.agent_ref, detail.openshell_policy, contained, refresh));
     }
+    if (detail.openshell_denials) card.append(renderOpenshellDenials(detail.openshell_denials));
     if (detail.active) {
       card.append(renderGuardrailRules(detail.rules));
       if (!detail.active.guardrail.rules.egress_containment && detail.egress) {
