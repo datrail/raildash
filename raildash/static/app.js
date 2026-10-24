@@ -1113,10 +1113,10 @@ async function drawAspAlignments(focusKey, focusAction) {
   [...openAspEvidence.keys()].forEach((key) => {
     if (!latest.has(key)) openAspEvidence.delete(key);
   });
-  // A poll that changes nothing leaves the panel alone, so a selection or a
-  // find-in-page match in an open evidence view survives it.
   // Counts finished draws, swapped or left alone; the browser tests wait on it.
   body.dataset.draws = String(Number(body.dataset.draws || 0) + 1);
+  // A poll that changes nothing leaves the panel alone, so a selection or a
+  // find-in-page match in an open evidence view survives it.
   const unchanged = panel.childNodes.length === body.childNodes.length
     && [...panel.childNodes].every((node, index) => node.isEqualNode(body.childNodes[index]));
   if (focusKey === null && unchanged) return;
