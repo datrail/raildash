@@ -1239,8 +1239,21 @@ function listOrNone(values, describe = (v) => v) {
   return values && values.length ? values.map(describe).join(", ") : "none";
 }
 
-function describePort(entry) {
-  return `${entry.protocol}/${entry.addr || "any address"}/${entry.port}`;
+// The listeners a proposal for an agent in an OpenShell sandbox allows
+// (raildash.guardrail.OPENSHELL_DNS_ENTRIES): OpenShell's own DNS. Named so
+// only for an agent OpenShell contains; elsewhere 127.0.0.53:53 is, say,
+// systemd-resolved's.
+const OPENSHELL_DNS_ADDR = "127.0.0.53";
+
+function describePort(entry, openshell = false) {
+  const dns = openshell && entry.addr === OPENSHELL_DNS_ADDR && entry.port === 53 ? " (OpenShell's DNS)" : "";
+  return `${entry.protocol}/${entry.addr || "any address"}/${entry.port}${dns}`;
+}
+
+// Whether an egress reading (the proposal's, or a detail's `egress.reading`)
+// says OpenShell enforces this agent's allow-list.
+function openshellEnforced(reading) {
+  return Boolean(reading && reading.level === "allow_list_enforced" && reading.enforcer === "openshell");
 }
 
 // The glob every proposal seeds (raildash.guardrail.BYTECODE_CACHE_ENTRY).
@@ -1253,7 +1266,7 @@ function describeSavedFile(entry) {
 }
 
 // What a version allows, rule by rule, in words.
-function renderGuardrailPolicy(rules) {
+function renderGuardrailPolicy(rules, openshell = false) {
   const dl = el("dl", "guardrail-policy");
   const add = (term, text) => dl.append(el("dt", null, term), el("dd", null, text));
   const caps = Object.entries(rules.uploads.max_request_bytes || {});
@@ -1261,7 +1274,7 @@ function renderGuardrailPolicy(rules) {
   if (caps.length) add("Size caps", caps.map(([host, cap]) => `${host} ≤ ${fmtBytes(cap)}`).join(", "));
   if (rules.uploads.denied_tool_calls.length) add("Denied tool calls", rules.uploads.denied_tool_calls.join(", "));
   add("Saved files", listOrNone(rules.saved_files.allowed, describeSavedFile));
-  add("Service ports", listOrNone(rules.service_ports.allowed, describePort));
+  add("Service ports", listOrNone(rules.service_ports.allowed, (entry) => describePort(entry, openshell)));
   add("Hosts it may call", listOrNone(rules.out_of_spec_calls.allowed_hosts));
   add("MCP servers", listOrNone(rules.out_of_spec_calls.allowed_mcp_servers));
   // DR-205: what each MCP tool may do with data (a v2 version only).
@@ -1697,7 +1710,7 @@ function renderGuardrailProposal(proposal, refresh) {
     "Proposed from the locked baseline: what it already did is allowed (plus Python's bytecode caches, and a " +
     "file written under a fresh uuid each time by its name), and nothing is " +
     "checked until you adopt it. Every line is shown so you can see what it approves."));
-  section.append(renderGuardrailPolicy(proposal.guardrail.rules));
+  section.append(renderGuardrailPolicy(proposal.guardrail.rules, openshellEnforced(proposal.egress)));
   section.append(renderDataActionsBlocked(proposal.data_actions_blocked));
   const emptyBecause = Object.entries(proposal.empty_because || {});
   if (emptyBecause.length) {
@@ -1939,7 +1952,8 @@ async function loadGuardrails(focusKey = null) {
       const policy = el("details", "guardrail-active-policy");
       policy.dataset.key = "policy";
       policy.append(el("summary", null, `What ${detail.active.guardrail.version} allows`));
-      policy.append(renderGuardrailPolicy(detail.active.guardrail.rules));
+      policy.append(renderGuardrailPolicy(detail.active.guardrail.rules,
+        openshellEnforced(detail.egress && detail.egress.reading)));
       card.append(policy);
       const actions = el("div", "asp-actions");
       actions.append(renderGuardrailVersions(detail, refresh));

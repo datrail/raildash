@@ -1656,6 +1656,15 @@ def evaluate_data_actions(
 # hides data in a file named like a bytecode cache, in a __pycache__
 # directory, isn't flagged under it.
 BYTECODE_CACHE_ENTRY: dict[str, Any] = {"path": "**/__pycache__/*.pyc"}
+# DR-247 (DR-194 M1): OpenShell answers a sandbox's DNS itself, on
+# 127.0.0.53:53 inside the agent's own container. RailMon lists those
+# listeners, since it observed them, but they are the enforcer's, not the
+# agent's service ports, so the proposal for an agent OpenShell contains
+# allows them. app.js labels them "OpenShell's DNS".
+OPENSHELL_DNS_ENTRIES: tuple[dict[str, Any], ...] = (
+    {"protocol": "tcp", "addr": "127.0.0.53", "port": 53},
+    {"protocol": "udp", "addr": "127.0.0.53", "port": 53},
+)
 
 
 def propose_guardrail(
@@ -1713,9 +1722,13 @@ def propose_guardrail(
     elif files.get("status") != "ABSENT":
         empty_because["saved_files.allowed"] = _why_empty(files)
 
+    egress = egress_reading(attributes.get(EGRESS_ATTRIBUTE))
+    ports: list[dict[str, Any]] = []
+    if egress is not None and egress["level"] == "allow_list_enforced" and egress.get("enforcer") == "openshell":
+        ports = [dict(entry) for entry in OPENSHELL_DNS_ENTRIES]
     listeners = attributes.get(LISTENERS_ATTRIBUTE) or {}
     if listeners.get("status") in ("ANSWERED", "PARTIAL") and isinstance(listeners.get("value"), list):
-        listed, _ = _listener_violations(listeners["value"], [], source)
+        listed, _ = _listener_violations(listeners["value"], ports, source)
         would_be.extend(listed)
 
     declared_hosts, declared_servers = _declared_lists(attributes)
@@ -1744,7 +1757,7 @@ def propose_guardrail(
                 "denied_tool_calls": [],
             },
             "saved_files": {"allowed": saved},
-            "service_ports": {"allowed": []},
+            "service_ports": {"allowed": ports},
             "out_of_spec_calls": {
                 "allowed_hosts": declared_hosts,
                 "allowed_mcp_servers": declared_servers,
@@ -1755,7 +1768,6 @@ def propose_guardrail(
     # DR-207 §4.4: containment is required only when the baseline was
     # contained, so adopting never starts Violated, and an agent that was
     # contained gets a regression alarm.
-    egress = egress_reading(attributes.get(EGRESS_ATTRIBUTE))
     if egress is not None and egress["contained"]:
         guardrail["rules"][EGRESS] = {"require": "contained"}
         guardrail["guardrail_contract_version"] = contract_version(guardrail["rules"])

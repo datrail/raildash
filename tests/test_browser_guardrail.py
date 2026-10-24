@@ -436,3 +436,51 @@ def test_the_egress_line_and_require_containment(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_the_proposal_labels_openshells_dns(tmp_path):
+    """DR-247: the two listeners a proposal allows for an agent in an
+    OpenShell sandbox say what they are."""
+    from test_guardrail_egress import OPENSHELL_DNS, egress
+
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    value = asp(listeners=[DEMO_LISTENER, *OPENSHELL_DNS], egress_containment=egress("allow_list_enforced"))
+    store.make_baseline(store.load_asp(json.dumps(value).encode())["asp_id"], "v1.0")
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            proposal = page.locator("#guardrail-body .guardrail-card .guardrail-proposal")
+            expect(proposal).to_contain_text("tcp/127.0.0.53/53 (OpenShell's DNS)", timeout=TIMEOUT)
+            expect(proposal).to_contain_text("udp/127.0.0.53/53 (OpenShell's DNS)")
+            expect(proposal.locator(".guardrail-would-be")).to_contain_text("tcp/127.0.0.1/8443")
+            expect(proposal.locator(".guardrail-would-be")).not_to_contain_text("127.0.0.53")
+            # Adopted, the version in force says the same.
+            card = page.locator("#guardrail-body .guardrail-card")
+            proposal.get_by_role("button", name="Adopt", exact=True).click()
+            card.locator(".guardrail-active-policy > summary").click(timeout=TIMEOUT)
+            expect(card.locator(".guardrail-active-policy")).to_contain_text(
+                "udp/127.0.0.53/53 (OpenShell's DNS)")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
