@@ -679,6 +679,12 @@ async function renderDriftExplained(aspId) {
 // the top.
 const openAspEvidence = new Map();
 
+// Drop a poll's panel that was built before an open or hide click. An explicit
+// load (an action's, a pager's) still draws, and the next poll shows the view.
+function supersedeAspPoll() {
+  if (aspKeyedLoads === 0) aspAlignmentGeneration++;
+}
+
 function fetchAspBundle(aspId) {
   return getJSONWithToken(`/api/asps/${encodeURIComponent(aspId)}/bundle`);
 }
@@ -711,7 +717,7 @@ async function renderInspectToggle(key, aspId) {
       view = null;
       openAspEvidence.delete(key);
       button.textContent = "Inspect evidence";
-      aspAlignmentGeneration++;  // a panel built before this click would reopen it
+      supersedeAspPoll();  // a panel built before this click would reopen it
       return;
     }
     if (error) error.remove();
@@ -721,7 +727,7 @@ async function renderInspectToggle(key, aspId) {
       openAspEvidence.set(key, open);
       if (wrap.isConnected) {
         show(open);
-        aspAlignmentGeneration++;  // a panel built before the bundle came would close it
+        supersedeAspPoll();  // a panel built before the bundle came would close it
       } else {
         // A redraw replaced this card while the bundle loaded; the next draw
         // shows it on the card now on screen.

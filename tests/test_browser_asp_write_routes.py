@@ -214,9 +214,10 @@ def test_asp_write_actions_drive_the_full_custody_flow_from_the_ui(tmp_path):
             # A poll that changes nothing keeps the very same view, so a
             # selection in it survives.
             view.evaluate("node => { node.sameNode = true; }")
-            with page.expect_response(lambda response: "/api/alignments" in response.url):
+            with page.expect_response(lambda response: "/api/asps/history" in response.url):
                 page.locator("#refresh").click()
-            page.wait_for_load_state("networkidle")
+            # The history page is the draw's last fetch; the swap follows it.
+            page.evaluate("() => new Promise((done) => setTimeout(done, 200))")
             assert view.evaluate("node => node.sameNode") is True
             some_card = page.locator(".asp-state-card").first
             some_card.get_by_role("button", name="Hide evidence").click()
