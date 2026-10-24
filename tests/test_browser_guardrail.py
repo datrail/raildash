@@ -469,6 +469,12 @@ def test_the_proposal_labels_openshells_dns(tmp_path):
             expect(proposal).to_contain_text("udp/127.0.0.53/53 (OpenShell's DNS)")
             expect(proposal.locator(".guardrail-would-be")).to_contain_text("tcp/127.0.0.1/8443")
             expect(proposal.locator(".guardrail-would-be")).not_to_contain_text("127.0.0.53")
+            # Adopted, the version in force says the same.
+            card = page.locator("#guardrail-body .guardrail-card")
+            proposal.get_by_role("button", name="Adopt", exact=True).click()
+            card.locator(".guardrail-active-policy > summary").click(timeout=TIMEOUT)
+            expect(card.locator(".guardrail-active-policy")).to_contain_text(
+                "udp/127.0.0.53/53 (OpenShell's DNS)")
             assert errors == []
             browser.close()
     finally:
