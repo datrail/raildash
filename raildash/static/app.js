@@ -236,6 +236,7 @@ function setConn(stateName, text) {
 const ASP_DRIFT_PAGE_SIZE = 20;
 let lastAspAnnouncement = null;
 let aspAlignmentGeneration = 0;
+let aspKeyedLoads = 0;
 
 function identityLabel(identity) {
   const value = identity && identity.value;
@@ -691,7 +692,7 @@ async function renderInspectToggle(key, aspId) {
   let pending = false;
   const show = (open) => {
     view = el("div", "asp-bundle-view");
-    view.dataset.scrollTop = String(open.scrollTop);
+    view.dataset.evidenceKey = key;
     view.append(el("pre", null, JSON.stringify(open.bundle, null, 2)));
     view.addEventListener("scroll", () => { open.scrollTop = view.scrollTop; });
     wrap.append(view);
@@ -710,6 +711,7 @@ async function renderInspectToggle(key, aspId) {
       view = null;
       openAspEvidence.delete(key);
       button.textContent = "Inspect evidence";
+      aspAlignmentGeneration++;  // a panel built before this click would reopen it
       return;
     }
     if (error) error.remove();
@@ -719,9 +721,10 @@ async function renderInspectToggle(key, aspId) {
       openAspEvidence.set(key, open);
       if (wrap.isConnected) {
         show(open);
+        aspAlignmentGeneration++;  // a panel built before the bundle came would close it
       } else {
-        // A redraw replaced this card while the bundle loaded; draw again so
-        // the card on screen shows it.
+        // A redraw replaced this card while the bundle loaded; the next draw
+        // shows it on the card now on screen.
         loadAspAlignments().catch((err) => console.error(err));
       }
     } catch (err) {
@@ -890,11 +893,23 @@ async function renderAspHistory(versionsByIdentity, focusAction) {
 }
 
 async function loadAspAlignments(focusKey = null, focusAction = null) {
+  if (focusKey === null) return drawAspAlignments(null, null);
+  aspKeyedLoads++;
+  try {
+    return await drawAspAlignments(focusKey, focusAction);
+  } finally {
+    aspKeyedLoads--;
+  }
+}
+
+async function drawAspAlignments(focusKey, focusAction) {
   const body = $("asp-alignment-body");
   // Polling must not destroy a keyboard user's focused command or pager.
   // Explicit pager navigation, and a write action's own refresh, supply a
   // focusKey and are allowed to rebuild.
   if (focusKey === null && body.contains(document.activeElement)) return;
+  // Nor does a poll cancel an explicit load that is still running.
+  if (focusKey === null && aspKeyedLoads > 0) return;
   if (staticDemo) {
     body.replaceChildren(el("p", "muted", "ASP alignment is available in the live local dashboard."));
     return;
@@ -902,7 +917,7 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
   // The new panel is built off screen and swapped in once complete, so the
   // page doesn't shrink and lose its scroll position while the poll fetches.
   const generation = ++aspAlignmentGeneration;
-  const panel = document.createDocumentFragment();
+  const panel = el("div");
 
   const asps = await fetchAllPages("/api/asps");
   if (generation !== aspAlignmentGeneration) return;  // a later load draws instead
@@ -952,6 +967,9 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
   let focusTarget = null;
   for (const { key, asp, alignment, drift } of states) {
     const card = el("article", "asp-state-card");
+    // The card's actions act on this ASP, so a later one never counts as an
+    // unchanged card that a poll can leave in place.
+    card.dataset.aspId = asp.asp_id;
     const head = el("div", "asp-state-head");
     const title = el("div");
     title.append(el("h3", null, identityLabel(alignment.asp.agent_identity)));
@@ -1083,9 +1101,15 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
   [...openAspEvidence.keys()].forEach((key) => {
     if (!latest.has(key)) openAspEvidence.delete(key);
   });
-  body.replaceChildren(panel);
+  // A poll that changes nothing leaves the panel alone, so a selection or a
+  // find-in-page match in an open evidence view survives it.
+  const unchanged = panel.childNodes.length === body.childNodes.length
+    && [...panel.childNodes].every((node, index) => node.isEqualNode(body.childNodes[index]));
+  if (focusKey === null && unchanged) return;
+  body.replaceChildren(...panel.childNodes);
   body.querySelectorAll(".asp-bundle-view").forEach((view) => {
-    view.scrollTop = Number(view.dataset.scrollTop);
+    const open = openAspEvidence.get(view.dataset.evidenceKey);
+    if (open) view.scrollTop = open.scrollTop;
   });
   const announcement = states
     .map(({ alignment }) => (
