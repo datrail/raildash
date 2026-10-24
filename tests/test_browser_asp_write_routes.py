@@ -181,6 +181,37 @@ def test_asp_write_actions_drive_the_full_custody_flow_from_the_ui(tmp_path):
             some_card.get_by_role("button", name="Inspect evidence").click()
             page.wait_for_selector(".asp-bundle-view")
             assert "bundle_id" in some_card.locator(".asp-bundle-view").inner_text()
+
+            # DR-245: the poll's redraw keeps the view open, scrolled where it
+            # was, without fetching the bundle again.
+            bundle_fetches: list[str] = []
+            page.on(
+                "request",
+                lambda request: bundle_fetches.append(request.url)
+                if request.url.endswith("/bundle") else None,
+            )
+            view = page.locator(".asp-bundle-view")
+            view.evaluate("node => { node.scrollTop = 30; node.dataset.drawnBefore = '1'; }")
+            assert view.evaluate("node => node.scrollTop") == 30
+            # The panel is swapped whole, never emptied while the poll fetches,
+            # so the page keeps its length and scroll position.
+            page.evaluate(
+                "() => { const body = document.getElementById('asp-alignment-body');"
+                " window.aspPanelEmptied = false;"
+                " new MutationObserver(() => { if (!body.childElementCount)"
+                " window.aspPanelEmptied = true; }).observe(body, { childList: true }); }"
+            )
+            with page.expect_response(lambda response: "/api/alignments" in response.url):
+                page.locator("#refresh").click()
+            page.wait_for_function(
+                "() => { const v = document.querySelector('.asp-bundle-view');"
+                " return v && !v.dataset.drawnBefore; }"
+            )
+            assert view.count() == 1
+            assert view.evaluate("node => node.scrollTop") == 30
+            assert bundle_fetches == []
+            assert page.evaluate("() => window.aspPanelEmptied") is False
+            some_card = page.locator(".asp-state-card").first
             some_card.get_by_role("button", name="Hide evidence").click()
             assert page.locator(".asp-bundle-view").count() == 0
 
