@@ -509,3 +509,12 @@ def test_the_collector_routes_are_token_gated(store, monkeypatch):
     assert client.post("/v1/openshell/sandboxes/bad%20name/policy", content=COLLECTOR_POLICY,
                        headers=headers).status_code == 422
     assert client.post(policy, content=b'{"version": 1}', headers=headers).status_code == 422
+
+
+def test_only_the_newest_collector_policies_are_kept(store):
+    from raildash import guardrail_store
+
+    for _ in range(guardrail_store.OPENSHELL_POLICIES_KEPT + 5):
+        store.record_openshell_policy(SANDBOX, COLLECTOR_POLICY)
+    count = store._db.execute("SELECT count(*) FROM openshell_sandbox_policies").fetchone()[0]  # noqa: SLF001
+    assert count == guardrail_store.OPENSHELL_POLICIES_KEPT

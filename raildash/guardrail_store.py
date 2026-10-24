@@ -111,6 +111,10 @@ MAX_GUARDRAIL_EVENTS_SHOWN = 100
 OPENSHELL_DENIALS_SHOWN = timedelta(hours=24)
 OPENSHELL_DENIAL_RETENTION = timedelta(days=7)
 OPENSHELL_DENIAL_GROUPS_SHOWN = 50
+# The newest this many denials make the groups, so an agent retrying a
+# blocked call all day can't slow the panel; counts then are lower bounds.
+OPENSHELL_DENIALS_READ = 20_000
+OPENSHELL_POLICIES_KEPT = 20
 OVERFLOW_RULE = "(overflow)"
 OVERFLOW_ITEM = "(overflow)"
 # Identity columns of a mark that applies to every agent.
@@ -241,6 +245,7 @@ CREATE TABLE IF NOT EXISTS openshell_denials (
     UNIQUE(sandbox, line_hash)
 );
 CREATE INDEX IF NOT EXISTS openshell_denials_sandbox_at ON openshell_denials(sandbox, at);
+CREATE INDEX IF NOT EXISTS openshell_denials_at ON openshell_denials(at);
 CREATE TABLE IF NOT EXISTS openshell_denial_gaps (
     gap_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     sandbox      TEXT NOT NULL,
@@ -1081,6 +1086,14 @@ class GuardrailCustody:
                 "INSERT INTO openshell_sandbox_policies (sandbox, received_at, record_json) VALUES (?, ?, ?)",
                 (sandbox, at, json.dumps(record, ensure_ascii=False, sort_keys=True)),
             )
+            # The collector posts an unchanged policy again every 30 minutes,
+            # so only the newest few rows are worth keeping.
+            self._db.execute(
+                "DELETE FROM openshell_sandbox_policies WHERE sandbox = ? AND policy_id NOT IN "
+                "(SELECT policy_id FROM openshell_sandbox_policies WHERE sandbox = ? "
+                "ORDER BY policy_id DESC LIMIT ?)",
+                (sandbox, sandbox, OPENSHELL_POLICIES_KEPT),
+            )
             return {"sandbox": sandbox, "received_at": at, "revision": record["revision"],
                     "digest": record["digest"], "endpoints": len(record["endpoints"])}
 
@@ -1130,8 +1143,8 @@ class GuardrailCustody:
         since = self._receive_time(_instant(self._receive_time()) - OPENSHELL_DENIALS_SHOWN)
         marks = ",".join("?" * len(sandboxes))
         rows = self._db.execute(
-            f"SELECT * FROM openshell_denials WHERE sandbox IN ({marks}) AND at >= ? ORDER BY at DESC",
-            (*sandboxes, since),
+            f"SELECT * FROM openshell_denials WHERE sandbox IN ({marks}) AND at >= ? ORDER BY at DESC LIMIT ?",
+            (*sandboxes, since, OPENSHELL_DENIALS_READ),
         ).fetchall()
         gaps = self._db.execute(
             f"SELECT gap_from, gap_to, reasons_json FROM openshell_denial_gaps "
