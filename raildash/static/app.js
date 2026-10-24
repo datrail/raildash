@@ -235,6 +235,8 @@ function setConn(stateName, text) {
 
 const ASP_DRIFT_PAGE_SIZE = 20;
 let lastAspAnnouncement = null;
+let aspAlignmentGeneration = 0;
+let aspKeyedLoads = 0;
 
 function identityLabel(identity) {
   const value = identity && identity.value;
@@ -670,32 +672,93 @@ async function renderDriftExplained(aspId) {
   return wrapper;
 }
 
-function renderInspectToggle(aspId) {
-  const wrap = el("div");
+// Open evidence views, by agent identity. The poll redraws the alignment panel
+// every five seconds; this keeps a view open across that, with its bundle (an
+// ASP's stored bytes never change, so it isn't fetched again) and where it
+// was scrolled to. A later ASP for the same agent shows its own bundle, from
+// the top.
+const openAspEvidence = new Map();
+
+// A click lands on the panel on screen while another may be being built, so
+// each swap, and each bundle that arrives, matches every toggle on screen to
+// this map.
+function syncAspEvidence(root, key = null) {
+  root.querySelectorAll(".asp-inspect").forEach((wrap) => {
+    if (key === null || wrap.dataset.evidenceKey === key) wrap.syncEvidence();
+  });
+}
+
+function fetchAspBundle(aspId) {
+  return getJSONWithToken(`/api/asps/${encodeURIComponent(aspId)}/bundle`);
+}
+
+async function renderInspectToggle(key, aspId) {
+  const wrap = el("div", "asp-inspect");
+  wrap.dataset.evidenceKey = key;
   const button = el("button", "btn btn-quiet", "Inspect evidence");
   button.type = "button";
   let view = null;
+  let error = null;
+  let pending = false;
+  const show = (open) => {
+    view = el("div", "asp-bundle-view");
+    view.dataset.evidenceKey = key;
+    view.append(el("pre", null, JSON.stringify(open.bundle, null, 2)));
+    view.addEventListener("scroll", () => { open.scrollTop = view.scrollTop; });
+    wrap.append(view);
+    button.textContent = "Hide evidence";
+  };
+  const hide = () => {
+    view.remove();
+    view = null;
+    button.textContent = "Inspect evidence";
+  };
+  wrap.syncEvidence = () => {
+    const open = openAspEvidence.get(key);
+    const wanted = Boolean(open && open.aspId === aspId);
+    if (wanted && !view) show(open);
+    if (!wanted && view) hide();
+  };
+  const fail = (message) => {
+    error = errorMessage(message);
+    wrap.append(error);
+  };
+  // Not disabled while the bundle loads: that would drop the button's focus,
+  // and the poll redraws the panel only when focus isn't in it.
   button.addEventListener("click", async () => {
+    if (pending) return;
     if (view) {
-      view.remove();
-      view = null;
-      button.textContent = "Inspect evidence";
+      openAspEvidence.delete(key);
+      hide();
       return;
     }
-    button.disabled = true;
+    if (error) error.remove();
+    pending = true;
     try {
-      const bundle = await getJSONWithToken(`/api/asps/${encodeURIComponent(aspId)}/bundle`);
-      view = el("div", "asp-bundle-view");
-      view.append(el("pre", null, JSON.stringify(bundle, null, 2)));
-      wrap.append(view);
-      button.textContent = "Hide evidence";
-    } catch (error) {
-      wrap.append(errorMessage(error.message));
+      const open = { aspId, bundle: await fetchAspBundle(aspId), scrollTop: 0 };
+      openAspEvidence.set(key, open);
+      // A redraw may have replaced this card while the bundle loaded.
+      syncAspEvidence($("asp-alignment-body"), key);
+    } catch (err) {
+      fail(err.message);
     } finally {
-      button.disabled = false;
+      pending = false;
     }
   });
   wrap.append(button);
+
+  let open = openAspEvidence.get(key);
+  if (open && open.aspId !== aspId) {
+    try {
+      open = { aspId, bundle: await fetchAspBundle(aspId), scrollTop: 0 };
+      openAspEvidence.set(key, open);
+    } catch (err) {
+      openAspEvidence.delete(key);
+      open = null;
+      fail(err.message);
+    }
+  }
+  if (open) show(open);
   return wrap;
 }
 
@@ -842,20 +905,37 @@ async function renderAspHistory(versionsByIdentity, focusAction) {
 }
 
 async function loadAspAlignments(focusKey = null, focusAction = null) {
+  if (focusKey === null) return drawAspAlignments(null, null);
+  aspKeyedLoads++;
+  try {
+    return await drawAspAlignments(focusKey, focusAction);
+  } finally {
+    aspKeyedLoads--;
+  }
+}
+
+async function drawAspAlignments(focusKey, focusAction) {
   const body = $("asp-alignment-body");
   // Polling must not destroy a keyboard user's focused command or pager.
   // Explicit pager navigation, and a write action's own refresh, supply a
   // focusKey and are allowed to rebuild.
   if (focusKey === null && body.contains(document.activeElement)) return;
-  body.replaceChildren();
+  // Nor does a poll cancel an explicit load that is still running.
+  if (focusKey === null && aspKeyedLoads > 0) return;
   if (staticDemo) {
-    body.append(el("p", "muted", "ASP alignment is available in the live local dashboard."));
+    body.replaceChildren(el("p", "muted", "ASP alignment is available in the live local dashboard."));
     return;
   }
+  // The new panel is built off screen and swapped in once complete, so the
+  // page doesn't shrink and lose its scroll position while the poll fetches.
+  const generation = ++aspAlignmentGeneration;
+  const panel = el("div");
 
   const asps = await fetchAllPages("/api/asps");
+  if (generation !== aspAlignmentGeneration) return;  // a later load draws instead
   if (!asps.length) {
-    body.append(renderAspEmptyState());
+    openAspEvidence.clear();
+    body.replaceChildren(renderAspEmptyState());
     return;
   }
 
@@ -899,6 +979,9 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
   let focusTarget = null;
   for (const { key, asp, alignment, drift } of states) {
     const card = el("article", "asp-state-card");
+    // The card's actions act on this ASP, so a later one never counts as an
+    // unchanged card that a poll can leave in place.
+    card.dataset.aspId = asp.asp_id;
     const head = el("div", "asp-state-head");
     const title = el("div");
     title.append(el("h3", null, identityLabel(alignment.asp.agent_identity)));
@@ -980,7 +1063,7 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
       card.append(baselineCommand(suggestNextVersion(versions)));
     }
 
-    card.append(renderInspectToggle(asp.asp_id));
+    card.append(await renderInspectToggle(key, asp.asp_id));
 
     if (drift && drift.change_count > 0) {
       card.append(renderDriftGroups(drift));
@@ -1017,13 +1100,32 @@ async function loadAspAlignments(focusKey = null, focusAction = null) {
         }
       }
     }
-    body.append(card);
+    panel.append(card);
   }
   const [history, historyFocus] = await renderAspHistory(
     versionsByIdentity, focusKey === "history" ? focusAction : null
   );
-  body.append(history);
+  panel.append(history);
   if (historyFocus) focusTarget = historyFocus;
+  if (generation !== aspAlignmentGeneration) return;
+  // Focus may have moved into the panel while it loaded; a poll leaves it be.
+  if (focusKey === null && body.contains(document.activeElement)) return;
+  [...openAspEvidence.keys()].forEach((key) => {
+    if (!latest.has(key)) openAspEvidence.delete(key);
+  });
+  // Counts finished draws, swapped or left alone; the browser tests wait on it.
+  body.dataset.draws = String(Number(body.dataset.draws || 0) + 1);
+  // A poll that changes nothing leaves the panel alone, so a selection or a
+  // find-in-page match in an open evidence view survives it.
+  const unchanged = panel.childNodes.length === body.childNodes.length
+    && [...panel.childNodes].every((node, index) => node.isEqualNode(body.childNodes[index]));
+  if (focusKey === null && unchanged) return;
+  body.replaceChildren(...panel.childNodes);
+  syncAspEvidence(body);
+  body.querySelectorAll(".asp-bundle-view").forEach((view) => {
+    const open = openAspEvidence.get(view.dataset.evidenceKey);
+    if (open) view.scrollTop = open.scrollTop;
+  });
   const announcement = states
     .map(({ alignment }) => (
       `${identityLabel(alignment.asp.agent_identity)}: ${statePresentation(alignment.state)[0]}`
