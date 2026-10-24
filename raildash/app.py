@@ -40,6 +40,7 @@ from .json_safety import (
 )
 from .guardrail import GuardrailValidationError
 from . import classifier_model
+from . import openshell_policy as osp
 from .store import Store
 from .asp import (
     DEFAULT_DRIFT_PAGE_SIZE,
@@ -1260,6 +1261,27 @@ async def api_require_containment(agent_ref: str, request: Request) -> dict[str,
         raise HTTPException(422, "require must be a string")
     # An unknown value is a 422 from the store's own check (`_guardrail_call`).
     return _guardrail_call(get_store().require_containment, agent_ref, require)
+
+
+@app.post(
+    "/api/guardrails/{agent_ref}/openshell-policy",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_import_openshell_policy(agent_ref: str, request: Request) -> dict[str, Any]:
+    """**Import OpenShell policy** (DR-194 M2, DR-248). The body is the file
+    as the user saved it: `openshell sandbox get <name> --policy-only`
+    (YAML), or `sandbox get -o json` / `policy get --full -o json`. Stored
+    as the agent's newest policy, endpoints only, beside its ASP; 422 with
+    what was wrong for a file that isn't a readable policy, which stores
+    nothing. The answer is the record the Egress line shows."""
+    raw = await _bounded_raw_body(request, osp.MAX_POLICY_BYTES)
+    try:
+        return await run_in_threadpool(
+            _guardrail_call, get_store().import_openshell_policy, agent_ref, raw
+        )
+    except osp.PolicyImportError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 # --------------------------------------------------------- legacy JSON routes

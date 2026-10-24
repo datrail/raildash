@@ -484,3 +484,70 @@ def test_the_proposal_labels_openshells_dns(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_an_imported_openshell_policy_shows_on_the_egress_line_and_seeds_the_proposal(tmp_path):
+    """DR-248: the import control on an agent OpenShell contains; a file
+    that isn't a policy is refused with what was wrong; OpenShell 0.1.3's
+    own `--policy-only` output then shows one row per endpoint and marks the
+    hosts it seeds into the proposal."""
+    from test_guardrail_egress import egress
+
+    fixtures = Path(__file__).parent / "fixtures" / "openshell-0.1.3"
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    value = asp(listeners=[DEMO_LISTENER], egress_containment=egress("allow_list_enforced"))
+    store.make_baseline(store.load_asp(json.dumps(value).encode())["asp_id"], "v1.0")
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            expect(card.locator(".guardrail-egress")).to_contain_text(
+                "its contents aren't visible to datRail", timeout=TIMEOUT)
+            section = card.locator(".guardrail-openshell")
+            chooser = section.locator("input[type=file]")
+            chooser.set_input_files(str(fixtures / "missing-sandbox.stderr.txt"))
+            expect(section).to_contain_text("Not imported: not an OpenShell policy but OpenShell's error output",
+                                            timeout=TIMEOUT)
+            expect(section.locator(".guardrail-openshell-endpoints")).to_have_count(0)
+            chooser.set_input_files(str(fixtures / "provider-pypi.policy-only.yaml"))
+            rows = card.locator(".guardrail-openshell-endpoints li")
+            expect(rows.first).to_be_visible(timeout=TIMEOUT)
+            expect(card.locator(".guardrail-egress")).to_contain_text("the imported policy is below")
+            expect(section).to_contain_text("OpenShell's policy, imported")
+            expect(section).to_contain_text("declared by the operator")
+            expect(rows.filter(has_text="api.github.com:443 · /usr/local")).to_contain_text(
+                "api.github.com:443 · /usr/local/bin/python3.13 · read-only · enforce")
+            expect(rows.filter(has_text="*.example.com")).to_contain_text("*.example.com:443,8443 · ")
+            expect(rows.filter(has_text="*.example.com")).to_contain_text("read-write · audit")
+            expect(rows.filter(has_text="uploads.github.com")).to_contain_text("2 rules · enforce")
+            expect(rows.filter(has_text="raw.githubusercontent.com")).to_contain_text("any traffic (L4)")
+            expect(rows.filter(has_text="pypi.org:443").first).to_contain_text("(provider fx_pypi)")
+            seed = card.locator(".guardrail-openshell-seed")
+            expect(seed).to_contain_text("Hosts it may call from OpenShell's policy (imported", timeout=TIMEOUT)
+            expect(seed).to_contain_text("api.github.com (_provider_fx_pypi, github_api)")
+            expect(card.locator(".guardrail-proposal .guardrail-policy")).to_contain_text("*.example.com")
+            expect(section.get_by_role("button", name="Import a newer policy")).to_be_visible()
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

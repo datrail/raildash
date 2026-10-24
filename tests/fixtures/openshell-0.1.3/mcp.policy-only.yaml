@@ -1,0 +1,46 @@
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /bin
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /etc
+    - /var/log
+    - /opt
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+landlock:
+  compatibility: best_effort
+network_policies:
+  docs_mcp:
+    name: docs-mcp
+    endpoints:
+      - host: mcp.example.com
+        path: /mcp
+        port: 443
+        protocol: mcp
+        enforcement: enforce
+        rules:
+          - allow:
+              method: initialize
+          - allow:
+              method: notifications/initialized
+          - allow:
+              method: tools/list
+          - allow:
+              method: tools/call
+              tool: search_docs
+          - allow:
+              method: tools/call
+              tool: read_page
+        mcp:
+          versions:
+            - '2025-03-26'
+            - '2025-11-25'
+    binaries:
+      - path: /usr/local/bin/python3.13

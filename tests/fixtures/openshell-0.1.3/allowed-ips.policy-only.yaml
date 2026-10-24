@@ -1,0 +1,40 @@
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /bin
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /etc
+    - /var/log
+    - /opt
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+landlock:
+  compatibility: best_effort
+network_policies:
+  internal_api:
+    name: internal-api
+    endpoints:
+      - host: api.corp.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+        allowed_ips:
+          - '10.20.0.0/16'
+    binaries:
+      - path: /usr/local/bin/python3.13
+  lab_subnet:
+    name: lab-subnet
+    endpoints:
+      - port: 8080
+        allowed_ips:
+          - '10.30.0.0/24'
+          - '10.31.0.0/24'
+    binaries:
+      - path: /usr/local/bin/python3.13

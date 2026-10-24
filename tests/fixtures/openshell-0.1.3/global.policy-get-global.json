@@ -1,0 +1,61 @@
+{
+  "created_at_ms": 1792869022500,
+  "hash": "57af3c5585e4fd60b1f7dce7b6d1c3bd6aba53f95afa3f24e4547257877a29c7",
+  "loaded_at_ms": 1792869022501,
+  "policy": {
+    "filesystem_policy": {
+      "include_workdir": true,
+      "read_only": [
+        "/bin",
+        "/usr",
+        "/lib",
+        "/proc",
+        "/dev/urandom",
+        "/etc",
+        "/var/log",
+        "/opt"
+      ],
+      "read_write": [
+        "/sandbox",
+        "/tmp",
+        "/dev/null"
+      ]
+    },
+    "landlock": {
+      "compatibility": "best_effort"
+    },
+    "network_policies": {
+      "pypi": {
+        "binaries": [
+          {
+            "path": "/usr/local/bin/python3.13"
+          },
+          {
+            "path": "/usr/local/bin/pip*"
+          }
+        ],
+        "endpoints": [
+          {
+            "access": "read-only",
+            "enforcement": "enforce",
+            "host": "pypi.org",
+            "port": 443,
+            "protocol": "rest"
+          },
+          {
+            "access": "read-only",
+            "enforcement": "enforce",
+            "host": "files.pythonhosted.org",
+            "port": 443,
+            "protocol": "rest"
+          }
+        ],
+        "name": "org-pypi"
+      }
+    },
+    "version": 1
+  },
+  "scope": "global",
+  "status": "loaded",
+  "version": 1
+}

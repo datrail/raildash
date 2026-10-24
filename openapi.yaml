@@ -298,6 +298,8 @@ paths:
         Each row says whether it `counts`, which version allows it
         (`allowed_by`), and whether it is a counting row Allow this alone
         could allow (`allowable`), the rows Allow all takes (DR-202).
+        `openshell_policy` is the agent's newest imported OpenShell policy, or
+        null (DR-248), and a proposal seeded from it carries `openshell`.
       parameters:
         - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
         - {$ref: '#/components/parameters/RailDashToken'}
@@ -397,6 +399,33 @@ paths:
         '404': {description: No such id}
         '409': {description: No guardrail is active, or it already requires this}
         '422': {description: require is not contained or allow_list_enforced}
+
+  /api/guardrails/{agent_ref}/openshell-policy:
+    post:
+      operationId: importOpenshellPolicy
+      summary: Import OpenShell policy - store a sandbox's network policy beside the agent's ASP
+      description: >-
+        Token-gated (DR-248, DR-194 M2). The body is the file as the user saved it: what
+        `openshell sandbox get <name> --policy-only` prints (YAML), or `sandbox get -o json` /
+        `policy get --full -o json`. Only the network endpoints and the policy's revision and
+        source are kept, so no credential field is stored. It becomes the agent's newest policy
+        (getGuardrail's `openshell_policy`) and changes no ASP, baseline or guardrail version.
+        For an agent OpenShell contains, the proposal is then seeded from it (the proposal's
+        `openshell`). A file that isn't a readable policy stores nothing.
+      parameters:
+        - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      requestBody:
+        required: true
+        content:
+          application/yaml: {schema: {type: string, maxLength: 262144}}
+          application/json: {schema: {type: object}}
+      responses:
+        '201': {description: 'The stored record: format, revision, policy_source, sandbox, digest, endpoints, imported_at, source, stale'}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such agent}
+        '413': {description: Body over 256 KiB}
+        '422': {description: Empty, or not a readable OpenShell policy; detail says what was wrong}
 
   /api/guardrail-rows/{row_id}/acknowledge:
     post:
