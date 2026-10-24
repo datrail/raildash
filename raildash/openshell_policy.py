@@ -67,6 +67,12 @@ class _Loader(yaml.SafeLoader):
         seen: set[Any] = set()
         for key_node, _ in node.value:
             key = self.construct_object(key_node, deep=deep)
+            try:
+                hash(key)
+            except TypeError:
+                raise yaml.constructor.ConstructorError(
+                    None, None, "a mapping key must be a scalar", key_node.start_mark
+                ) from None
             if key in seen:
                 raise yaml.constructor.ConstructorError(
                     None, None, f"duplicate key {key!r}", key_node.start_mark
@@ -90,15 +96,27 @@ def _load(raw: bytes) -> tuple[str, Any]:
         raise PolicyImportError(
             f"not an OpenShell policy but OpenShell's error output: {_first_line(text)[:200]}"
         )
-    if text.lstrip().startswith("{"):
-        try:
-            return "json", json.loads(text)
-        except ValueError as exc:
-            raise PolicyImportError(f"not valid JSON: {exc}") from exc
     try:
-        return "yaml", yaml.load(text, Loader=_Loader)  # noqa: S506 -- a SafeLoader subclass
-    except yaml.YAMLError as exc:
-        raise PolicyImportError(f"not valid YAML: {_first_line(str(exc))}") from exc
+        if text.lstrip().startswith("{"):
+            try:
+                return "json", json.loads(text, object_pairs_hook=_unique_keys)
+            except ValueError as exc:
+                raise PolicyImportError(f"not valid JSON: {exc}") from exc
+        try:
+            return "yaml", yaml.load(text, Loader=_Loader)  # noqa: S506 -- a SafeLoader subclass
+        except yaml.YAMLError as exc:
+            raise PolicyImportError(f"not valid YAML: {_first_line(str(exc))}") from exc
+    except RecursionError as exc:
+        raise PolicyImportError("nested too deeply to be a policy") from exc
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
 
 
 def _first_line(text: str) -> str:
@@ -120,7 +138,13 @@ def parse_policy(raw: bytes) -> dict[str, Any]:
         # (`Error: × ... sandbox not found`) reads as one YAML string.
         shown = _first_line(document) if isinstance(document, str) else type(document).__name__
         raise PolicyImportError(f"not an OpenShell policy (the file holds {shown[:120]!r})")
-    if form == "json" and "network_policies" not in document and isinstance(document.get("policy"), dict):
+    if form == "json" and "network_policies" not in document:
+        # A JSON view wraps the policy; without one (`policy get` without
+        # `--full`, say) there is nothing to read, not an empty policy.
+        if not isinstance(document.get("policy"), dict):
+            raise PolicyImportError(
+                "a JSON view with no `policy` in it (use `openshell policy get <name> --full -o json`)"
+            )
         # `sandbox get -o json` names the version `current_policy_version`,
         # `policy get -o json` names it `active_version`, and `policy get
         # --global -o json` just `version`, with `scope: global`.
@@ -142,7 +166,7 @@ def parse_policy(raw: bytes) -> dict[str, Any]:
             "(upload `openshell sandbox get <name> --policy-only`)"
         )
     version = document.get("version", 1)
-    if version != 1:
+    if isinstance(version, bool) or version != 1:
         raise PolicyImportError(f"policy version {version!r} is not one this RailDash reads (1)")
     rules = document.get("network_policies", {})
     if rules is None:
@@ -351,8 +375,9 @@ def seed_view(
     seed: Mapping[str, Any], record: Mapping[str, Any], upload_hosts: list[str]
 ) -> dict[str, Any]:
     """The proposal's `openshell`: which hosts came from the policy and from
-    which of its rules, marked with the policy's revision (or its digest,
-    for a YAML upload, which carries none) and when it was imported."""
+    which of its rules, with the policy's revision (None for a YAML upload,
+    which carries none; the panel then names it by when it was imported),
+    its digest and its import time."""
     return {
         "revision": record.get("revision"),
         "digest": record["digest"],

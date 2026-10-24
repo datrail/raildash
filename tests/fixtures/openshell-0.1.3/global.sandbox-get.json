@@ -1,8 +1,8 @@
 {
   "annotations": {
     "internal.openshell.ai/auth-epoch": "1",
-    "internal.openshell.ai/gateway-token-id": "c2640811-d629-4549-a888-c8566b6feefa",
-    "internal.openshell.ai/runtime-generation": "9362356e-b650-4a42-8029-8f2c3d6b3dc6"
+    "internal.openshell.ai/gateway-token-id": "(redacted)",
+    "internal.openshell.ai/runtime-generation": "48cc9258-248d-43c8-ab1b-ae65bd45bb8e"
   },
   "conditions": [
     {
@@ -28,16 +28,16 @@
     "provider_env_revision": 16365777791390307699,
     "state": "accepted"
   },
-  "created_at": "2026-10-24 18:55:41",
+  "created_at": "2026-10-24 19:09:26",
   "created_from_workload_template": null,
   "current_policy_version": 2,
   "endpoint_statuses": [],
   "exit_code": null,
-  "host_key_fingerprint": "SHA256:k+/gzQnXwchrFgtPn7yeIDoN4r4Q6CQLolMSx52KQ3k",
-  "id": "9cdc2e03-93d3-4eb0-9594-3f73a93b6c76",
+  "host_key_fingerprint": "SHA256:Cf9bBhPK6npWyHiGKY8C/5rCVRI/mPGLLDfpPibDg8A",
+  "id": "d4762f92-e98b-43ef-80b1-8bb6f430f03c",
   "labels": {},
-  "main_process_instance_id": "eaae463c-1712-4329-8795-3295c312b0eb",
-  "main_process_started_at_ms": 1792868142303,
+  "main_process_instance_id": "3bdcd223-cd2b-4b4e-af9a-cb61396498cd",
+  "main_process_started_at_ms": 1792868967217,
   "name": "fx-base",
   "next_restart_at_ms": 0,
   "phase": "Ready",
@@ -96,22 +96,22 @@
   },
   "policy_source": "global",
   "provisioning": {
-    "admission_start_time": "2026-10-24T18:55:42.268Z",
-    "attempt_id": "2bb18841-6fc0-406b-a8ee-532e397b995a",
+    "admission_start_time": "2026-10-24T19:09:27.165Z",
+    "attempt_id": "ab57ba07-4f1f-4615-aad7-5b66a0e2dea2",
     "cleanup_completed_time": null,
     "cleanup_error": "",
     "cleanup_retry_time": null,
     "configuration_change_id": "9fb4101b3376a5b08b6d868fc7dff6f6711bccbafa75aa3870144bab7854f5cd",
-    "configuration_change_time": "2026-10-24T18:55:41.878Z",
+    "configuration_change_time": "2026-10-24T19:09:26.638Z",
     "deadline": null,
-    "driver_operation_id": "c48a75cf-90e7-4874-b812-3b334ba5d965",
+    "driver_operation_id": "0f198414-b4c3-4141-a2f1-c64ee129c75e",
     "driver_operation_pending": false,
     "first_rejection_time": null,
     "phase": "ready",
-    "preparation_deadline": "2026-10-24T19:25:41.878Z",
+    "preparation_deadline": "2026-10-24T19:39:26.638Z",
     "timeout_time": null
   },
-  "resource_version": 17,
+  "resource_version": 18,
   "restart_count": 0,
   "restart_policy": "never",
   "revision": 1,

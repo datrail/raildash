@@ -20,7 +20,7 @@ network_policies:
   internal_api:
     name: internal-api
     endpoints:
-      - host: api.internal.example
+      - host: api.corp.example.com
         port: 443
         protocol: rest
         enforcement: enforce
@@ -35,6 +35,6 @@ network_policies:
       - port: 8080
         allowed_ips:
           - '10.30.0.0/24'
-          - '10.31.0.5'
+          - '10.31.0.0/24'
     binaries:
       - path: /usr/local/bin/python3.13

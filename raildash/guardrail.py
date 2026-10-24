@@ -1725,7 +1725,10 @@ def propose_guardrail(
     if endpoint.get("status") == "ANSWERED":
         host = _url_host(endpoint.get("value"))
         if host is not None and _is_host_pattern(host):
-            upload_hosts.add(host)
+            if seed is not None and _osp.refuses_body(openshell_policy, host):
+                seed["withheld_upload_hosts"].add(host)
+            else:
+                upload_hosts.add(host)
     for request in requests:
         host = normalize_host(request.get("host"))
         if carries_body(request) and host is not None and _is_host_pattern(host):

@@ -123,12 +123,12 @@ def test_an_mcp_endpoint_lists_its_rules_by_method_and_tool():
 
 def test_allowed_ips_with_and_without_a_host():
     found = endpoints("allowed-ips.policy-only.yaml")
-    limited = found[("internal_api", "api.internal.example")]
+    limited = found[("internal_api", "api.corp.example.com")]
     assert limited["allowed_ips"] == ["10.20.0.0/16"]
     assert osp.not_representable(limited) is None
     hostless = found[("lab_subnet", None)]
-    assert hostless["allowed_ips"] == ["10.30.0.0/24", "10.31.0.5"]
-    assert osp.endpoint_label(hostless) == "any host in 10.30.0.0/24, 10.31.0.5:8080"
+    assert hostless["allowed_ips"] == ["10.30.0.0/24", "10.31.0.0/24"]
+    assert osp.endpoint_label(hostless) == "any host in 10.30.0.0/24, 10.31.0.0/24:8080"
     assert osp.not_representable(hostless) == osp.NOT_REPRESENTABLE_HOSTLESS
 
 
@@ -154,6 +154,15 @@ def test_allowed_ips_with_and_without_a_host():
     (b"version: 1\nnetwork_policies:\n  a: {}\n  a: {}\n", "duplicate key"),
     (b"version: 1\nx: &a [1]\ny: *a\n", "aliases are not accepted"),
     (b"version: 1\n# " + b"x" * osp.MAX_POLICY_BYTES, "over 256 KiB"),
+    # A JSON view without its policy body (`policy get` without --full)
+    # carries a top-level `version` too, and is still no policy.
+    (b'{"active_version": 1, "version": 1, "hash": "ab"}', "JSON view with no `policy`"),
+    (b'{"version": 1, "policy": null}', "JSON view with no `policy`"),
+    (b'{"version": 1, "network_policies": {}, "network_policies": {}}', "duplicate key"),
+    (b"version: true\nnetwork_policies: {}\n", "policy version True"),
+    (b"version: 1\n? [a, b]\n: c\n", "mapping key must be a scalar"),
+    (b"version: 1\nx: " + b"[" * 50_000, "nested too deeply|not valid YAML"),
+    (b'{"policy": ' + b"[" * 50_000, "nested too deeply|not valid JSON"),
 ])
 def test_a_file_that_isnt_a_policy_is_an_error_never_an_empty_list(raw, message):
     with pytest.raises(osp.PolicyImportError, match=message):
@@ -218,7 +227,7 @@ def test_the_newest_import_is_the_agents_policy_and_shows_its_age(store):
     shown = store.guardrail_detail(ref)["openshell_policy"]
     assert shown["revision"] == 1 and shown["stale"] is False
     assert len(shown["endpoints"]) == 4
-    # Past DR-184's stale window the line dates it ("as of") instead.
+    # Past DR-184's longest stale window (two hours) the line dates it ("as of").
     store._db.execute(  # noqa: SLF001
         "UPDATE openshell_policies SET imported_at = '2020-01-01T00:00:00.000000Z'")
     assert store.guardrail_detail(ref)["openshell_policy"]["stale"] is True
@@ -368,3 +377,13 @@ def test_the_stored_policy_seeds_the_panels_proposal(store):
     assert {"*.example.com", "api.github.com", "raw.githubusercontent.com", "uploads.github.com"} <= set(
         proposal["guardrail"]["rules"]["out_of_spec_calls"]["allowed_hosts"])
     assert g.guardrail_problems(proposal["guardrail"]) == []
+
+
+def test_an_inference_host_the_policy_allows_no_body_is_withheld_too(store):
+    # The base URL's host is seeded into uploads like a body the agent sent;
+    # the policy's refusal applies to it alike, so it is never both.
+    policy = SEED_POLICY.replace(b"access: read-write}]\n  anthropic", b"access: read-only}]\n  anthropic")
+    proposal = _seeded(store, egress(), policy)
+    assert "api.openai.com" not in proposal["guardrail"]["rules"]["uploads"]["allowed_hosts"]
+    assert proposal["openshell"]["withheld_upload_hosts"] == ["api.anthropic.com", "api.openai.com"]
+    assert proposal["openshell"]["upload_hosts"] == []

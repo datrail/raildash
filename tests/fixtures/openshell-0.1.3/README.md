@@ -1,7 +1,7 @@
 # OpenShell 0.1.3 policy output
 
 Recorded verbatim from OpenShell 0.1.3 by datrail-project's *Record OpenShell
-fixtures* workflow (`tests/openshell/record-fixtures.sh`, run 40122920802).
+fixtures* workflow (`tests/openshell/record-fixtures.sh`, run 40123980582).
 Each file is what a user would upload for RailDash's policy import (DR-248).
 The sandbox policies the script applies are in that script's `fixtures/`
 directory.
@@ -20,6 +20,11 @@ directory.
 | `global.sandbox-get.json` | `sandbox get -o json` then: `policy_source: global` |
 | `global.policy-get-global.json` | `policy get --global --full -o json` (`scope: global`) |
 | `missing-sandbox.stderr.txt` | What `--policy-only` prints for a sandbox that doesn't exist (stderr; stdout is empty) |
+
+One value is not verbatim: the `internal.openshell.ai/gateway-token-id`
+annotation in the two `sandbox get -o json` files reads `(redacted)`. It
+names a token on the throwaway CI gateway, not the token itself, but nothing
+here needs it.
 
 The `github` provider was created with a marker credential. The workflow
 checks that the marker appears in no output, so none of these files carries

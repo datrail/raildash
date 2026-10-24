@@ -193,8 +193,8 @@ BEFORE DELETE ON guardrail_versions
 BEGIN SELECT RAISE(ABORT, 'guardrail versions are immutable'); END;
 
 -- DR-248 (DR-194 M2): each OpenShell policy imported for an agent, as
--- `raildash.openshell_policy.parse_policy` reads it (endpoints only, no
--- credential field). Beside the ASP, never in it: no ASP, baseline or
+-- `raildash.openshell_policy.parse_policy` reads it: its network endpoints
+-- and revision, field by field, so no credential field. Beside the ASP, never in it: no ASP, baseline or
 -- guardrail version refers to a row here. The newest row is the policy.
 CREATE TABLE IF NOT EXISTS openshell_policies (
     policy_id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1008,8 +1008,9 @@ class GuardrailCustody:
 
     def _openshell_policy_view_locked(self, kind: str, value: str) -> dict[str, Any] | None:
         """The Egress line's OpenShell rows (DR-194 §4.3): the newest
-        record and whether it is older than DR-184's stale window, past
-        which the line says "as of <time>" rather than showing it as now."""
+        record and whether it is older than DR-184's longest stale window
+        (`STALE_MAX`, two hours; an import has no gap between scans to
+        scale it by), past which the line says "as of <time>"."""
         record = self._openshell_policy_locked(kind, value)
         if record is None:
             return None

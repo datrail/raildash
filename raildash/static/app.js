@@ -1424,12 +1424,15 @@ function renderOpenshellImport(agentRef, held, refresh) {
       guardrailBusy -= 1;
     }
   });
-  wrap.append(button, input, status);
+  // The status right after the button, where a redraw looks for an
+  // action's message to keep (guardrailViewState).
+  wrap.append(input, button, status);
   return wrap;
 }
 
 // DR-248: what a proposal took from the imported OpenShell policy (§4.4),
-// each host marked with the policy's revision.
+// marked with the policy's revision, or for a YAML upload, which carries
+// none, with when it was imported.
 function renderOpenshellSeed(seed) {
   const notes = el("ul", "guardrail-notes guardrail-openshell-seed");
   const mark = seed.revision ? `revision ${seed.revision}` : `imported ${fmtDateTime(seed.imported_at)}`;
