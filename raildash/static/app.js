@@ -1436,6 +1436,7 @@ function renderOpenshellDenials(denials) {
   });
   section.append(list);
   if (denials.more_groups) section.append(el("p", "muted", `and ${denials.more_groups} more`));
+  if (denials.truncated) section.append(el("p", "muted", "Counted from the newest 20,000 denials only."));
   return section;
 }
 

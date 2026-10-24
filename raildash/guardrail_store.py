@@ -1176,6 +1176,8 @@ class GuardrailCustody:
         return {
             "groups": ordered[:OPENSHELL_DENIAL_GROUPS_SHOWN],
             "more_groups": max(0, len(ordered) - OPENSHELL_DENIAL_GROUPS_SHOWN),
+            # The read stopped at OPENSHELL_DENIALS_READ: counts are at least.
+            "truncated": len(rows) >= OPENSHELL_DENIALS_READ,
             "partial": [{"from": gap["gap_from"], "to": gap["gap_to"], "reasons": json.loads(gap["reasons_json"])}
                         for gap in gaps],
         }
