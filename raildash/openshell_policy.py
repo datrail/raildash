@@ -20,7 +20,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 import yaml
 
@@ -346,6 +346,36 @@ def endpoint_label(endpoint: Mapping[str, Any]) -> str:
     where = endpoint.get("host") or "any host in " + ", ".join(endpoint.get("allowed_ips") or [])
     ports = ",".join(str(port) for port in endpoint.get("ports") or [])
     return f"{where}:{ports}" if ports else where
+
+
+def pattern_covered(pattern: str, allowed: Iterable[str]) -> bool:
+    """Whether a list's patterns allow every host one pattern matches: an
+    exact host as `host_matches` reads it, a wildcard only by a wildcard at
+    or above it (`*.github.com` covers `*.api.github.com`, never the other
+    way, and `api.github.com` covers no wildcard)."""
+    if not pattern.startswith("*."):
+        return any(g.host_matches(pattern, other) for other in allowed)
+    suffix = pattern[1:]
+    return any(other.startswith("*.") and (suffix == other[1:] or suffix.endswith(other[1:]))
+               for other in allowed)
+
+
+def beyond_guardrail(record: Mapping[str, Any], allowed_hosts: list[str]) -> list[dict[str, Any]]:
+    """Design §4.5's comparison (DR-257): each endpoint the policy allows
+    whose host the guardrail's `out_of_spec_calls.allowed_hosts` doesn't
+    cover, as `{endpoint, rule, provider, reason}`. `reason` is None for a
+    host outside the list, or `not_representable`'s answer for one that
+    can't be compared (it is never read as covered). The guardrail has no
+    ports, so a covered host is covered on every port. Context only: it
+    judges nothing and changes no state."""
+    out = []
+    for endpoint in record["endpoints"]:
+        reason = not_representable(endpoint)
+        if reason is None and pattern_covered(endpoint_host_pattern(endpoint), allowed_hosts):
+            continue
+        out.append({"endpoint": endpoint_label(endpoint), "rule": endpoint["rule"],
+                    "provider": endpoint["provider"], "reason": reason})
+    return out
 
 
 def proposal_seed(record: Mapping[str, Any]) -> dict[str, Any]:

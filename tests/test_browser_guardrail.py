@@ -542,6 +542,17 @@ def test_an_imported_openshell_policy_shows_on_the_egress_line_and_seeds_the_pro
             expect(seed).to_contain_text("api.github.com (_provider_fx_pypi, github_api)")
             expect(card.locator(".guardrail-proposal .guardrail-policy")).to_contain_text("*.example.com")
             expect(section.get_by_role("button", name="Import a newer policy")).to_be_visible()
+            # DR-257: the proposal seeds every host the policy names, so
+            # nothing it allows is beyond it; a hostless endpoint is listed
+            # as not comparable, never as covered.
+            beyond = section.locator(".guardrail-openshell-beyond")
+            expect(beyond).to_contain_text("OpenShell allows no host beyond the guardrail's allowed hosts.")
+            chooser.set_input_files(str(fixtures / "allowed-ips.policy-only.yaml"))
+            beyond_rows = beyond.locator(".guardrail-openshell-beyond-list li")
+            expect(beyond_rows).to_have_count(1, timeout=TIMEOUT)
+            expect(beyond_rows.first).to_contain_text(
+                "any host in 10.30.0.0/24, 10.31.0.0/24:8080 · rule lab_subnet · "
+                "can't be compared: allowed_ips only, no host")
             assert errors == []
             browser.close()
     finally:

@@ -1388,8 +1388,32 @@ function renderOpenshellPolicy(agentRef, policy, offerImport, refresh) {
     policy.endpoints.forEach((endpoint) => list.append(el("li", null, describeOpenshellEndpoint(endpoint))));
     if (!policy.endpoints.length) list.append(el("li", "muted", "no network rules: it allows no outside host"));
     section.append(list);
+    if (policy.beyond_guardrail) section.append(renderOpenshellBeyond(policy.beyond_guardrail));
   }
   if (offerImport) section.append(renderOpenshellImport(agentRef, Boolean(policy), refresh));
+  return section;
+}
+
+// DR-257 (design §4.5's comparison): what the policy lets the agent reach
+// that the guardrail's allowed hosts don't. Context, not a rule: it changes
+// no state, and an endpoint that can't be compared is never read as covered.
+function renderOpenshellBeyond(beyond) {
+  const section = el("div", "guardrail-openshell-beyond");
+  section.dataset.key = "openshell-beyond";
+  if (!beyond.length) {
+    section.append(el("p", "muted", "OpenShell allows no host beyond the guardrail's allowed hosts."));
+    return section;
+  }
+  section.append(el("p", "muted", "OpenShell allows beyond the guardrail's allowed hosts:"));
+  const list = el("ul", "guardrail-openshell-beyond-list");
+  beyond.forEach((entry) => {
+    const item = el("li");
+    item.append(el("code", null, entry.endpoint));
+    const rule = entry.provider ? `rule ${entry.rule} (provider ${entry.provider})` : `rule ${entry.rule}`;
+    item.append(el("span", "muted", ` · ${rule}${entry.reason ? ` · can't be compared: ${entry.reason}` : ""}`));
+    list.append(item);
+  });
+  section.append(list);
   return section;
 }
 
