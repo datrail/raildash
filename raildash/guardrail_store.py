@@ -1182,16 +1182,22 @@ class GuardrailCustody:
                         for gap in gaps],
         }
 
-    def _openshell_policy_view_locked(self, kind: str, value: str) -> dict[str, Any] | None:
+    def _openshell_policy_view_locked(
+        self, kind: str, value: str, allowed_hosts: list[str] | None = None
+    ) -> dict[str, Any] | None:
         """The Egress line's OpenShell rows (DR-194 §4.3): the newest
         record and whether it is older than DR-184's longest stale window
         (`STALE_MAX`, two hours; an import has no gap between scans to
-        scale it by), past which the line says "as of <time>"."""
+        scale it by), past which the line says "as of <time>". With
+        `beyond_guardrail`, the endpoints it allows that `allowed_hosts`
+        (the version in force's or the proposal's) doesn't (DR-257,
+        design §4.5); None when there is no guardrail to compare with."""
         record = self._openshell_policy_locked(kind, value)
         if record is None:
             return None
         age = _instant(self._receive_time()) - _instant(record["imported_at"])
-        return {**record, "stale": age > g.STALE_MAX}
+        beyond = None if allowed_hosts is None else osp.beyond_guardrail(record, allowed_hosts)
+        return {**record, "stale": age > g.STALE_MAX, "beyond_guardrail": beyond}
 
     def import_openshell_policy(self, ref: str, raw: bytes) -> dict[str, Any]:
         """**Import OpenShell policy** (DR-248): store an uploaded policy as
@@ -1211,7 +1217,11 @@ class GuardrailCustody:
                 "revision": record["revision"], "digest": record["digest"],
                 "endpoints": len(record["endpoints"]),
             })
-            return {"agent_ref": ref, **self._openshell_policy_view_locked(kind, value)}
+            view = self._openshell_policy_view_locked(kind, value)
+            # The comparison needs the proposal; the panel's read, which
+            # follows an import, carries it (DR-257).
+            view.pop("beyond_guardrail")
+            return {"agent_ref": ref, **view}
 
     def require_containment(self, ref: str, require: str = "contained") -> dict[str, Any]:
         """**Require containment** (DR-207 §4.4): a new v3 version, the
@@ -1602,19 +1612,21 @@ class GuardrailCustody:
                 if baseline is not None:
                     proposal = self._proposal_locked(self._alignment_row(baseline[0]))
                     proposal["alignment_version_id"] = baseline[0]
+            # What the denials and the policy are compared with: the version
+            # in force's hosts, else the proposal's, else nothing to compare.
+            allowed_hosts = (
+                json.loads(active["contract_json"])["rules"]["out_of_spec_calls"]["allowed_hosts"]
+                if active is not None else
+                proposal["guardrail"]["rules"]["out_of_spec_calls"]["allowed_hosts"]
+                if proposal is not None and proposal.get("guardrail") is not None else None
+            )
             return {
                 "agent_ref": ref,
                 "agent_identity": self._identity_object(kind, value),
                 "data_actions_offer_available": self._data_actions_offer_available_locked(kind, value),
                 "egress": self._egress_locked(kind, value),
-                "openshell_policy": self._openshell_policy_view_locked(kind, value),
-                "openshell_denials": self._openshell_denials_locked(
-                    kind, value,
-                    json.loads(active["contract_json"])["rules"]["out_of_spec_calls"]["allowed_hosts"]
-                    if active is not None else
-                    proposal["guardrail"]["rules"]["out_of_spec_calls"]["allowed_hosts"]
-                    if proposal is not None and proposal.get("guardrail") is not None else None,
-                ),
+                "openshell_policy": self._openshell_policy_view_locked(kind, value, allowed_hosts),
+                "openshell_denials": self._openshell_denials_locked(kind, value, allowed_hosts),
                 **summary,
                 "active": self._version_view(active, active=True) if active is not None else None,
                 "rows": rows,

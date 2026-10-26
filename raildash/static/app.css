@@ -951,6 +951,8 @@ pre {
 .guardrail-openshell { margin: 2px 0 6px; font-size: 11.5px; }
 .guardrail-openshell p { margin: 0; }
 .guardrail-openshell-endpoints { margin: 2px 0 4px; padding-left: 18px; font: 11.5px var(--mono); overflow-wrap: anywhere; }
+/* DR-257: what the policy allows beyond the guardrail. */
+.guardrail-openshell-beyond-list { margin: 2px 0 4px; padding-left: 18px; font: 11.5px var(--mono); overflow-wrap: anywhere; }
 /* DR-249: Blocked by OpenShell. */
 .guardrail-openshell-denials { margin: 4px 0 8px; font-size: 11.5px; }
 .guardrail-openshell-denials h5 { margin: 4px 0 2px; }

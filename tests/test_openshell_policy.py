@@ -223,6 +223,7 @@ def test_the_newest_import_is_the_agents_policy_and_shows_its_age(store):
     assert store.guardrail_detail(ref)["openshell_policy"] is None
     first = store.import_openshell_policy(ref, fixture("base.policy-only.yaml"))
     assert (first["agent_ref"], first["source"], first["stale"], first["revision"]) == (ref, "import", False, None)
+    assert "beyond_guardrail" not in first  # getGuardrail carries the comparison
     store.import_openshell_policy(ref, fixture("base.policy-full.json"))
     shown = store.guardrail_detail(ref)["openshell_policy"]
     assert shown["revision"] == 1 and shown["stale"] is False
@@ -387,6 +388,62 @@ def test_an_inference_host_the_policy_allows_no_body_is_withheld_too(store):
     assert "api.openai.com" not in proposal["guardrail"]["rules"]["uploads"]["allowed_hosts"]
     assert proposal["openshell"]["withheld_upload_hosts"] == ["api.anthropic.com", "api.openai.com"]
     assert proposal["openshell"]["upload_hosts"] == []
+
+
+# ------------------------------------------ beyond the guardrail (DR-257)
+
+
+@pytest.mark.parametrize(("pattern", "allowed", "covered"), [
+    ("api.github.com", ["api.github.com"], True),
+    ("api.github.com", ["*.github.com"], True),
+    ("github.com", ["*.github.com"], False),  # a wildcard never matches its own base
+    ("*.github.com", ["api.github.com"], False),
+    ("*.github.com", ["*.github.com"], True),
+    ("*.api.github.com", ["*.github.com"], True),
+    ("*.github.com", ["*.api.github.com"], False),
+    ("*.xgithub.com", ["*.github.com"], False),
+    ("api.github.com", [], False),
+])
+def test_a_policy_host_is_covered_only_by_a_pattern_at_or_above_it(pattern, allowed, covered):
+    assert osp.pattern_covered(pattern, allowed) is covered
+
+
+def test_beyond_the_guardrail_lists_what_the_policy_allows_and_the_hosts_dont(store):
+    """Design §4.5's comparison, golden: one row per uncovered endpoint, as
+    host:port with its rule; the endpoints that can't be compared are
+    listed with why, never read as covered."""
+    record = osp.parse_policy(SEED_POLICY)
+    assert osp.beyond_guardrail(record, ["api.openai.com", "*.example.com", "*.githubusercontent.com"]) == [
+        {"endpoint": "api.anthropic.com:443", "rule": "anthropic", "provider": None, "reason": None},
+        {"endpoint": "*-api.example.com:443", "rule": "content", "provider": None,
+         "reason": osp.NOT_REPRESENTABLE_WILDCARD},
+        {"endpoint": "any host in 10.30.0.0/24:8080", "rule": "lab", "provider": None,
+         "reason": osp.NOT_REPRESENTABLE_HOSTLESS},
+        {"endpoint": "registry.npmjs.org:443", "rule": "registry", "provider": None, "reason": None},
+    ]
+    # A guardrail that names one subdomain doesn't cover the policy's wildcard.
+    narrow = osp.beyond_guardrail(record, ["githubusercontent.com", "raw.githubusercontent.com"])
+    assert "*.githubusercontent.com:443" in [row["endpoint"] for row in narrow]
+    provider = osp.beyond_guardrail(osp.parse_policy(fixture("provider-github.policy-only.yaml")), [])
+    assert {row["provider"] for row in provider if row["rule"].startswith("_provider_")} == {"fx_github"}
+
+
+def test_the_panel_compares_the_policy_with_the_proposal_then_the_version_in_force(store):
+    alignment, ref = baseline(store, asp(egress_containment=egress()))
+    store.import_openshell_policy(ref, fixture("base.sandbox-get.json"))
+    shown = store.guardrail_detail(ref)["openshell_policy"]
+    # The proposal seeds every host the policy names (§4.4), so only what
+    # DR-184 can't write is beyond it.
+    assert all(row["reason"] is not None for row in shown["beyond_guardrail"])
+    active = store.adopt_guardrail(alignment["alignment_version_id"])
+    rules = json.loads(json.dumps(active["guardrail"]["rules"]))
+    rules["out_of_spec_calls"]["allowed_hosts"] = [
+        host for host in rules["out_of_spec_calls"]["allowed_hosts"] if host != "*.example.com"]
+    store.edit_guardrail(active["guardrail"]["guardrail_version_id"], rules)
+    detail = store.guardrail_detail(ref)
+    beyond = [row for row in detail["openshell_policy"]["beyond_guardrail"] if row["reason"] is None]
+    assert beyond == [{"endpoint": "*.example.com:443,8443", "rule": "example_wildcard", "provider": None,
+                       "reason": None}]
 
 
 # --------------------------------------------------- the collector (DR-249)
