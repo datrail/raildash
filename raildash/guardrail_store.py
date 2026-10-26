@@ -1217,7 +1217,11 @@ class GuardrailCustody:
                 "revision": record["revision"], "digest": record["digest"],
                 "endpoints": len(record["endpoints"]),
             })
-            return {"agent_ref": ref, **self._openshell_policy_view_locked(kind, value)}
+            view = self._openshell_policy_view_locked(kind, value)
+            # The comparison needs the proposal; the panel's read, which
+            # follows an import, carries it (DR-257).
+            view.pop("beyond_guardrail")
+            return {"agent_ref": ref, **view}
 
     def require_containment(self, ref: str, require: str = "contained") -> dict[str, Any]:
         """**Require containment** (DR-207 §4.4): a new v3 version, the

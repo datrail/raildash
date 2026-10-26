@@ -223,6 +223,7 @@ def test_the_newest_import_is_the_agents_policy_and_shows_its_age(store):
     assert store.guardrail_detail(ref)["openshell_policy"] is None
     first = store.import_openshell_policy(ref, fixture("base.policy-only.yaml"))
     assert (first["agent_ref"], first["source"], first["stale"], first["revision"]) == (ref, "import", False, None)
+    assert "beyond_guardrail" not in first  # getGuardrail carries the comparison
     store.import_openshell_policy(ref, fixture("base.policy-full.json"))
     shown = store.guardrail_detail(ref)["openshell_policy"]
     assert shown["revision"] == 1 and shown["stale"] is False

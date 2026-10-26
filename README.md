@@ -370,8 +370,8 @@ agent sent a body to stays out of **Uploads to** when the policy allows it
 no body there, so that attempt shows as a would-be violation.
 
 Under the policy, the line lists every `host:port` the policy allows that
-the guardrail's hosts the agent may call (the version in force's, or the
-proposal's) don't cover, with its rule. A policy wildcard is covered only
+isn't among the guardrail's hosts the agent may call (the version in
+force's, or the proposal's), with its rule. A policy wildcard is covered only
 by a guardrail wildcard at or above it, and an endpoint with only
 `allowed_ips` or a wildcard form the guardrail can't write is listed as
 not comparable, never as covered. This is context: it changes no state.
