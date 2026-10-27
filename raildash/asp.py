@@ -784,12 +784,32 @@ def _window_attributes(
 # OpenClaw's `sessions.json.1.<uuid>.tmp` written on every turn, outside the
 # temp directories RailMon folds. Within one windowed file-access comparison
 # each uuid in a file's name reads as `*`, so the same file written again
-# under a new uuid is not newly written. The directory and the rest of the
-# name still count. The price, as for RailMon's temp names: a new file named
+# under a new uuid is not newly written. The rest of the name, and the
+# directory but for a mkdtemp suffix (below), still count. The price, as for RailMon's temp names: a new file named
 # like one already in the baseline but for its uuid is aligned. A run of
 # uuids is one `*`: two `*` side by side would be a `**`, which as a
 # guardrail glob crosses directories.
 _UUIDS = re.compile(r"(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})+")
+# Two more names minted afresh by a real agent's every run (OpenClaw's CLI,
+# one process per turn), outside the temp names RailMon folds:
+# - SQLite's temp files, `etilqs_` and a random number in hex (up to 16
+#   digits, as leading zeros are dropped; older SQLite wrote 15 letters and
+#   digits), which RailMon's temp patterns (6 to 12) don't all take, in
+#   /var/tmp or anywhere;
+# - a directory made by mkdtemp (Node's fs.mkdtemp, mkdtemp(3)): its prefix,
+#   then 6 random letters and digits, as `openclaw-sqlite-readonly-v2-jRu2h7`
+#   under ~/.cache. The prefix must end in `-`, `_` or `.` and hold at least
+#   three letters or digits, and the random part a digit or a capital, as
+#   RailMon's own mkstemp pattern asks, so `/srv/build-output` is not one.
+#   Only below a temp or cache directory (_MKDTEMP_ROOTS, or one named
+#   `.cache`), where most such names are made: elsewhere `client-Acme01` or
+#   `logs-202610` is a name someone chose. A chosen name of that shape
+#   below them (`~/.cache/pip-Wheel1`) folds too.
+# Both fold to `*` like a uuid, at the same price.
+_SQLITE_TEMP = re.compile(r"(?<=^etilqs_)[A-Za-z0-9]{1,16}\Z")
+_MKDTEMP = re.compile(r"(?P<prefix>[^/]*[._-])(?P<random>[A-Za-z0-9]{6})")
+_MKDTEMP_RANDOM = re.compile(r"[A-Z0-9]")
+_MKDTEMP_ROOTS = ("/tmp/", "/var/tmp/", "/dev/shm/")
 # RailMon's note on a file list whose cap left reads out, whatever its
 # reason (railmon `tools/scan/evidence_bundle.py`, unchanged through rule pack 13).
 # A reworded note only turns the rule off, which reports drift, not less.
@@ -815,15 +835,33 @@ def only_reads_left_out(attribute: Any) -> bool:
     )
 
 
-def uuid_name_template(path: str) -> str | None:
-    """`path` with each run of uuids in its file name made `*`, or None when the
-    name has none, or the path already has a `*` (RailMon's own templates),
-    which as a guardrail glob would match more than it says."""
+def _mkdtemp_template(part: str) -> str:
+    match = _MKDTEMP.fullmatch(part)
+    if (match is None or not _MKDTEMP_RANDOM.search(match["random"])
+            or sum(character.isalnum() for character in match["prefix"]) < 3):
+        return part
+    return match["prefix"] + "*"
+
+
+def generated_name_template(path: str) -> str | None:
+    """`path` with the parts a run mints afresh made `*`: each run of uuids
+    and a SQLite temp file's random part in its file name, and a mkdtemp
+    directory's random suffix in its directories below a temp or cache
+    directory. None when there is none,
+    or the path already has a `*` (RailMon's own templates), which as a
+    guardrail glob would match more than it says."""
     if "*" in path:
         return None
     directory, slash, name = path.rpartition("/")
-    templated = _UUIDS.sub("*", name)
-    return directory + slash + templated if templated != name else None
+    templated = _SQLITE_TEMP.sub("*", _UUIDS.sub("*", name))
+    if slash:
+        parts = directory.split("/")
+        in_temp = path.startswith(_MKDTEMP_ROOTS)
+        directory = "/".join(
+            _mkdtemp_template(part) if in_temp or ".cache" in parts[:index] else part
+            for index, part in enumerate(parts))
+    folded = directory + slash + templated
+    return folded if folded != path else None
 
 
 def _comparable_file_access(
@@ -831,7 +869,7 @@ def _comparable_file_access(
 ) -> tuple[Any, Any]:
     """Both `observed_file_access` values as a windowed comparison reads them.
 
-    Each uuid in a file name is folded (`uuid_name_template`). And when the
+    Each name a run mints afresh is folded (`generated_name_template`). And when the
     baseline's list left reads out at RailMon's cap, a current read-only
     entry it doesn't list is dropped if it sorts after the baseline's last
     listed read-only entry: RailMon keeps every write and exec, then reads by
@@ -870,7 +908,7 @@ def _comparable_file_access(
 
     def folded(value: list[Any]) -> list[Any]:
         return [
-            {**entry, "path": uuid_name_template(entry["path"]) or entry["path"]}
+            {**entry, "path": generated_name_template(entry["path"]) or entry["path"]}
             if isinstance(entry, dict) and isinstance(entry.get("path"), str) else entry
             for entry in value
         ]

@@ -1001,6 +1001,51 @@ def test_a_proposal_and_allow_this_take_a_uuid_named_write_as_its_glob(store):
         assert g.with_item_allowed(rules, row)["saved_files"]["allowed"][-1] == {"path": path, "literal": True}
 
 
+def test_allow_this_takes_a_sqlite_temp_file_and_a_mkdtemp_directory_as_globs():
+    """OpenClaw's CLI, one process per turn, writes `/var/tmp/etilqs_<16>`
+    and files in a fresh mkdtemp directory under ~/.cache on every turn."""
+    cache = "/home/node/.cache/openclaw"
+    rules = {"saved_files": {"allowed": [g.BYTECODE_CACHE_ENTRY]}}
+    for path, entry in (
+        # SQLite's names have no extension: etilqs_secrets.tar.gz isn't one.
+        ("/var/tmp/etilqs_155d7cc864b75a27", {"path": "/var/tmp/etilqs_*", "kinds": ["(none)"]}),
+        (f"{cache}/openclaw-sqlite-readonly-v2-jRu2h7/owner.sqlite",
+         {"path": f"{cache}/openclaw-sqlite-readonly-v2-*/owner.sqlite"}),
+        # The file name's own rule still holds under a folded directory.
+        (f"{cache}/oc-sqlite-jRu2h7/0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d.json",
+         {"path": f"{cache}/oc-sqlite-jRu2h7/0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d.json",
+          "literal": True}),
+        # A name ending in a uuid keeps DR-229's bare glob.
+        ("/root/sessions.json.0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d", {"path": "/root/sessions.json.*"}),
+        ("/root/abc-0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d", {"path": "/root/abc-*"}),
+    ):
+        row = {"rule": "saved_files", "item": path, "detail": {}}
+        assert g.with_item_allowed(rules, row)["saved_files"]["allowed"][-1] == entry, path
+        if "literal" not in entry:
+            assert g.saved_file_allowed(path.replace("jRu2h7", "QOnshQ")
+                                        .replace("155d7cc864b75a27", "e41fab04de771bb7")
+                                        .replace("0b1c2d3e", "11111111"), [entry]), path
+    assert not g.saved_file_allowed("/var/tmp/etilqs_secrets.tar.gz",
+                                    [{"path": "/var/tmp/etilqs_*", "kinds": ["(none)"]}])
+    allowed = [{"path": f"{cache}/openclaw-sqlite-readonly-v2-*/owner.sqlite"}]
+    for path in (f"{cache}/openclaw-sqlite-readonly-v2-QOnshQ/other.sqlite",
+                 f"{cache}/openclaw-sqlite-readonly-v2-QOnshQ/sub/owner.sqlite",
+                 f"{cache}/elsewhere-QOnshQ/owner.sqlite"):
+        assert not g.saved_file_allowed(path, allowed), path
+
+
+def test_a_proposal_seeds_a_sqlite_temp_files_glob_with_its_kind(store):
+    """The entry with `kinds` is a valid guardrail version entry, and the
+    proposal validates with it."""
+    alignment, bundle = _lock(store, v1_bundle(observed_file_access=observed(
+        [_file("/var/tmp/etilqs_155d7cc864b75a27"), _file("/var/tmp/etilqs_98d280781ef3c96")],
+        method=FILE_METHOD)))
+    proposal = _propose(alignment, bundle, [])
+    g.validate_guardrail(proposal["guardrail"])
+    allowed = proposal["guardrail"]["rules"]["saved_files"]["allowed"]
+    assert allowed == [g.BYTECODE_CACHE_ENTRY, {"path": "/var/tmp/etilqs_*", "kinds": ["(none)"]}]
+
+
 def test_a_proposal_from_absent_declarations_says_why_its_lists_are_empty(store):
     # The real fixture as RailMon wrote it: no MCP config, no base URL.
     alignment, bundle = _lock(store, v1_bundle())
