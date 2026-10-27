@@ -28,7 +28,7 @@ from raildash.asp import (
     compare_alignment,
     parse_bundle,
     resolve_identity,
-    uuid_name_template,
+    generated_name_template,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -938,13 +938,52 @@ def test_a_file_rewritten_under_a_new_uuid_is_not_newly_written():
     # A run of uuids is one `*`, never a `**` that would cross directories.
     (f"/s/{_uuid(1)}{_uuid(2)}", "/s/*"),
     (f"/s/a{_uuid(1)}-{_uuid(2)}.tmp", "/s/a*-*.tmp"),
-    (f"/{_uuid(1)}/notes.txt", None),       # only the file name folds
+    (f"/{_uuid(1)}/notes.txt", None),       # a uuid folds in the file name only
     ("/tmp/tmp*", None),                    # RailMon's own template stays
     (f"/proc/*/{_uuid(1)}", None),
     ("/app/agent.log", None),
+    # SQLite's temp files, and mkdtemp directories (OpenClaw's CLI, every turn).
+    ("/var/tmp/etilqs_155d7cc864b75a27", "/var/tmp/etilqs_*"),
+    ("/var/tmp/etilqs_98d280781ef3c96", "/var/tmp/etilqs_*"),   # a leading zero dropped
+    ("/var/tmp/etilqs_155d7cc864b75a27f", None),        # 17: not SQLite's
+    ("/var/tmp/my-etilqs_155d7cc864b75a27", None),
+    ("/h/.cache/openclaw/openclaw-sqlite-readonly-v2-jRu2h7/owner.sqlite",
+     "/h/.cache/openclaw/openclaw-sqlite-readonly-v2-*/owner.sqlite"),
+    ("/h/.cache/oc/oc-sqlite-AYQXpt/oc-sqlite-9gBVNb/.fs-safe-" + _uuid(1) + ".tmp",
+     "/h/.cache/oc/oc-sqlite-*/oc-sqlite-*/.fs-safe-*.tmp"),
+    ("/tmp/build-output/log.txt", None),                 # a word, no digit or capital
+    ("/tmp/ab-Xy12cd/log.txt", None),                    # under three before the suffix
+    ("/tmp/run-Xy12cde/log.txt", None),                  # 7: not mkdtemp's 6
+    ("/tmp/run-Xy12cd", None),                           # a file name, not a directory
+    ("/tmp/run-Xy12cd/log.txt", "/tmp/run-*/log.txt"),
+    # Outside a temp or cache directory such a name is someone's choice.
+    ("/home/u/work/client-Acme01/notes.md", None),
+    ("/var/log/app/logs-202610/a.log", None),
+    ("/h/.cache-Ab12cd/x", None),                       # .cache itself doesn't fold
+    ("/var/tmp/etilqs_abc\n", None),                    # Python's $ would take it
 ])
-def test_uuid_name_template(path, template):
-    assert uuid_name_template(path) == template
+def test_generated_name_template(path, template):
+    assert generated_name_template(path) == template
+
+
+def test_a_real_agents_fresh_sqlite_and_mkdtemp_names_are_not_newly_written():
+    """OpenClaw's CLI, one process per turn, writes SQLite temp files in
+    /var/tmp and a fresh mkdtemp directory under ~/.cache on every turn."""
+    cache = "/home/node/.cache/openclaw"
+    baseline = _windowed_v2([], [_file("/var/tmp/etilqs_155d7cc864b75a27", write=True),
+                                 _file(f"{cache}/openclaw-sqlite-readonly-v2-jRu2h7/owner.sqlite",
+                                       write=True)])
+    current = _windowed_v2([], [_file("/var/tmp/etilqs_e41fab04de771bb7", write=True),
+                                _file("/var/tmp/etilqs_291fae92afdae74e", write=True),
+                                _file(f"{cache}/openclaw-sqlite-readonly-v2-QOnshQ/owner.sqlite",
+                                      write=True)])
+    assert _window_drift(baseline, current) == []
+    for path in (f"{cache}/openclaw-sqlite-readonly-v2-QOnshQ/other.sqlite",
+                 f"{cache}/elsewhere-QOnshQ/owner.sqlite",
+                 "/var/tmp/exfil.tar"):
+        assert _window_drift(baseline, _windowed_v2([], [_file(path, write=True)])) == [
+            (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
+        ], path
 
 
 def _capped(value: dict, *, note: str) -> dict:

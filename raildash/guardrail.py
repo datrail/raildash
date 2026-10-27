@@ -133,7 +133,7 @@ from urllib.parse import urlsplit
 from jsonschema import Draft202012Validator, FormatChecker
 
 from .asp import (
-    BUNDLE_VERSION_V2, FILE_ACCESS_ATTRIBUTE, identity_problems, only_reads_left_out, uuid_name_template,
+    BUNDLE_VERSION_V2, FILE_ACCESS_ATTRIBUTE, identity_problems, only_reads_left_out, generated_name_template,
 )
 from .ingest import _header, legacy_exchange
 from .json_safety import (
@@ -454,17 +454,26 @@ def saved_file_allowed(path: str, entries: Iterable[Mapping[str, Any]]) -> bool:
 
 def saved_file_entry(path: str) -> dict[str, Any]:
     """The entry a proposal or **Allow this** makes for one written path:
-    the path exactly, or, when its file name holds a uuid, that name with
-    each run of uuids as `*` in the same directory (DR-229). An agent that
-    writes `sessions.json.1.<uuid>.tmp` on every turn mints a new path each
-    time, so an exact entry would be violated again on the next turn. A name
-    with fewer than three letters or digits before its first uuid stays
-    exact: `<dir>/*`, `<dir>/*.json` or `<dir>/.*` would allow any file,
-    any file of a kind, or every hidden file in that directory."""
-    template = uuid_name_template(path)
-    prefix = template.rpartition("/")[2].partition("*")[0] if template is not None else ""
-    if sum(character.isalnum() for character in prefix) < 3:
+    the path exactly, or, when it holds a name a run mints afresh, the path
+    with that part as `*` (`generated_name_template`: a uuid or a SQLite
+    temp file's random part in its file name, DR-229, or a mkdtemp
+    directory's suffix). An agent that writes `sessions.json.1.<uuid>.tmp`
+    on every turn mints a new path each time, so an exact entry would be
+    violated again on the next turn. A file name with fewer than three
+    letters or digits before its first `*` stays exact: `<dir>/*`,
+    `<dir>/*.json` or `<dir>/.*` would allow any file, any file of a kind,
+    or every hidden file in that directory. A folded directory already
+    keeps three before its `*`. A SQLite temp file's glob, `etilqs_*`,
+    is for files without an extension, as SQLite names them, so it doesn't
+    also allow `etilqs_secrets.tar.gz`."""
+    template = generated_name_template(path)
+    if template is None:
         return {"path": path, "literal": True}
+    name = template.rpartition("/")[2]
+    if "*" in name and sum(character.isalnum() for character in name.partition("*")[0]) < 3:
+        return {"path": path, "literal": True}
+    if name == "etilqs_*":
+        return {"path": template, "kinds": ["(none)"]}
     return {"path": template}
 
 
@@ -1690,7 +1699,7 @@ def propose_guardrail(
     it called) is listed for the user to allow with one click, and a
     declared list left empty says why. `saved_files` is the baseline's
     written paths, each exact, after `BYTECODE_CACHE_ENTRY`, the one fixed
-    glob; a path whose file name holds a uuid is seeded as that name's glob
+    glob; a path holding a name a run mints afresh is seeded as its glob
     (`saved_file_entry`), and a written path an earlier entry already allows
     isn't listed again. A
     multi-agent baseline gets no proposal (`reason: MULTI_AGENT`).
@@ -1960,7 +1969,7 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
     """The rules of the version **Allow this** makes from one stored row
     (§4.5): the row's item added to its rule, as narrowly as the row names
     it. A listener is allowed by its own protocol, address and port; a path
-    as a literal entry, or as its uuid glob (`saved_file_entry`); a host by its exact name; an MCP row by its server;
+    as a literal entry, or as its glob (`saved_file_entry`); a host by its exact name; an MCP row by its server;
     a denied tool call by taking it off `denied_tool_calls`.
 
     Raises `ValueError` for a row one click can't allow: the overflow row

@@ -512,23 +512,39 @@ function isWindowed(change) {
 
 // DR-229: a windowed list is shown the way the server compared it
 // (raildash.asp._comparable_file_access), so a real change isn't buried
-// under the noise that comparison ignores. A run of uuids in a file name
-// reads as `*`, and when the baseline's list says reads were left out at
+// under the noise that comparison ignores. A name a run mints afresh reads
+// as `*` (raildash.asp.generated_name_template): a run of uuids or a SQLite
+// temp file's random part in a file name, and a mkdtemp directory's random
+// suffix below a temp or cache directory. And when the baseline's list says reads were left out at
 // RailMon's cap, a read it doesn't list that sorts after its last listed
 // read is left out: whether the baseline saw it is unknown.
 const UUID_RUN = /(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})+/g;
+const SQLITE_TEMP = /^(etilqs_)[A-Za-z0-9]{1,16}$/;
+const MKDTEMP = /^([^/]*[._-])([A-Za-z0-9]{6})$/;
+const MKDTEMP_ROOTS = ["/tmp/", "/var/tmp/", "/dev/shm/"];
 const READS_LEFT_OUT = "more distinct files than the cap (reads are left out first)";
 
-function uuidNameTemplate(path) {
+function mkdtempTemplate(part) {
+  const match = MKDTEMP.exec(part);
+  if (!match || !/[A-Z0-9]/.test(match[2])) return part;
+  return (match[1].match(/[\p{L}\p{N}]/gu) || []).length < 3 ? part : `${match[1]}*`;
+}
+
+function generatedNameTemplate(path) {
   if (path.includes("*")) return path;
   const cut = path.lastIndexOf("/") + 1;
-  return path.slice(0, cut) + path.slice(cut).replace(UUID_RUN, "*");
+  const name = path.slice(cut).replace(UUID_RUN, "*").replace(SQLITE_TEMP, "$1*");
+  const inTemp = MKDTEMP_ROOTS.some((root) => path.startsWith(root));
+  const parts = cut ? path.slice(0, cut - 1).split("/") : [];
+  const directory = cut ? parts.map((part, index) =>
+    (inTemp || parts.slice(0, index).includes(".cache") ? mkdtempTemplate(part) : part)).join("/") + "/" : "";
+  return directory + name;
 }
 
 function foldedFileEntries(entries) {
   const folded = new Map();
   entries.forEach((entry) => {
-    const path = uuidNameTemplate(entry.path);
+    const path = generatedNameTemplate(entry.path);
     const key = `${entry.layer ? 1 : 0}:${path}`;
     const seen = folded.get(key);
     folded.set(key, seen
