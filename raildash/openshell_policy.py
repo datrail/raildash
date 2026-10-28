@@ -7,15 +7,17 @@ the agent's ASP, never inside it: the operator writes the policy, so it is
 *declared, by the operator* and changes nothing the ASP, a baseline or a
 guardrail version holds.
 
-`parse_policy` reads an upload into a record of the network endpoints only,
-field by field from an allow-list, so a credential an upload carries (a
-middleware's config, signing settings) never reaches storage. Anything that
+`parse_policy` reads an upload into a record of the network endpoints and
+the static sections an export starts from (DR-258), field by field from an
+allow-list, so a credential an upload carries (a middleware's config,
+signing settings) never reaches storage. Anything that
 isn't a readable policy raises `PolicyImportError`; a parse failure is never
 read as a policy with no endpoints.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -41,6 +43,17 @@ BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE", "*"})
 # Protocols whose requests are bodies by construction, whatever the access
 # preset: a read-only GraphQL query is still a POST with a body.
 BODY_PROTOCOLS = frozenset({"mcp", "json-rpc", "jsonrpc", "graphql", "websocket"})
+# The static sections OpenShell fixes at sandbox creation (filesystem,
+# Landlock, process identity), kept so an export can start from the sandbox's
+# own base policy (design §4.5). Field by field like the endpoints: paths and
+# settings, never a credential. A field outside this list is dropped and named
+# in `base.dropped`, so the export can say what it left out.
+BASE_FIELDS: dict[str, dict[str, type]] = {
+    "filesystem_policy": {"include_workdir": bool, "read_only": list, "read_write": list},
+    "landlock": {"compatibility": str},
+    "process": {"run_as_user": str, "run_as_group": str},
+}
+MAX_BASE_PATHS = 1_000
 # Why a policy host isn't seeded into a guardrail list (§4.4).
 NOT_REPRESENTABLE_HOSTLESS = "allowed_ips only, no host"
 NOT_REPRESENTABLE_WILDCARD = "a wildcard form DR-184's host lists can't express"
@@ -131,8 +144,10 @@ def parse_policy(raw: bytes) -> dict[str, Any]:
     The record: `format` (`yaml`/`json`), `revision` (OpenShell's policy
     version, from a JSON view; the YAML carries none), `policy_source`
     (`sandbox`/`global`, from a JSON view), `sandbox`, `digest` (sha256 of
-    the endpoints, so two uploads of one policy compare equal) and
-    `endpoints`, one per endpoint of every rule, sorted by rule key."""
+    the endpoints, so two uploads of one policy compare equal),
+    `endpoints`, one per endpoint of every rule, sorted by rule key, and
+    `base`, the static sections an export starts from (`_base`; None when
+    the upload carries none, as the collector's posts don't)."""
     form, document = _load(raw)
     meta: dict[str, Any] = {"revision": None, "policy_source": None, "sandbox": None}
     if not isinstance(document, dict):
@@ -183,7 +198,46 @@ def parse_policy(raw: bytes) -> dict[str, Any]:
     digest = hashlib.sha256(
         json.dumps(endpoints, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-    return {"format": form, **meta, "digest": digest, "endpoints": endpoints}
+    return {"format": form, **meta, "digest": digest, "endpoints": endpoints, "base": _base(document)}
+
+
+def _base(document: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The upload's static sections as `{"sections": {...}, "dropped":
+    [...]}`, only `BASE_FIELDS`' fields. A field of another name or of the
+    wrong shape is dropped (and named), never stored: the import is about
+    the network rules, and a section RailDash only carries forward doesn't
+    refuse it. None when the upload has no static section at all."""
+    sections: dict[str, dict[str, Any]] = {}
+    dropped: list[str] = []
+    for section, fields in BASE_FIELDS.items():
+        value = document.get(section)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            dropped.append(section)
+            continue
+        kept: dict[str, Any] = {}
+        for field in sorted(value, key=str):
+            item = value[field]
+            kind = fields.get(field) if isinstance(field, str) else None
+            if kind is list:
+                ok = (isinstance(item, list) and len(item) <= MAX_BASE_PATHS
+                      and all(isinstance(path, str) and 0 < len(path) <= 4096 for path in item))
+            elif kind is str:
+                ok = isinstance(item, str) and 0 < len(item) <= 256
+            else:
+                ok = kind is bool and isinstance(item, bool)
+            if ok:
+                kept[field] = list(item) if kind is list else item
+            else:
+                dropped.append(f"{section}.{field}")
+        sections[section] = kept
+    for key in sorted(document, key=str):
+        if key not in BASE_FIELDS and key not in ("version", "network_policies"):
+            dropped.append(str(key)[:64])
+    if not sections:
+        return None
+    return {"sections": sections, "dropped": dropped}
 
 
 def _rule_endpoints(key: Any, rule: Any) -> list[dict[str, Any]]:
@@ -496,3 +550,279 @@ def parse_denials(body: Any) -> dict[str, Any]:
             "reasons": sorted(set(reasons)),
         }
     return {"denials": out, "partial": partial}
+
+
+# ---------------------------------------------------------------- the export
+
+# DR-258 (DR-194 M4, design §4.5): the guardrail in force as an OpenShell
+# policy the user applies. Lebin's §7 Q2 (2026-10-27): a policy generated
+# from the ASP baseline is the first step towards enforcement.
+EXPORT_PORT = 443
+EXPORT_RULE_PREFIX = "raildash_"
+_RULE_KEY_UNSAFE = re.compile(r"[^a-z0-9_]")
+# Anything that could end a `#` comment line: an imported value written into
+# the header must stay inside it, never become YAML of its own.
+_HEADER_UNSAFE = re.compile(r"[\x00-\x1f\x7f\u0085\u2028\u2029]")
+
+
+def _host_endpoints(record: Mapping[str, Any] | None, host: str) -> list[dict[str, Any]]:
+    """The policy's endpoints for one guardrail host: those whose host
+    pattern is that host, or covers it, or (for a guardrail wildcard) falls
+    under it. Where an export takes a host's ports and binaries from."""
+    if record is None:
+        return []
+    out = []
+    for endpoint in record["endpoints"]:
+        pattern = endpoint_host_pattern(endpoint)
+        if pattern is None:
+            continue
+        if pattern == host or g.host_matches(host, pattern) or (
+            host.startswith("*.") and g.host_matches(pattern.removeprefix("*."), host)
+        ):
+            out.append(endpoint)
+    return out
+
+
+def _rule_key(host: str, taken: set[str]) -> str:
+    stem = EXPORT_RULE_PREFIX + (_RULE_KEY_UNSAFE.sub("_", host.replace("*.", "any.").lower()) or "host")
+    key, n = stem, 2
+    while key in taken:
+        key, n = f"{stem}_{n}", n + 1
+    taken.add(key)
+    return key
+
+
+def _denied_tools(denied_tool_calls: Iterable[str]) -> set[str]:
+    """The tool part of each denied `mcp__<server>__<tool>` name: what an
+    MCP endpoint's `tools/call` rules name. RailDash can't tie a server name
+    to an endpoint, so a tool is dropped from every MCP endpoint by name."""
+    out = set()
+    for name in denied_tool_calls:
+        server = g.tool_call_server(name)
+        if server is not None:
+            out.add(name[len(g.MCP_PREFIX) + len(server) + 2:])
+    return out
+
+
+def _mcp_rules(endpoint: Mapping[str, Any], denied: set[str]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """An MCP endpoint's allow rules back from their stored text (`method`,
+    or `method tool`, or `method {a, b}`), never wider than the policy's:
+    `(rules, dropped, still_allowed)`. A rule naming one denied tool is
+    dropped; a set loses its denied tools (and is dropped when none is
+    left). A rule that allows a denied tool through a glob or with no tool
+    at all can't be narrowed by an allow rule, so it is kept and the
+    denied tools it still allows are named."""
+    rules: list[dict[str, Any]] = []
+    dropped: list[str] = []
+    still: list[str] = []
+    for text in endpoint["rules"]:
+        method, _, tool = text.partition(" ")
+        if tool.startswith("{"):
+            names = sorted({t.strip() for t in tool.strip("{}").split(",") if t.strip()})
+            kept = [n for n in names if n not in denied]
+            dropped.extend(n for n in names if n in denied)
+            if kept:
+                rules.append({"allow": {"method": method, "tool": {"any": kept}}})
+                if method in ("tools/call", "*"):
+                    still.extend(d for d in sorted(denied)
+                                 if any("*" in n and fnmatch.fnmatchcase(d, n) for n in kept))
+            continue
+        if tool and "*" not in tool:
+            if tool in denied:
+                dropped.append(tool)
+            else:
+                rules.append({"allow": {"method": method, "tool": tool}})
+            continue
+        rules.append({"allow": {"method": method, "tool": tool}} if tool else {"allow": {"method": method}})
+        if method in ("tools/call", "*"):
+            still.extend(n for n in sorted(denied) if not tool or fnmatch.fnmatchcase(n, tool))
+    return rules, dropped, still
+
+
+def _ports(endpoint: dict[str, Any], ports: list[int]) -> None:
+    if len(ports) == 1:
+        endpoint["port"] = ports[0]
+    elif ports:
+        endpoint["ports"] = ports
+
+
+def _header_line(text: str) -> str:
+    return "# " + _HEADER_UNSAFE.sub(" ", text) + "\n"
+
+
+def export_policy(
+    rules: Mapping[str, Any],
+    record: Mapping[str, Any] | None,
+    base_record: Mapping[str, Any] | None,
+    *,
+    agent: str,
+    version: str,
+    exported_at: str,
+) -> dict[str, Any]:
+    """Design §4.5: `rules` (a guardrail version's) as an OpenShell policy.
+
+    Starts from `base_record`'s static sections (the newest import that
+    carried them), else `version: 1` alone, and writes `network_policies`
+    only. Each `out_of_spec_calls.allowed_hosts` host gets an endpoint on
+    the ports `record` (the newest policy) gives it, else 443: `protocol:
+    rest`, `enforcement: audit`, `access: read-only`, or `read-write` where
+    `uploads.allowed_hosts` allows a body. In an enforced allow-list every
+    captured request already passed the policy, so its port is one of
+    those. Ports the policy passes only at L4 stay L4 (a second endpoint),
+    a host's own rules win over a wildcard's, and a pin to `allowed_ips`
+    every source endpoint has is kept. Binaries are the policy's for that host,
+    else all of its binaries: the capture records no executable path (plan
+    M4). An HTTP MCP endpoint the policy holds for an allowed host keeps its
+    tool rules, minus the tools `uploads.denied_tool_calls` names
+    (`_mcp_rules`), and then takes the place of a REST endpoint unless the
+    policy had one there too. Whatever couldn't be carried is a gap.
+
+    Answers `{"policy", "gaps", "text"}`: the policy as a mapping, what it
+    couldn't carry, and the YAML file with the gaps in its header comment."""
+    out_of_spec = rules["out_of_spec_calls"]
+    uploads = rules["uploads"]
+    gaps = [
+        "The guardrail has no ports: each host takes the ports the current policy gives it, else 443.",
+        "A body isn't a method: a GET with a body passes OpenShell and still trips the uploads rule.",
+        "uploads.max_request_bytes, service_ports and saved_files have no OpenShell field; "
+        "RailDash still judges them.",
+        "MCP servers are named by the agent's config, not by host: allowed_mcp_servers and "
+        "data_actions stay RailDash's to judge; a stdio or provider-side MCP server never crosses "
+        "the network.",
+        "Rules are rebuilt from what RailDash keeps of the policy: access presets, deny rules, "
+        "parameter matchers and an MCP endpoint's mcp settings are not carried over.",
+    ]
+    all_binaries = sorted({b for e in (record or {}).get("endpoints", []) for b in e["binaries"]})
+    denied = _denied_tools(uploads.get("denied_tool_calls", []))
+    taken: set[str] = set()
+    network: dict[str, Any] = {}
+    no_binary, widened, wildcards = [], [], []
+    emitted_mcp: set[int] = set()
+    for host in sorted(out_of_spec["allowed_hosts"]):
+        related = _host_endpoints(record, host)
+        own = [e for e in related if endpoint_host_pattern(e) == host]
+        binaries = (sorted({b for e in own for b in e["binaries"]})
+                    or sorted({b for e in related for b in e["binaries"]}))
+        if not binaries and all_binaries:
+            binaries = all_binaries
+            widened.append(host)
+        if not binaries:
+            no_binary.append(host)
+        if host.startswith("*."):
+            wildcards.append(host)
+        # An MCP endpoint is carried for its own host only, once; the host
+        # then gets a REST endpoint only where the policy had one too.
+        mcp_here = [e for e in related if e["protocol"] == "mcp" and endpoint_host_pattern(e) == host]
+        rest = [e for e in related if e["protocol"] != "mcp"
+                and (not mcp_here or endpoint_host_pattern(e) == host)]
+        # The host's own rules win over a wildcard's that also covers it.
+        rest = [e for e in rest if endpoint_host_pattern(e) == host] or rest
+        if rest or not mcp_here:
+            # Ports the policy inspects (L7) take a REST endpoint; ports it
+            # passes as plain bytes (L4) stay L4, so non-HTTP traffic isn't
+            # put through an HTTP parser.
+            l7_ports = sorted({p for e in rest if e["protocol"] is not None for p in e["ports"]})
+            l4_ports = sorted({p for e in rest if e["protocol"] is None for p in e["ports"]} - set(l7_ports))
+            # A port-less L4 endpoint stays port-less and L4, as written.
+            l4_bare = bool(rest) and not l7_ports and not l4_ports and all(e["protocol"] is None for e in rest)
+            if not l7_ports and not l4_ports and not l4_bare:
+                l7_ports = [EXPORT_PORT]
+            # A pin holds only when every endpoint the host came from had one.
+            pin = sorted({ip for e in rest for ip in e["allowed_ips"]}) if rest and all(
+                e["allowed_ips"] for e in rest) else None
+            endpoints = []
+            if l7_ports:
+                endpoint: dict[str, Any] = {"host": host}
+                _ports(endpoint, l7_ports)
+                if pin:
+                    endpoint["allowed_ips"] = pin
+                writes = pattern_covered(host, uploads["allowed_hosts"])
+                endpoint.update(protocol="rest", enforcement="audit",
+                                access="read-write" if writes else "read-only")
+                endpoints.append(endpoint)
+            if l4_ports or l4_bare:
+                endpoint = {"host": host}
+                _ports(endpoint, l4_ports)
+                if pin:
+                    endpoint["allowed_ips"] = pin
+                endpoints.append(endpoint)
+                where = f"{host}:{','.join(map(str, l4_ports))}" if l4_ports else host
+                gaps.append(f"{where} stays L4 as in the policy: "
+                            "no access preset, so uploads aren't limited there.")
+            key = _rule_key(host, taken)
+            rule: dict[str, Any] = {"name": key.replace("_", "-"), "endpoints": endpoints}
+            if binaries:
+                rule["binaries"] = [{"path": b} for b in binaries]
+            network[key] = rule
+        for mcp in mcp_here:
+            if id(mcp) in emitted_mcp:
+                continue
+            emitted_mcp.add(id(mcp))
+            tool_rules, dropped, still = _mcp_rules(mcp, denied)
+            mcp_endpoint: dict[str, Any] = {"host": mcp["host"]}
+            if mcp["path"]:
+                mcp_endpoint["path"] = mcp["path"]
+            _ports(mcp_endpoint, mcp["ports"])
+            if mcp["allowed_ips"]:
+                mcp_endpoint["allowed_ips"] = list(mcp["allowed_ips"])
+            mcp_endpoint.update(protocol="mcp", enforcement="audit", rules=tool_rules)
+            mcp_key = _rule_key(f"{host}_mcp", taken)
+            mcp_rule: dict[str, Any] = {"name": mcp_key.replace("_", "-"), "endpoints": [mcp_endpoint]}
+            if mcp["binaries"] or binaries:
+                mcp_rule["binaries"] = [{"path": b} for b in (mcp["binaries"] or binaries)]
+            network[mcp_key] = mcp_rule
+            if dropped:
+                gaps.append(f"MCP rule {mcp['rule']}: no tools/call for {', '.join(sorted(set(dropped)))}, "
+                            "which the guardrail denies (matched by tool name on every MCP endpoint).")
+            if not tool_rules:
+                gaps.append(f"MCP rule {mcp['rule']}: no allow rule is left to carry over; "
+                            "add its rules (or an access preset) by hand.")
+            if still:
+                gaps.append(f"MCP rule {mcp['rule']}: a rule allowing every tool or a glob still allows "
+                            f"{', '.join(sorted(set(still)))}, which the guardrail denies; narrow it by hand.")
+    if widened:
+        gaps.append("No policy rule names the binaries for " + ", ".join(widened)
+                    + ": every binary the policy names is allowed there instead.")
+    if no_binary:
+        gaps.append("No binary is known for " + ", ".join(no_binary) + ": OpenShell lets no process "
+                    "use a rule without one. Add `binaries` before applying it, or import the "
+                    "sandbox's policy first.")
+    if wildcards:
+        gaps.append("The guardrail's " + ", ".join(wildcards) + " matches subdomains at any depth; "
+                    "check how your OpenShell version matches `*.` and use `**.` if it is one label only.")
+    only_uploads = sorted(h for h in uploads["allowed_hosts"] if not pattern_covered(h, out_of_spec["allowed_hosts"]))
+    if only_uploads:
+        gaps.append("Upload hosts the guardrail doesn't allow calls to are left out: " + ", ".join(only_uploads) + ".")
+    for endpoint in (record or {}).get("endpoints", []):
+        reason = not_representable(endpoint)
+        if reason is not None:
+            gaps.append(f"Not carried over from rule {endpoint['rule']}: {endpoint_label(endpoint)} ({reason}).")
+    if base_record is not None and base_record.get("base"):
+        base = base_record["base"]
+        policy: dict[str, Any] = {"version": 1, **{k: dict(v) for k, v in base["sections"].items()}}
+        mark = f"revision {base_record['revision']}" if base_record.get("revision") else "no revision"
+        source = f"the sandbox policy imported {base_record.get('imported_at')} ({mark})"
+        if base["dropped"]:
+            gaps.append("Base fields RailDash doesn't keep, so not carried over: " + ", ".join(base["dropped"]) + ".")
+    else:
+        policy = {"version": 1}
+        source = "no base policy (none imported): add your sandbox's filesystem_policy, landlock and process sections"
+        gaps.append("No base policy is held, so the static sections are missing: import "
+                    "`openshell sandbox get <name> --policy-only` first, or merge network_policies by hand.")
+    policy["network_policies"] = network
+    header = [
+        f"OpenShell policy exported by RailDash from guardrail {version} for {agent}, {exported_at}.",
+        f"Based on {source}; only network_policies is replaced.",
+        "Every L7 endpoint is enforcement: audit (OpenShell logs, doesn't block). The guardrail",
+        "was proposed from what the agent was seen doing, so switch an endpoint to enforce knowingly.",
+        "Apply: note the current revision (openshell policy list <sandbox>), then",
+        "  openshell policy set <sandbox> --policy <this file> --wait",
+        "Roll back: openshell policy get <sandbox> --rev <N> --base > before.yaml, then",
+        "  openshell policy set <sandbox> --policy before.yaml --wait",
+        "Not exported:",
+        *(f"- {gap}" for gap in gaps),
+    ]
+    text = "".join(_header_line(line) for line in header) + yaml.safe_dump(
+        policy, sort_keys=False, default_flow_style=False, allow_unicode=True
+    )
+    return {"policy": policy, "gaps": gaps, "text": text}
