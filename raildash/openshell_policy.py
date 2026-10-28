@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import fnmatch
 import hashlib
+import ipaddress
 import json
 import re
 from datetime import datetime, timezone
@@ -560,6 +561,22 @@ def parse_denials(body: Any) -> dict[str, Any]:
 EXPORT_PORT = 443
 EXPORT_RULE_PREFIX = "raildash_"
 _RULE_KEY_UNSAFE = re.compile(r"[^a-z0-9_]")
+# Destinations OpenShell's network policy never authorizes (its Network
+# Rules page: "loopback, link-local, or unspecified"); loopback inside the
+# sandbox needs no rule. A rule for one would be meaningless.
+LOOPBACK_HOSTS = frozenset({"localhost", "::1"})
+
+
+def _loopback(host: str) -> bool:
+    if host in LOOPBACK_HOSTS or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_link_local or address.is_unspecified
+
+
 # Anything that could end a `#` comment line: an imported value written into
 # the header must stay inside it, never become YAML of its own.
 _HEADER_UNSAFE = re.compile(r"[\x00-\x1f\x7f\u0085\u2028\u2029]")
@@ -663,7 +680,8 @@ def export_policy(
 
     Starts from `base_record`'s static sections (the newest import that
     carried them), else `version: 1` alone, and writes `network_policies`
-    only. Each `out_of_spec_calls.allowed_hosts` host gets an endpoint on
+    only. Each `out_of_spec_calls.allowed_hosts` host (but loopback, which
+    never leaves the sandbox) gets an endpoint on
     the ports `record` (the newest policy) gives it, else 443: `protocol:
     rest`, `enforcement: audit`, `access: read-only`, or `read-write` where
     `uploads.allowed_hosts` allows a body. In an enforced allow-list every
@@ -698,7 +716,11 @@ def export_policy(
     network: dict[str, Any] = {}
     no_binary, widened, wildcards = [], [], []
     emitted_mcp: set[int] = set()
-    for host in sorted(out_of_spec["allowed_hosts"]):
+    loopback = sorted({h for h in [*out_of_spec["allowed_hosts"], *uploads["allowed_hosts"]] if _loopback(h)})
+    if loopback:
+        gaps.append("Loopback, link-local and unspecified addresses never take a rule (loopback stays "
+                    "inside the sandbox): " + ", ".join(loopback) + ".")
+    for host in sorted(h for h in out_of_spec["allowed_hosts"] if not _loopback(h)):
         related = _host_endpoints(record, host)
         own = [e for e in related if endpoint_host_pattern(e) == host]
         binaries = (sorted({b for e in own for b in e["binaries"]})
@@ -790,7 +812,8 @@ def export_policy(
     if wildcards:
         gaps.append("The guardrail's " + ", ".join(wildcards) + " matches subdomains at any depth; "
                     "check how your OpenShell version matches `*.` and use `**.` if it is one label only.")
-    only_uploads = sorted(h for h in uploads["allowed_hosts"] if not pattern_covered(h, out_of_spec["allowed_hosts"]))
+    only_uploads = sorted(h for h in uploads["allowed_hosts"]
+                          if not pattern_covered(h, out_of_spec["allowed_hosts"]) and not _loopback(h))
     if only_uploads:
         gaps.append("Upload hosts the guardrail doesn't allow calls to are left out: " + ", ".join(only_uploads) + ".")
     for endpoint in (record or {}).get("endpoints", []):
@@ -817,8 +840,8 @@ def export_policy(
         "was proposed from what the agent was seen doing, so switch an endpoint to enforce knowingly.",
         "Apply: note the current revision (openshell policy list <sandbox>), then",
         "  openshell policy set <sandbox> --policy <this file> --wait",
-        "Roll back: openshell policy get <sandbox> --rev <N> --base > before.yaml, then",
-        "  openshell policy set <sandbox> --policy before.yaml --wait",
+        "Roll back: openshell policy get <sandbox> --rev <N> --base --output json | jq -e .policy > before.json",
+        "  openshell policy set <sandbox> --policy before.json --wait",
         "Not exported:",
         *(f"- {gap}" for gap in gaps),
     ]

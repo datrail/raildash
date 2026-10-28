@@ -135,7 +135,7 @@ def test_the_file_reads_back_as_a_policy_with_its_gaps_in_the_header():
     assert back["base"] == record["base"]
     joined = "\n".join(header)
     assert "openshell policy set <sandbox> --policy <this file> --wait" in joined
-    assert "--rev <N> --base" in joined and "--dry-run" not in text
+    assert "--rev <N> --base --output json | jq -e .policy > before.json" in joined and "--dry-run" not in text
     assert "enforcement: audit" in joined
     assert "uploads.github.com" in joined  # an upload host calls aren't allowed to
     assert all(f"# - {gap}" in joined for gap in out["gaps"])
@@ -339,3 +339,16 @@ def test_the_route_is_token_gated_and_answers_a_yaml_download(store, monkeypatch
     # This ASP's guardrail allows no outside host: a policy with no rules.
     assert yaml.safe_load(answer.text) == {"version": 1, "network_policies": {}}
     assert client.get("/api/guardrails/agt-nobody/openshell-policy/export", headers=headers).status_code == 404
+
+
+def test_loopback_hosts_need_no_rule():
+    """The demo agent's own server (127.0.0.1) is in its guardrail, as in
+    datrail-project's openshell job; loopback never reaches the supervisor."""
+    record = imported("base.policy-only.yaml")
+    out = export(rules(["127.0.0.1", "localhost", "::1", "169.254.169.254", "0.0.0.0", "api.github.com"],
+                       uploads=["127.0.0.1"]), record, record)
+    assert list(out["policy"]["network_policies"]) == ["raildash_api_github_com"]
+    gaps = "\n".join(out["gaps"])
+    assert ("never take a rule (loopback stays inside the sandbox): "
+            "0.0.0.0, 127.0.0.1, 169.254.169.254, ::1, localhost.") in gaps
+    assert "Upload hosts" not in gaps
