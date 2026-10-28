@@ -623,6 +623,9 @@ def _mcp_rules(endpoint: Mapping[str, Any], denied: set[str]) -> tuple[list[dict
             dropped.extend(n for n in names if n in denied)
             if kept:
                 rules.append({"allow": {"method": method, "tool": {"any": kept}}})
+                if method in ("tools/call", "*"):
+                    still.extend(d for d in sorted(denied)
+                                 if any("*" in n and fnmatch.fnmatchcase(d, n) for n in kept))
             continue
         if tool and "*" not in tool:
             if tool in denied:
@@ -665,8 +668,9 @@ def export_policy(
     rest`, `enforcement: audit`, `access: read-only`, or `read-write` where
     `uploads.allowed_hosts` allows a body. In an enforced allow-list every
     captured request already passed the policy, so its port is one of
-    those. A host the policy allows only at L4 stays L4, and one it pins to
-    `allowed_ips` keeps the pin. Binaries are the policy's for that host,
+    those. Ports the policy passes only at L4 stay L4 (a second endpoint),
+    a host's own rules win over a wildcard's, and a pin to `allowed_ips`
+    every source endpoint has is kept. Binaries are the policy's for that host,
     else all of its binaries: the capture records no executable path (plan
     M4). An HTTP MCP endpoint the policy holds for an allowed host keeps its
     tool rules, minus the tools `uploads.denied_tool_calls` names
@@ -696,7 +700,8 @@ def export_policy(
     emitted_mcp: set[int] = set()
     for host in sorted(out_of_spec["allowed_hosts"]):
         related = _host_endpoints(record, host)
-        binaries = sorted({b for e in related for b in e["binaries"]})
+        own = [e for e in related if endpoint_host_pattern(e) == host]
+        binaries = sorted({b for e in own or related for b in e["binaries"]})
         if not binaries and all_binaries:
             binaries = all_binaries
             widened.append(host)
@@ -709,22 +714,39 @@ def export_policy(
         mcp_here = [e for e in related if e["protocol"] == "mcp" and endpoint_host_pattern(e) == host]
         rest = [e for e in related if e["protocol"] != "mcp"
                 and (not mcp_here or endpoint_host_pattern(e) == host)]
+        # The host's own rules win over a wildcard's that also covers it.
+        rest = [e for e in rest if endpoint_host_pattern(e) == host] or rest
         if rest or not mcp_here:
-            endpoint: dict[str, Any] = {"host": host}
-            _ports(endpoint, sorted({p for e in rest for p in e["ports"]}) or [EXPORT_PORT])
+            # Ports the policy inspects (L7) take a REST endpoint; ports it
+            # passes as plain bytes (L4) stay L4, so non-HTTP traffic isn't
+            # put through an HTTP parser.
+            l7_ports = sorted({p for e in rest if e["protocol"] is not None for p in e["ports"]})
+            l4_ports = sorted({p for e in rest if e["protocol"] is None for p in e["ports"]} - set(l7_ports))
+            if not l7_ports and not l4_ports:
+                l7_ports = [EXPORT_PORT]
             # A pin holds only when every endpoint the host came from had one.
-            if rest and all(e["allowed_ips"] for e in rest):
-                endpoint["allowed_ips"] = sorted({ip for e in rest for ip in e["allowed_ips"]})
-            if rest and all(e["protocol"] is None for e in rest):
-                # L4 in the policy (any bytes, no inspection): left L4, so
-                # non-HTTP traffic isn't broken by an L7 endpoint.
-                gaps.append(f"{host} stays L4 as in the policy: no access preset, so uploads aren't limited there.")
-            else:
+            pin = sorted({ip for e in rest for ip in e["allowed_ips"]}) if rest and all(
+                e["allowed_ips"] for e in rest) else None
+            endpoints = []
+            if l7_ports:
+                endpoint: dict[str, Any] = {"host": host}
+                _ports(endpoint, l7_ports)
+                if pin:
+                    endpoint["allowed_ips"] = pin
                 writes = pattern_covered(host, uploads["allowed_hosts"])
                 endpoint.update(protocol="rest", enforcement="audit",
                                 access="read-write" if writes else "read-only")
+                endpoints.append(endpoint)
+            if l4_ports:
+                endpoint = {"host": host}
+                _ports(endpoint, l4_ports)
+                if pin:
+                    endpoint["allowed_ips"] = pin
+                endpoints.append(endpoint)
+                gaps.append(f"{host}:{','.join(map(str, l4_ports))} stays L4 as in the policy: "
+                            "no access preset, so uploads aren't limited there.")
             key = _rule_key(host, taken)
-            rule: dict[str, Any] = {"name": key.replace("_", "-"), "endpoints": [endpoint]}
+            rule: dict[str, Any] = {"name": key.replace("_", "-"), "endpoints": endpoints}
             if binaries:
                 rule["binaries"] = [{"path": b} for b in binaries]
             network[key] = rule
@@ -748,6 +770,9 @@ def export_policy(
             if dropped:
                 gaps.append(f"MCP rule {mcp['rule']}: no tools/call for {', '.join(sorted(set(dropped)))}, "
                             "which the guardrail denies (matched by tool name on every MCP endpoint).")
+            if not tool_rules:
+                gaps.append(f"MCP rule {mcp['rule']}: no allow rule is left to carry over; "
+                            "add its rules (or an access preset) by hand.")
             if still:
                 gaps.append(f"MCP rule {mcp['rule']}: a rule allowing every tool or a glob still allows "
                             f"{', '.join(sorted(set(still)))}, which the guardrail denies; narrow it by hand.")

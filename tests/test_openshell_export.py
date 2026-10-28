@@ -188,6 +188,8 @@ def test_an_mcp_endpoint_keeps_its_tool_rules_minus_a_denied_tool():
     ("tools/call read_*", [{"allow": {"method": "tools/call", "tool": "read_*"}}], [], ["read_page"]),
     ("tools/call", [{"allow": {"method": "tools/call"}}], [], ["read_page"]),
     ("tools/list", [{"allow": {"method": "tools/list"}}], [], []),
+    ("tools/call {rea*, ok}", [{"allow": {"method": "tools/call", "tool": {"any": ["ok", "rea*"]}}}],
+     [], ["read_page"]),
 ])
 def test_mcp_rules_are_never_wider_than_the_policys(text, rules_out, dropped, still):
     """A denied tool is taken out where an allow rule can express it; a rule
@@ -224,11 +226,32 @@ network_policies:
         {"host": "api.corp.example.com", "port": 443, "allowed_ips": ["10.20.0.0/16"],
          "protocol": "rest", "enforcement": "audit", "access": "read-only"}]
     gaps = "\n".join(network["gaps"])
-    assert "db.internal stays L4" in gaps
+    assert "db.internal:5432 stays L4" in gaps
     # api.github.com has no rule of its own: every binary, and said so.
     assert network["policy"]["network_policies"]["raildash_api_github_com"]["binaries"] == [
         {"path": "/usr/bin/curl"}, {"path": "/usr/bin/psql"}]
     assert "No policy rule names the binaries for api.github.com" in gaps
+
+
+def test_l4_ports_stay_l4_beside_a_wildcards_rest_ports():
+    raw = b"""
+version: 1
+network_policies:
+  db:
+    endpoints: [{host: db.example.com, port: 5432}, {host: db.example.com, port: 443, protocol: rest}]
+    binaries: [{path: /bin/x}]
+  web:
+    endpoints: [{host: "*.example.com", port: 8443, protocol: rest, access: read-only}]
+    binaries: [{path: /bin/y}]
+"""
+    record = {**osp.parse_policy(raw), "imported_at": "t"}
+    rule = export(rules(["db.example.com"]), record, None)["policy"]["network_policies"]["raildash_db_example_com"]
+    # db.example.com's own rule wins over the wildcard's 8443.
+    assert rule["endpoints"] == [
+        {"host": "db.example.com", "port": 443, "protocol": "rest", "enforcement": "audit", "access": "read-only"},
+        {"host": "db.example.com", "port": 5432},
+    ]
+    assert rule["binaries"] == [{"path": "/bin/x"}]
 
 
 def test_an_imported_value_cant_break_out_of_the_header_comment():
