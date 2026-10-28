@@ -394,7 +394,8 @@ With a guardrail version in force, **Download as OpenShell policy** turns it
 into a policy file to apply to the sandbox yourself; RailDash never sends it
 to OpenShell. The file keeps the static sections of the newest imported
 policy (or is `version: 1` without one, and says so) and replaces
-`network_policies`. Each host the agent may call becomes an endpoint on the
+`network_policies`. Each host the agent may call (but loopback, which never
+leaves the sandbox) becomes an endpoint on the
 ports the policy already gives it, or 443. It is `read-only`, or
 `read-write` where the guardrail allows uploads there, and keeps the
 policy's `allowed_ips` pin; a host the policy allows only at L4 stays L4.
