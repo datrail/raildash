@@ -173,21 +173,79 @@ def test_an_mcp_endpoint_keeps_its_tool_rules_minus_a_denied_tool():
             "binaries": BINARY,
         },
     }
-    assert any("dropped tools/call for read_page" in gap for gap in out["gaps"])
+    assert any("no tools/call for read_page" in gap for gap in out["gaps"])
     # A host the guardrail doesn't allow isn't exported at all.
     assert export(rules(["api.github.com"]), record, record)["policy"]["network_policies"].keys() == {
         "raildash_api_github_com"}
 
 
-@pytest.mark.parametrize("tool, kept", [
-    ("{search_docs, read_page}", False),
-    ("{search_docs, list_pages}", True),
-    ("search_*", False),
+@pytest.mark.parametrize("text, rules_out, dropped, still", [
+    ("tools/call read_page", [], ["read_page"], []),
+    ("tools/call {search_docs, read_page}",
+     [{"allow": {"method": "tools/call", "tool": {"any": ["search_docs"]}}}], ["read_page"], []),
+    ("tools/call {read_page}", [], ["read_page"], []),
+    ("tools/call search_*", [{"allow": {"method": "tools/call", "tool": "search_*"}}], [], []),
+    ("tools/call read_*", [{"allow": {"method": "tools/call", "tool": "read_*"}}], [], ["read_page"]),
+    ("tools/call", [{"allow": {"method": "tools/call"}}], [], ["read_page"]),
+    ("tools/list", [{"allow": {"method": "tools/list"}}], [], []),
 ])
-def test_a_tool_set_rule_is_kept_only_when_nothing_in_it_is_denied(tool, kept):
-    endpoint = {"rules": [f"tools/call {tool}"]}
-    rules_out, dropped = osp._mcp_rules(endpoint, {"read_page"})  # noqa: SLF001
-    assert bool(rules_out) is kept and bool(dropped) is not kept
+def test_mcp_rules_are_never_wider_than_the_policys(text, rules_out, dropped, still):
+    """A denied tool is taken out where an allow rule can express it; a rule
+    that allows it some other way is kept, and the tool is named."""
+    assert osp._mcp_rules({"rules": [text]}, {"read_page"}) == (rules_out, dropped, still)  # noqa: SLF001
+
+
+def test_a_bare_tools_call_rule_is_named_as_still_allowing_a_denied_tool():
+    raw = fixture("mcp.policy-only.yaml").replace(
+        b"          - allow:\n              method: tools/list\n",
+        b"          - allow:\n              method: tools/list\n          - allow:\n              method: tools/call\n")
+    record = {**osp.parse_policy(raw), "imported_at": "2026-10-28T01:00:00.000000Z"}
+    gaps = "\n".join(export(rules(["mcp.example.com"], denied=["mcp__docs__read_page"]), record, record)["gaps"])
+    assert "still allows read_page" in gaps
+
+
+def test_a_host_keeps_its_l4_form_and_its_allowed_ips_pin():
+    raw = b"""
+version: 1
+network_policies:
+  db:
+    endpoints: [{host: db.internal, port: 5432}]
+    binaries: [{path: /usr/bin/psql}]
+  corp:
+    endpoints: [{host: api.corp.example.com, port: 443, protocol: rest, access: read-only,
+                 allowed_ips: [10.20.0.0/16]}]
+    binaries: [{path: /usr/bin/curl}]
+"""
+    record = {**osp.parse_policy(raw), "imported_at": "2026-10-28T01:00:00.000000Z"}
+    network = export(rules(["db.internal", "api.corp.example.com", "api.github.com"]), record, None)
+    assert network["policy"]["network_policies"]["raildash_db_internal"]["endpoints"] == [
+        {"host": "db.internal", "port": 5432}]
+    assert network["policy"]["network_policies"]["raildash_api_corp_example_com"]["endpoints"] == [
+        {"host": "api.corp.example.com", "port": 443, "allowed_ips": ["10.20.0.0/16"],
+         "protocol": "rest", "enforcement": "audit", "access": "read-only"}]
+    gaps = "\n".join(network["gaps"])
+    assert "db.internal stays L4" in gaps
+    # api.github.com has no rule of its own: every binary, and said so.
+    assert network["policy"]["network_policies"]["raildash_api_github_com"]["binaries"] == [
+        {"path": "/usr/bin/curl"}, {"path": "/usr/bin/psql"}]
+    assert "No policy rule names the binaries for api.github.com" in gaps
+
+
+def test_an_imported_value_cant_break_out_of_the_header_comment():
+    raw = b"""{"version": 1, "x\\nprocess:\\n  run_as_user: root\\n#": 1,
+ "network_policies": {"r\\nlandlock: {compatibility: hard_requirement}\\n#": {
+   "endpoints": [{"host": "*.*.example.com", "port": 443}]}}}"""
+    record = {**osp.parse_policy(raw), "imported_at": "2026-10-28T01:00:00.000000Z"}
+    assert record["base"] is None  # no static section: nothing kept, so nothing named
+    text = export(rules(["api.github.com"]), record, record)["text"]
+    assert [line for line in text.splitlines() if line.startswith("process") or line.startswith("landlock")] == []
+    assert set(yaml.safe_load(text)) == {"version", "network_policies"}
+    with_base = osp.parse_policy(b"""{"version": 1, "landlock": {"compatibility": "best_effort"},
+ "x\\nprocess:\\n  run_as_user: root\\n#": 1, "network_policies": {}}""")
+    assert with_base["base"]["dropped"] == ["x\nprocess:\n  run_as_user: root\n#"]
+    text = export(rules(["api.github.com"]), None, {**with_base, "imported_at": "t"})["text"]
+    assert set(yaml.safe_load(text)) == {"version", "landlock", "network_policies"}
+    assert yaml.safe_load(text)["landlock"] == {"compatibility": "best_effort"}
 
 
 def test_an_endpoint_that_cant_be_carried_over_is_named():
@@ -212,7 +270,9 @@ def test_the_export_is_of_the_version_in_force_on_the_newest_base(store):  # noq
     out = store.export_openshell_policy(ref)
     assert out["policy"]["filesystem_policy"]["read_write"] == ["/sandbox", "/tmp", "/dev/null"]
     endpoints = [e for rule in out["policy"]["network_policies"].values() for e in rule["endpoints"]]
-    assert endpoints and {e["enforcement"] for e in endpoints} == {"audit"}
+    # Every L7 endpoint is audit; the policy's plain L4 host stays L4.
+    assert {e.get("enforcement") for e in endpoints} == {"audit", None}
+    assert [e["host"] for e in endpoints if "protocol" not in e] == ["raw.githubusercontent.com"]
     # Read-only: nothing new is stored.
     assert store._db.execute("SELECT count(*) FROM openshell_policies").fetchone()[0] == 1  # noqa: SLF001
 

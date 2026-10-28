@@ -7,15 +7,17 @@ the agent's ASP, never inside it: the operator writes the policy, so it is
 *declared, by the operator* and changes nothing the ASP, a baseline or a
 guardrail version holds.
 
-`parse_policy` reads an upload into a record of the network endpoints only,
-field by field from an allow-list, so a credential an upload carries (a
-middleware's config, signing settings) never reaches storage. Anything that
+`parse_policy` reads an upload into a record of the network endpoints and
+the static sections an export starts from (DR-258), field by field from an
+allow-list, so a credential an upload carries (a middleware's config,
+signing settings) never reaches storage. Anything that
 isn't a readable policy raises `PolicyImportError`; a parse failure is never
 read as a policy with no endpoints.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import re
@@ -558,6 +560,9 @@ def parse_denials(body: Any) -> dict[str, Any]:
 EXPORT_PORT = 443
 EXPORT_RULE_PREFIX = "raildash_"
 _RULE_KEY_UNSAFE = re.compile(r"[^a-z0-9_]")
+# Anything that could end a `#` comment line: an imported value written into
+# the header must stay inside it, never become YAML of its own.
+_HEADER_UNSAFE = re.compile(r"[\x00-\x1f\x7f\u0085\u2028\u2029]")
 
 
 def _host_endpoints(record: Mapping[str, Any] | None, host: str) -> list[dict[str, Any]]:
@@ -599,27 +604,47 @@ def _denied_tools(denied_tool_calls: Iterable[str]) -> set[str]:
     return out
 
 
-def _mcp_rules(endpoint: Mapping[str, Any], denied: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
-    """An MCP endpoint's allow rules back from their stored text (`method`
-    or `tools/call <tool>`), without a denied tool's; and the tools dropped.
-    A rule whose tool is a set (`{a, b}`) or a glob is kept as its method
-    only if no tool in it is denied, else left out and named."""
-    rules, dropped = [], []
+def _mcp_rules(endpoint: Mapping[str, Any], denied: set[str]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    """An MCP endpoint's allow rules back from their stored text (`method`,
+    or `method tool`, or `method {a, b}`), never wider than the policy's:
+    `(rules, dropped, still_allowed)`. A rule naming one denied tool is
+    dropped; a set loses its denied tools (and is dropped when none is
+    left). A rule that allows a denied tool through a glob or with no tool
+    at all can't be narrowed by an allow rule, so it is kept and the
+    denied tools it still allows are named."""
+    rules: list[dict[str, Any]] = []
+    dropped: list[str] = []
+    still: list[str] = []
     for text in endpoint["rules"]:
         method, _, tool = text.partition(" ")
-        if not tool:
-            rules.append({"allow": {"method": method}})
-        elif tool.startswith("{") or "*" in tool:
-            names = {t.strip() for t in tool.strip("{}").split(",")}
-            if names & denied or "*" in tool:
+        if tool.startswith("{"):
+            names = sorted({t.strip() for t in tool.strip("{}").split(",") if t.strip()})
+            kept = [n for n in names if n not in denied]
+            dropped.extend(n for n in names if n in denied)
+            if kept:
+                rules.append({"allow": {"method": method, "tool": {"any": kept}}})
+            continue
+        if tool and "*" not in tool:
+            if tool in denied:
                 dropped.append(tool)
             else:
-                rules.append({"allow": {"method": method, "tool": {"any": sorted(names)}}})
-        elif tool in denied:
-            dropped.append(tool)
-        else:
-            rules.append({"allow": {"method": method, "tool": tool}})
-    return rules, dropped
+                rules.append({"allow": {"method": method, "tool": tool}})
+            continue
+        rules.append({"allow": {"method": method, "tool": tool}} if tool else {"allow": {"method": method}})
+        if method in ("tools/call", "*"):
+            still.extend(n for n in sorted(denied) if not tool or fnmatch.fnmatchcase(n, tool))
+    return rules, dropped, still
+
+
+def _ports(endpoint: dict[str, Any], ports: list[int]) -> None:
+    if len(ports) == 1:
+        endpoint["port"] = ports[0]
+    elif ports:
+        endpoint["ports"] = ports
+
+
+def _header_line(text: str) -> str:
+    return "# " + _HEADER_UNSAFE.sub(" ", text) + "\n"
 
 
 def export_policy(
@@ -635,15 +660,18 @@ def export_policy(
 
     Starts from `base_record`'s static sections (the newest import that
     carried them), else `version: 1` alone, and writes `network_policies`
-    only. One rule per `out_of_spec_calls.allowed_hosts` host, an endpoint
-    on the ports `record` (the newest policy) gives that host, else 443:
-    `protocol: rest`, `enforcement: audit`, `access: read-only`, or
-    `read-write` where `uploads.allowed_hosts` allows a body. In an enforced
-    allow-list every captured request already passed the policy, so its
-    port is one of those. Binaries are the policy's for that host, else all
-    of its binaries: the capture records no executable path (plan M4). An
-    HTTP MCP endpoint the policy holds for an allowed host keeps its tool
-    rules, minus a tool `uploads.denied_tool_calls` names.
+    only. Each `out_of_spec_calls.allowed_hosts` host gets an endpoint on
+    the ports `record` (the newest policy) gives it, else 443: `protocol:
+    rest`, `enforcement: audit`, `access: read-only`, or `read-write` where
+    `uploads.allowed_hosts` allows a body. In an enforced allow-list every
+    captured request already passed the policy, so its port is one of
+    those. A host the policy allows only at L4 stays L4, and one it pins to
+    `allowed_ips` keeps the pin. Binaries are the policy's for that host,
+    else all of its binaries: the capture records no executable path (plan
+    M4). An HTTP MCP endpoint the policy holds for an allowed host keeps its
+    tool rules, minus the tools `uploads.denied_tool_calls` names
+    (`_mcp_rules`), and then takes the place of a REST endpoint unless the
+    policy had one there too. Whatever couldn't be carried is a gap.
 
     Answers `{"policy", "gaps", "text"}`: the policy as a mapping, what it
     couldn't carry, and the YAML file with the gaps in its header comment."""
@@ -657,32 +685,44 @@ def export_policy(
         "MCP servers are named by the agent's config, not by host: allowed_mcp_servers and "
         "data_actions stay RailDash's to judge; a stdio or provider-side MCP server never crosses "
         "the network.",
+        "Rules are rebuilt from what RailDash keeps of the policy: access presets, deny rules, "
+        "parameter matchers and an MCP endpoint's mcp settings are not carried over.",
     ]
     all_binaries = sorted({b for e in (record or {}).get("endpoints", []) for b in e["binaries"]})
     denied = _denied_tools(uploads.get("denied_tool_calls", []))
     taken: set[str] = set()
     network: dict[str, Any] = {}
-    no_binary = []
+    no_binary, widened, wildcards = [], [], []
     emitted_mcp: set[int] = set()
     for host in sorted(out_of_spec["allowed_hosts"]):
         related = _host_endpoints(record, host)
-        binaries = sorted({b for e in related for b in e["binaries"]}) or all_binaries
+        binaries = sorted({b for e in related for b in e["binaries"]})
+        if not binaries and all_binaries:
+            binaries = all_binaries
+            widened.append(host)
         if not binaries:
             no_binary.append(host)
+        if host.startswith("*."):
+            wildcards.append(host)
         # An MCP endpoint is carried for its own host only, once; the host
         # then gets a REST endpoint only where the policy had one too.
         mcp_here = [e for e in related if e["protocol"] == "mcp" and endpoint_host_pattern(e) == host]
         rest = [e for e in related if e["protocol"] != "mcp"
                 and (not mcp_here or endpoint_host_pattern(e) == host)]
         if rest or not mcp_here:
-            ports = sorted({p for e in rest for p in e["ports"]}) or [EXPORT_PORT]
             endpoint: dict[str, Any] = {"host": host}
-            if len(ports) == 1:
-                endpoint["port"] = ports[0]
+            _ports(endpoint, sorted({p for e in rest for p in e["ports"]}) or [EXPORT_PORT])
+            # A pin holds only when every endpoint the host came from had one.
+            if rest and all(e["allowed_ips"] for e in rest):
+                endpoint["allowed_ips"] = sorted({ip for e in rest for ip in e["allowed_ips"]})
+            if rest and all(e["protocol"] is None for e in rest):
+                # L4 in the policy (any bytes, no inspection): left L4, so
+                # non-HTTP traffic isn't broken by an L7 endpoint.
+                gaps.append(f"{host} stays L4 as in the policy: no access preset, so uploads aren't limited there.")
             else:
-                endpoint["ports"] = ports
-            writes = pattern_covered(host, uploads["allowed_hosts"])
-            endpoint.update(protocol="rest", enforcement="audit", access="read-write" if writes else "read-only")
+                writes = pattern_covered(host, uploads["allowed_hosts"])
+                endpoint.update(protocol="rest", enforcement="audit",
+                                access="read-write" if writes else "read-only")
             key = _rule_key(host, taken)
             rule: dict[str, Any] = {"name": key.replace("_", "-"), "endpoints": [endpoint]}
             if binaries:
@@ -692,14 +732,13 @@ def export_policy(
             if id(mcp) in emitted_mcp:
                 continue
             emitted_mcp.add(id(mcp))
-            tool_rules, dropped = _mcp_rules(mcp, denied)
+            tool_rules, dropped, still = _mcp_rules(mcp, denied)
             mcp_endpoint: dict[str, Any] = {"host": mcp["host"]}
             if mcp["path"]:
                 mcp_endpoint["path"] = mcp["path"]
-            if len(mcp["ports"]) == 1:
-                mcp_endpoint["port"] = mcp["ports"][0]
-            elif mcp["ports"]:
-                mcp_endpoint["ports"] = mcp["ports"]
+            _ports(mcp_endpoint, mcp["ports"])
+            if mcp["allowed_ips"]:
+                mcp_endpoint["allowed_ips"] = list(mcp["allowed_ips"])
             mcp_endpoint.update(protocol="mcp", enforcement="audit", rules=tool_rules)
             mcp_key = _rule_key(f"{host}_mcp", taken)
             mcp_rule: dict[str, Any] = {"name": mcp_key.replace("_", "-"), "endpoints": [mcp_endpoint]}
@@ -707,12 +746,21 @@ def export_policy(
                 mcp_rule["binaries"] = [{"path": b} for b in (mcp["binaries"] or binaries)]
             network[mcp_key] = mcp_rule
             if dropped:
-                gaps.append(f"MCP rule {mcp['rule']}: dropped tools/call for {', '.join(dropped)} "
-                            "(denied by the guardrail, matched by tool name on every MCP endpoint).")
+                gaps.append(f"MCP rule {mcp['rule']}: no tools/call for {', '.join(sorted(set(dropped)))}, "
+                            "which the guardrail denies (matched by tool name on every MCP endpoint).")
+            if still:
+                gaps.append(f"MCP rule {mcp['rule']}: a rule allowing every tool or a glob still allows "
+                            f"{', '.join(sorted(set(still)))}, which the guardrail denies; narrow it by hand.")
+    if widened:
+        gaps.append("No policy rule names the binaries for " + ", ".join(widened)
+                    + ": every binary the policy names is allowed there instead.")
     if no_binary:
         gaps.append("No binary is known for " + ", ".join(no_binary) + ": OpenShell lets no process "
                     "use a rule without one. Add `binaries` before applying it, or import the "
                     "sandbox's policy first.")
+    if wildcards:
+        gaps.append("The guardrail's " + ", ".join(wildcards) + " matches subdomains at any depth; "
+                    "check how your OpenShell version matches `*.` and use `**.` if it is one label only.")
     only_uploads = sorted(h for h in uploads["allowed_hosts"] if not pattern_covered(h, out_of_spec["allowed_hosts"]))
     if only_uploads:
         gaps.append("Upload hosts the guardrail doesn't allow calls to are left out: " + ", ".join(only_uploads) + ".")
@@ -736,8 +784,8 @@ def export_policy(
     header = [
         f"OpenShell policy exported by RailDash from guardrail {version} for {agent}, {exported_at}.",
         f"Based on {source}; only network_policies is replaced.",
-        "Every endpoint is enforcement: audit (OpenShell logs, doesn't block). The guardrail was",
-        "proposed from what the agent was seen doing, so switch an endpoint to enforce knowingly.",
+        "Every L7 endpoint is enforcement: audit (OpenShell logs, doesn't block). The guardrail",
+        "was proposed from what the agent was seen doing, so switch an endpoint to enforce knowingly.",
         "Apply: note the current revision (openshell policy list <sandbox>), then",
         "  openshell policy set <sandbox> --policy <this file> --wait",
         "Roll back: openshell policy get <sandbox> --rev <N> --base > before.yaml, then",
@@ -745,7 +793,7 @@ def export_policy(
         "Not exported:",
         *(f"- {gap}" for gap in gaps),
     ]
-    text = "".join(f"# {line}\n" for line in header) + yaml.safe_dump(
+    text = "".join(_header_line(line) for line in header) + yaml.safe_dump(
         policy, sort_keys=False, default_flow_style=False, allow_unicode=True
     )
     return {"policy": policy, "gaps": gaps, "text": text}

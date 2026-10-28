@@ -394,12 +394,13 @@ With a guardrail version in force, **Download as OpenShell policy** turns it
 into a policy file to apply to the sandbox yourself; RailDash never sends it
 to OpenShell. The file keeps the static sections of the newest imported
 policy (or is `version: 1` without one, and says so) and replaces
-`network_policies`. Each host the agent may call becomes one endpoint on the
+`network_policies`. Each host the agent may call becomes an endpoint on the
 ports the policy already gives it, or 443. It is `read-only`, or
-`read-write` where the guardrail allows uploads there. Binaries are the
-policy's for that host, or else every binary the policy names. An MCP
-endpoint over HTTP keeps its tool rules, minus any tool the guardrail
-denies. Every endpoint is `enforcement: audit`: the guardrail was proposed
+`read-write` where the guardrail allows uploads there, and keeps the
+policy's `allowed_ips` pin; a host the policy allows only at L4 stays L4.
+Binaries are the policy's for that host, or else every binary the policy
+names. An MCP endpoint over HTTP keeps its tool rules, minus any tool the
+guardrail denies. Every L7 endpoint is `enforcement: audit`: the guardrail was proposed
 from what the agent was seen doing, so switch an endpoint to `enforce`
 knowingly. The file's header comment lists what it couldn't carry (ports,
 upload sizes, service ports, saved files, MCP servers by name) and how to

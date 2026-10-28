@@ -1425,6 +1425,11 @@ function renderOpenshellExport(agentRef) {
   const status = el("span", "asp-status-msg");
   status.setAttribute("aria-live", "polite");
   button.addEventListener("click", async () => {
+    // In flight, like the guardrail's other actions: a redraw waits, so the
+    // status lands on the shown span, and a second click doesn't start a
+    // second download.
+    guardrailBusy += 1;
+    button.disabled = true;
     setInlineStatus(status, "Exporting…");
     try {
       const res = await tokenFetch(`/api/guardrails/${encodeURIComponent(agentRef)}/openshell-policy/export`);
@@ -1441,12 +1446,16 @@ function renderOpenshellExport(agentRef) {
       setInlineStatus(status, `Downloaded ${name}.`, "ok");
     } catch (error) {
       setInlineStatus(status, `Not exported: ${error.message}`, "err");
+    } finally {
+      button.disabled = false;
+      guardrailBusy -= 1;
     }
   });
   const action = el("span", "guardrail-action");
   action.append(button, status);
   wrap.append(action);
   const steps = el("details", "guardrail-openshell-apply");
+  steps.dataset.key = "openshell-export-apply";
   steps.append(el("summary", null, "How to apply it, and roll it back"));
   const list = el("ol");
   const step = (text, command) => {
@@ -1467,7 +1476,7 @@ function renderOpenshellExport(agentRef) {
     "openshell policy set <sandbox> --policy before.yaml --wait");
   steps.append(list);
   steps.append(el("p", "hint",
-    "Every endpoint is audit: OpenShell logs what it would refuse and blocks nothing. The guardrail " +
+    "Every L7 endpoint is audit: OpenShell logs what it would refuse and blocks nothing. The guardrail " +
     "was proposed from what the agent was seen doing, so switch an endpoint to enforce knowingly. " +
     "What the file couldn't carry is listed in its header comment."));
   wrap.append(steps);

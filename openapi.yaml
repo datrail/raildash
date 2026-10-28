@@ -490,11 +490,12 @@ paths:
       description: >-
         Token-gated (DR-258, DR-194 M4). Read-only: nothing is stored or sent to OpenShell. The
         newest imported policy's static sections, or `version: 1` alone, with `network_policies`
-        replaced: one `audit` REST endpoint per `out_of_spec_calls.allowed_hosts` host, on the
-        ports the agent's newest policy gives it (else 443), `read-write` where
-        `uploads.allowed_hosts` covers it, with that policy's binaries; an HTTP MCP endpoint the
-        policy holds for an allowed host keeps its tool rules minus tools
-        `uploads.denied_tool_calls` names. The header comment lists what the file couldn't
+        replaced: each `out_of_spec_calls.allowed_hosts` host gets an `audit` REST endpoint on
+        the ports the agent's newest policy gives it (else 443), `read-write` where
+        `uploads.allowed_hosts` covers it, with that policy's binaries and `allowed_ips` pin; a
+        host the policy allows only at L4 stays L4. An HTTP MCP endpoint the policy holds for an
+        allowed host keeps its tool rules minus tools `uploads.denied_tool_calls` names, in place
+        of the REST endpoint unless the policy had one there too. The header comment lists what the file couldn't
         carry and how to apply and roll it back.
       parameters:
         - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}

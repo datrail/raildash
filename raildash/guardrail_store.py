@@ -205,8 +205,9 @@ BEFORE DELETE ON guardrail_versions
 BEGIN SELECT RAISE(ABORT, 'guardrail versions are immutable'); END;
 
 -- DR-248 (DR-194 M2): each OpenShell policy imported for an agent, as
--- `raildash.openshell_policy.parse_policy` reads it: its network endpoints
--- and revision, field by field, so no credential field. Beside the ASP, never in it: no ASP, baseline or
+-- `raildash.openshell_policy.parse_policy` reads it: its network endpoints,
+-- revision and (DR-258) the static sections an export starts from, field by
+-- field, so no credential field. Beside the ASP, never in it: no ASP, baseline or
 -- guardrail version refers to a row here. The newest row is the policy.
 CREATE TABLE IF NOT EXISTS openshell_policies (
     policy_id      INTEGER PRIMARY KEY AUTOINCREMENT,
