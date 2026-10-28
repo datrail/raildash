@@ -490,7 +490,7 @@ paths:
       description: >-
         Token-gated (DR-258, DR-194 M4). Read-only: nothing is stored or sent to OpenShell. The
         newest imported policy's static sections, or `version: 1` alone, with `network_policies`
-        replaced: each `out_of_spec_calls.allowed_hosts` host but loopback gets an `audit` REST endpoint on
+        replaced: each `out_of_spec_calls.allowed_hosts` host but loopback, link-local and unspecified addresses gets an `audit` REST endpoint on
         the ports the agent's newest policy gives it (else 443), `read-write` where
         `uploads.allowed_hosts` covers it, with that policy's binaries and `allowed_ips` pin; a
         host the policy allows only at L4 stays L4. An HTTP MCP endpoint the policy holds for an

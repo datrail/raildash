@@ -1472,8 +1472,8 @@ function renderOpenshellExport(agentRef) {
     "fail_closed a revision it can't load blocks the sandbox's traffic:",
     "openshell policy set <sandbox> --policy openshell-policy-<version>.yaml --wait");
   step("To roll back, take that revision's policy and set it again:",
-    "openshell policy get <sandbox> --rev <N> --base > before.yaml\n" +
-    "openshell policy set <sandbox> --policy before.yaml --wait");
+    "openshell policy get <sandbox> --rev <N> --base --output json | jq -e .policy > before.json\n" +
+    "openshell policy set <sandbox> --policy before.json --wait");
   steps.append(list);
   steps.append(el("p", "hint",
     "Every L7 endpoint is audit: OpenShell logs what it would refuse and blocks nothing. The guardrail " +

@@ -609,7 +609,7 @@ def test_the_guardrail_downloads_as_an_openshell_policy(tmp_path):
             expect(section.locator(".asp-status-msg")).to_contain_text("Downloaded openshell-policy-")
             section.get_by_text("How to apply it, and roll it back").click()
             expect(section).to_contain_text("openshell policy set <sandbox> --policy")
-            expect(section).to_contain_text("--rev <N> --base")
+            expect(section).to_contain_text("--rev <N> --base --output json | jq -e .policy")
             expect(section).not_to_contain_text("--dry-run")
             assert errors == []
             browser.close()

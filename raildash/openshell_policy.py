@@ -561,8 +561,9 @@ def parse_denials(body: Any) -> dict[str, Any]:
 EXPORT_PORT = 443
 EXPORT_RULE_PREFIX = "raildash_"
 _RULE_KEY_UNSAFE = re.compile(r"[^a-z0-9_]")
-# Hosts that never leave the sandbox: OpenShell's supervisor sees only what
-# goes out, so a rule for one would be meaningless.
+# Destinations OpenShell's network policy never authorizes (its Network
+# Rules page: "loopback, link-local, or unspecified"); loopback inside the
+# sandbox needs no rule. A rule for one would be meaningless.
 LOOPBACK_HOSTS = frozenset({"localhost", "::1"})
 
 
@@ -570,9 +571,10 @@ def _loopback(host: str) -> bool:
     if host in LOOPBACK_HOSTS or host.endswith(".localhost"):
         return True
     try:
-        return ipaddress.ip_address(host).is_loopback
+        address = ipaddress.ip_address(host)
     except ValueError:
         return False
+    return address.is_loopback or address.is_link_local or address.is_unspecified
 
 
 # Anything that could end a `#` comment line: an imported value written into
@@ -716,7 +718,8 @@ def export_policy(
     emitted_mcp: set[int] = set()
     loopback = sorted({h for h in [*out_of_spec["allowed_hosts"], *uploads["allowed_hosts"]] if _loopback(h)})
     if loopback:
-        gaps.append("Loopback stays inside the sandbox and needs no rule: " + ", ".join(loopback) + ".")
+        gaps.append("Loopback, link-local and unspecified addresses never take a rule (loopback stays "
+                    "inside the sandbox): " + ", ".join(loopback) + ".")
     for host in sorted(h for h in out_of_spec["allowed_hosts"] if not _loopback(h)):
         related = _host_endpoints(record, host)
         own = [e for e in related if endpoint_host_pattern(e) == host]
@@ -837,8 +840,8 @@ def export_policy(
         "was proposed from what the agent was seen doing, so switch an endpoint to enforce knowingly.",
         "Apply: note the current revision (openshell policy list <sandbox>), then",
         "  openshell policy set <sandbox> --policy <this file> --wait",
-        "Roll back: openshell policy get <sandbox> --rev <N> --base > before.yaml, then",
-        "  openshell policy set <sandbox> --policy before.yaml --wait",
+        "Roll back: openshell policy get <sandbox> --rev <N> --base --output json | jq -e .policy > before.json",
+        "  openshell policy set <sandbox> --policy before.json --wait",
         "Not exported:",
         *(f"- {gap}" for gap in gaps),
     ]

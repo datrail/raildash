@@ -394,8 +394,8 @@ With a guardrail version in force, **Download as OpenShell policy** turns it
 into a policy file to apply to the sandbox yourself; RailDash never sends it
 to OpenShell. The file keeps the static sections of the newest imported
 policy (or is `version: 1` without one, and says so) and replaces
-`network_policies`. Each host the agent may call (but loopback, which never
-leaves the sandbox) becomes an endpoint on the
+`network_policies`. Each host the agent may call (but loopback, link-local
+and unspecified addresses, which OpenShell never authorizes) becomes an endpoint on the
 ports the policy already gives it, or 443. It is `read-only`, or
 `read-write` where the guardrail allows uploads there, and keeps the
 policy's `allowed_ips` pin; a host the policy allows only at L4 stays L4.
@@ -406,9 +406,10 @@ from what the agent was seen doing, so switch an endpoint to `enforce`
 knowingly. The file's header comment lists what it couldn't carry (ports,
 upload sizes, service ports, saved files, MCP servers by name) and how to
 apply it and roll it back. Note the revision in force first; `openshell
-policy set <sandbox> --policy <file> --wait` applies it, and setting the
-output of `openshell policy get <sandbox> --rev <N> --base` again rolls it
-back.
+policy set <sandbox> --policy <file> --wait` applies it. To roll back, save
+that revision's policy with `openshell policy get <sandbox> --rev <N> --base
+--output json | jq -e .policy > before.json` (the plain output also prints
+the revision's details) and set it again.
 
 RailMon's opt-in `railmon openshell` collector posts the same policy
 whenever the sandbox loads a new revision, so the line shows "read by the
