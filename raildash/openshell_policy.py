@@ -561,8 +561,6 @@ def parse_denials(body: Any) -> dict[str, Any]:
 EXPORT_PORT = 443
 EXPORT_RULE_PREFIX = "raildash_"
 _RULE_KEY_UNSAFE = re.compile(r"[^a-z0-9_]")
-# Anything that could end a `#` comment line: an imported value written into
-# the header must stay inside it, never become YAML of its own.
 # Hosts that never leave the sandbox: OpenShell's supervisor sees only what
 # goes out, so a rule for one would be meaningless.
 LOOPBACK_HOSTS = frozenset({"localhost", "::1"})
@@ -577,6 +575,8 @@ def _loopback(host: str) -> bool:
         return False
 
 
+# Anything that could end a `#` comment line: an imported value written into
+# the header must stay inside it, never become YAML of its own.
 _HEADER_UNSAFE = re.compile(r"[\x00-\x1f\x7f\u0085\u2028\u2029]")
 
 
@@ -714,7 +714,7 @@ def export_policy(
     network: dict[str, Any] = {}
     no_binary, widened, wildcards = [], [], []
     emitted_mcp: set[int] = set()
-    loopback = sorted(h for h in out_of_spec["allowed_hosts"] if _loopback(h))
+    loopback = sorted({h for h in [*out_of_spec["allowed_hosts"], *uploads["allowed_hosts"]] if _loopback(h)})
     if loopback:
         gaps.append("Loopback stays inside the sandbox and needs no rule: " + ", ".join(loopback) + ".")
     for host in sorted(h for h in out_of_spec["allowed_hosts"] if not _loopback(h)):
