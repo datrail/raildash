@@ -1517,12 +1517,20 @@ const OPENSHELL_PARTIAL_WORDS = {
   poll_failed: "a poll failed",
 };
 
-function renderOpenshellDenials(denials) {
+function renderOpenshellDenials(denials, held) {
   const section = el("section", "guardrail-openshell-denials");
   section.dataset.key = "openshell-denials";
   section.append(el("h5", null, "Blocked by OpenShell (last 24 h)"));
   section.append(el("p", "muted",
     "Reported by OpenShell's supervisor. A denial isn't a violation: nothing left the sandbox."));
+  // DR-261: requests answered 403, not judged until OpenShell's log says
+  // whether it blocked them.
+  if (held) {
+    section.append(el("p", "hint", `${held.count} request${held.count === 1 ? "" : "s"} answered 403 ` +
+      `since ${fmtDateTime(held.since)} wait${held.count === 1 ? "s" : ""} for OpenShell's log: ` +
+      "one it blocked isn't judged, and one it didn't is judged within 5 minutes."));
+  }
+  if (!denials) return section;
   denials.partial.forEach((span) => {
     const from = span.from ? fmtDateTime(span.from) : "the collector's start";
     section.append(el("p", "hint", `Denials may be missing between ${from} and ${fmtDateTime(span.to)} ` +
@@ -2221,7 +2229,9 @@ async function loadGuardrails(focusKey = null) {
       card.append(renderOpenshellPolicy(detail.agent_ref, detail.openshell_policy, contained, refresh,
         Boolean(detail.active)));
     }
-    if (detail.openshell_denials) card.append(renderOpenshellDenials(detail.openshell_denials));
+    if (detail.openshell_denials || detail.openshell_held) {
+      card.append(renderOpenshellDenials(detail.openshell_denials, detail.openshell_held));
+    }
     if (detail.active) {
       card.append(renderGuardrailRules(detail.rules));
       if (!detail.active.guardrail.rules.egress_containment && detail.egress) {
