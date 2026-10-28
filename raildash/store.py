@@ -1722,6 +1722,9 @@ class Store(GuardrailCustody, DataActionsStore):
                     (session_id, session_id, session_id),
                 )
             if authenticated:
+                # DR-261: requests held for OpenShell's denial, once a batch
+                # (their own judging can queue a not-offered call).
+                self._release_held_guarded()
                 # DR-205: calls queued as "not offered" whose delay passed,
                 # judged after this batch's own listings are stored.
                 self._run_not_offered_guarded()

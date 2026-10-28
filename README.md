@@ -431,8 +431,10 @@ collector reports on the agent's sandbox, a request answered 403 waits for
 that denial (same host, method and path, logged within 10 seconds of the
 capture) before it is judged. With the denial it is dropped and shows only
 under Blocked by OpenShell; with none after 5 minutes it is judged like any
-other request. The section says how many requests are waiting. Without the
-collector a 403 is judged at once, as before.
+other request, under the version in force then (none, after **Turn off**:
+not judged). One denial excuses one request. The section says how many
+requests are waiting. Without the collector a 403 is judged at once, as
+before.
 
 Containment is a property of the sandbox, so in a multi-agent sandbox
 (evidence bundle v2 with two or more agents) the line and the rule read the

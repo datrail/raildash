@@ -124,6 +124,11 @@ OPENSHELL_POLICIES_KEPT = 20
 # and a denial logged this close to the capture is that request's.
 OPENSHELL_HOLD = timedelta(minutes=5)
 OPENSHELL_DENIAL_MATCH = timedelta(seconds=10)
+# Past this many held requests of one agent, the next 403 is judged at once,
+# as `data_actions_store.MAX_PENDING` bounds the not-offered queue; and one
+# release judges at most this many.
+OPENSHELL_HELD_MAX = 1000
+OPENSHELL_RELEASE_BATCH = 500
 OVERFLOW_RULE = "(overflow)"
 OVERFLOW_ITEM = "(overflow)"
 # Identity columns of a mark that applies to every agent.
@@ -279,6 +284,11 @@ CREATE TABLE IF NOT EXISTS openshell_held_requests (
 );
 CREATE INDEX IF NOT EXISTS openshell_held_requests_identity
     ON openshell_held_requests(identity_kind, identity_value);
+-- Each denial excuses one request only: the denials a held or incoming
+-- request was dropped for.
+CREATE TABLE IF NOT EXISTS openshell_denials_used (
+    denial_id INTEGER PRIMARY KEY
+);
 """
 
 
@@ -639,8 +649,7 @@ class GuardrailCustody:
         one newly stored ASP, under the version in force. Called by
         `Store.load_asp` inside its write transaction, after the drift
         comparison."""
-        with self._hook_guard("held requests"):
-            self._release_held_requests_locked()
+        self._release_held_guarded()
         active = self._active_guardrail_row(kind, value)
         if active is None:
             return
@@ -686,7 +695,6 @@ class GuardrailCustody:
         that stores it. `active` is `_active_guardrails()`, read once per
         batch. An unauthenticated request never reaches here (§4.1)."""
         with self._hook_guard("request"):
-            self._release_held_requests_locked()
             self._check_request_locked(interaction, active, calls)
 
     def _check_request_locked(
@@ -745,10 +753,11 @@ class GuardrailCustody:
             sandboxes,
         )]
 
-    def _openshell_denied_locked(self, sandboxes: Sequence[str], interaction: Mapping[str, Any]) -> bool:
+    def _use_openshell_denial_locked(self, sandboxes: Sequence[str], interaction: Mapping[str, Any]) -> bool:
         """Whether OpenShell logged a denial of this very request: an HTTP
         (L7) denial in one of `sandboxes` with its host, method and path,
-        within OPENSHELL_DENIAL_MATCH of its capture."""
+        within OPENSHELL_DENIAL_MATCH of its capture, that no other request
+        was dropped for. The nearest such denial is marked used."""
         host = g.normalize_host(interaction.get("host"))
         method = (interaction.get("method") or "").upper()
         path = (interaction.get("path") or "").split("?", 1)[0]
@@ -756,23 +765,28 @@ class GuardrailCustody:
         if not sandboxes or host is None or not method or not path or when is None:
             return False
         marks = ",".join("?" * len(sandboxes))
-        # A wide bound on the stored text, then the exact window on parsed
-        # times: OpenShell's and the capture's timestamps aren't written alike.
+        # Denials' `at` is stored as `_receive_time` writes it, so the window
+        # is a text range; a second's slack for the capture's own rounding.
+        slack = OPENSHELL_DENIAL_MATCH + timedelta(seconds=1)
+        found = []
         for row in self._db.execute(
-            f"SELECT at, host, method, path FROM openshell_denials WHERE sandbox IN ({marks}) "
-            "AND kind = 'http' AND at >= ? AND at <= ?",
-            (*sandboxes, self._receive_time(when - timedelta(hours=1)),
-             self._receive_time(when + timedelta(hours=1))),
+            f"SELECT d.denial_id, d.at, d.host, d.path FROM openshell_denials d "
+            f"WHERE d.sandbox IN ({marks}) AND d.kind = 'http' AND upper(d.method) = ? "
+            "AND d.at >= ? AND d.at <= ? "
+            "AND d.denial_id NOT IN (SELECT denial_id FROM openshell_denials_used)",
+            (*sandboxes, method, self._receive_time(when - slack), self._receive_time(when + slack)),
         ):
             at = g._instant(row["at"])
             if (
                 at is not None and abs(at - when) <= OPENSHELL_DENIAL_MATCH
                 and g.normalize_host(row["host"]) == host
-                and (row["method"] or "").upper() == method
                 and (row["path"] or "").split("?", 1)[0] == path
             ):
-                return True
-        return False
+                found.append((abs(at - when), row["denial_id"]))
+        if not found:
+            return False
+        self._db.execute("INSERT INTO openshell_denials_used (denial_id) VALUES (?)", (min(found)[1],))
+        return True
 
     def _hold_if_blocked_locked(
         self, interaction: Mapping[str, Any], kind: str, value: str, version: Mapping[str, Any],
@@ -784,39 +798,59 @@ class GuardrailCustody:
         was blocked. A 403 from an agent whose sandbox the collector reports
         on is therefore not judged now: with that denial already stored it
         is dropped, and otherwise held until it arrives or OPENSHELL_HOLD
-        passes. Returns whether it was dropped or held."""
+        passes. Returns whether it was dropped or held; past
+        OPENSHELL_HELD_MAX held for the agent, it is judged at once."""
         if interaction.get("status_code") != 403:
             return False
         sandboxes = self._collector_sandboxes(kind, value)
         if not sandboxes:
             return False
-        if not self._openshell_denied_locked(sandboxes, interaction):
-            self._db.execute(
-                """INSERT OR REPLACE INTO openshell_held_requests
-                       (interaction_row, identity_kind, identity_value, guardrail_version_id,
-                        held_at, calls_json)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (interaction["id"], kind, value, version["guardrail_version_id"], now,
-                 json.dumps(list(calls), ensure_ascii=False, sort_keys=True)),
-            )
+        if self._use_openshell_denial_locked(sandboxes, interaction):
+            return True
+        held = self._db.execute(
+            "SELECT count(*) FROM openshell_held_requests WHERE identity_kind = ? AND identity_value = ?",
+            (kind, value),
+        ).fetchone()[0]
+        if held >= OPENSHELL_HELD_MAX:
+            return False
+        self._db.execute(
+            """INSERT OR REPLACE INTO openshell_held_requests
+                   (interaction_row, identity_kind, identity_value, guardrail_version_id,
+                    held_at, calls_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (interaction["id"], kind, value, version["guardrail_version_id"], now,
+             json.dumps(list(calls), ensure_ascii=False, sort_keys=True)),
+        )
         return True
+
+    def _release_held_guarded(self) -> None:
+        """`_release_held_requests_locked` in a savepoint, for the write
+        paths that run it: after a capture batch, an ASP, a denials post."""
+        with self._hook_guard("held requests"):
+            self._release_held_requests_locked()
 
     def _release_held_requests_locked(self) -> None:
         """Drop each held request OpenShell's denials now cover, and judge
-        each one still held after OPENSHELL_HOLD, under the version it was
-        held under, as on ingest. Run on every request, ASP and denials
-        post, so a held request is judged even if the agent goes quiet."""
+        each one still held after OPENSHELL_HOLD as on ingest, under the
+        version in force now (an Allow this meanwhile counts; turned off
+        meanwhile, it isn't judged), stamped when it was held. Each in its
+        own savepoint: one that fails is dropped and marks the check
+        failed, so it can't block the rest."""
         now = self._receive_time()
         due = self._receive_time(_instant(now) - OPENSHELL_HOLD)
+        sandboxes: dict[tuple[str, str], list[str]] = {}
         for held in self._db.execute(
-            "SELECT * FROM openshell_held_requests ORDER BY interaction_row"
+            "SELECT * FROM openshell_held_requests ORDER BY interaction_row LIMIT ?",
+            (OPENSHELL_RELEASE_BATCH,),
         ).fetchall():
-            kind, value = held["identity_kind"], held["identity_value"]
+            identity = (held["identity_kind"], held["identity_value"])
+            if identity not in sandboxes:
+                sandboxes[identity] = self._collector_sandboxes(*identity)
             interaction = self._db.execute(
                 "SELECT * FROM interactions WHERE id = ?", (held["interaction_row"],)
             ).fetchone()
-            if interaction is not None and self._openshell_denied_locked(
-                self._collector_sandboxes(kind, value), dict(interaction)
+            if interaction is not None and self._use_openshell_denial_locked(
+                sandboxes[identity], dict(interaction)
             ):
                 self._db.execute("DELETE FROM openshell_held_requests WHERE interaction_row = ?",
                                  (held["interaction_row"],))
@@ -825,14 +859,19 @@ class GuardrailCustody:
                 continue
             self._db.execute("DELETE FROM openshell_held_requests WHERE interaction_row = ?",
                              (held["interaction_row"],))
-            version = self._db.execute(
-                "SELECT * FROM guardrail_versions WHERE guardrail_version_id = ?",
-                (held["guardrail_version_id"],),
-            ).fetchone()
-            if interaction is not None and version is not None:
+            active = self._active_guardrail_row(*identity)
+            if interaction is None or active is None:
+                continue
+            self._db.execute("SAVEPOINT held_one")
+            try:
                 self._judge_request_locked(
-                    kind, value, version, dict(interaction), json.loads(held["calls_json"]), now,
+                    *identity, active, dict(interaction), json.loads(held["calls_json"]), held["held_at"],
                 )
+            except Exception as exc:  # noqa: BLE001 - the rest still run
+                self._db.execute("ROLLBACK TO held_one")
+                print(f"raildash: a held request's check failed: {exc!r}", file=sys.stderr)
+                self._mark(*EVERY_AGENT, MARK_CHECK_FAILED, now)
+            self._db.execute("RELEASE held_one")
 
     def _openshell_held_locked(self, kind: str, value: str) -> dict[str, Any] | None:
         """The agent's held requests, for the panel: how many, since when."""
@@ -1275,9 +1314,11 @@ class GuardrailCustody:
             cutoff = self._receive_time(_instant(now) - OPENSHELL_DENIAL_RETENTION)
             self._db.execute("DELETE FROM openshell_denials WHERE at < ?", (cutoff,))
             self._db.execute("DELETE FROM openshell_denial_gaps WHERE gap_to < ?", (cutoff,))
+            self._db.execute(
+                "DELETE FROM openshell_denials_used WHERE denial_id NOT IN (SELECT denial_id FROM openshell_denials)"
+            )
             # A held request these denials cover is dropped (DR-261).
-            with self._hook_guard("held requests"):
-                self._release_held_requests_locked()
+            self._release_held_guarded()
             return {"sandbox": sandbox, "stored": stored, "duplicates": len(batch["denials"]) - stored,
                     "partial": partial is not None}
 
@@ -1528,6 +1569,12 @@ class GuardrailCustody:
                 raise ValueError("this agent has no active guardrail")
             self._db.execute(
                 "DELETE FROM guardrail_bindings WHERE identity_kind = ? AND identity_value = ?",
+                (kind, value),
+            )
+            # Requests held for OpenShell's word (DR-261) have no guardrail
+            # left to be judged against.
+            self._db.execute(
+                "DELETE FROM openshell_held_requests WHERE identity_kind = ? AND identity_value = ?",
                 (kind, value),
             )
             # A dismissed *Add data actions* offer is about the guardrail

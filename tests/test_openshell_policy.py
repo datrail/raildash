@@ -598,6 +598,51 @@ def test_a_403_openshell_didnt_deny_is_judged_once_the_hold_passes(store, monkey
     assert store.guardrail_detail(ref)["openshell_held"] is None
 
 
+def test_one_denial_excuses_one_request(store, monkeypatch):
+    """Two 403s for the same POST within the window and one denial: only
+    one was OpenShell's; the other is judged once the hold passes."""
+    ref = _adopted_in_sandbox(store)
+    first, second = _blocked_post(), _blocked_post()
+    second["timestamp"] = first["timestamp"]
+    send(store, first, second)
+    store.record_openshell_denials(SANDBOX, _l7_denial(first))
+    assert store.guardrail_detail(ref)["openshell_held"]["count"] == 1
+    assert _uploads(store, ref) == []
+    monkeypatch.setattr(guardrail_store, "OPENSHELL_HOLD", timedelta(0))
+    load(store, asp(egress_containment=egress()))
+    assert _uploads(store, ref) == ["api.github.com"]
+
+
+def test_a_request_held_when_the_guardrail_is_turned_off_is_never_judged(store, monkeypatch):
+    ref = _adopted_in_sandbox(store)
+    send(store, _blocked_post())
+    store.turn_off_guardrail(ref)
+    monkeypatch.setattr(guardrail_store, "OPENSHELL_HOLD", timedelta(0))
+    load(store, asp(egress_containment=egress()))
+    detail = store.guardrail_detail(ref)
+    assert (detail["state"], detail["openshell_held"], _uploads(store, ref)) == (g.STATE_NO_GUARDRAIL, None, [])
+
+
+def test_a_held_request_that_fails_to_judge_is_dropped_and_blocks_nothing(store, monkeypatch):
+    ref = _adopted_in_sandbox(store)
+    send(store, _blocked_post())
+    monkeypatch.setattr(guardrail_store, "OPENSHELL_HOLD", timedelta(0))
+    real = g.evaluate_request
+
+    def fails_for_the_held_one(contract, interaction, *args, **kwargs):
+        if interaction.get("status_code") == 403:
+            raise RuntimeError("boom")
+        return real(contract, interaction, *args, **kwargs)
+
+    monkeypatch.setattr(g, "evaluate_request", fails_for_the_held_one)
+    send(store, request("exfil.attacker.net"))
+    detail = store.guardrail_detail(ref)
+    # The held one failed and is gone; the batch's own request was judged.
+    assert detail["openshell_held"] is None and _uploads(store, ref) == ["exfil.attacker.net"]
+    monkeypatch.setattr(g, "evaluate_request", real)
+    send(store, request("second.attacker.net"))
+    assert sorted(_uploads(store, ref)) == ["exfil.attacker.net", "second.attacker.net"]
+
 def test_without_the_collector_or_without_a_403_a_request_is_judged_at_once(store):
     ref = _adopted_in_sandbox(store, collector=False)
     send(store, _blocked_post())
