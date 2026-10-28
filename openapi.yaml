@@ -307,7 +307,10 @@ paths:
         can't be compared. Null when there is no guardrail (DR-257).
         `openshell_denials` is Blocked by OpenShell:
         the last 24 h of denials for the agent's sandbox, grouped, with
-        `partial` spans, or null.
+        `partial` spans, or null. `openshell_held` is `{count, since}` for the
+        requests answered 403 that wait for OpenShell's denial of them before
+        they are judged (at most 5 minutes; one OpenShell denied isn't judged,
+        DR-261), or null.
       parameters:
         - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
         - {$ref: '#/components/parameters/RailDashToken'}
@@ -439,7 +442,8 @@ paths:
         "method", "path", "binary", "policy", "reason"}], "partial": null | {"from", "to",
         "reasons": [first_poll|gap|full_buffer|poll_failed]}}`, at most 2,000 denials. A line
         already stored for the sandbox (same hash) is skipped. getGuardrail's `openshell_denials`
-        shows the last 24 h; a denial changes no guardrail state.
+        shows the last 24 h; a denial changes no guardrail state, and a held request it
+        covers (getGuardrail's `openshell_held`) is dropped rather than judged (DR-261).
       parameters:
         - {name: sandbox, in: path, required: true, schema: {type: string, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$'}}
         - {$ref: '#/components/parameters/RailDashToken'}

@@ -1722,6 +1722,9 @@ class Store(GuardrailCustody, DataActionsStore):
                     (session_id, session_id, session_id),
                 )
             if authenticated:
+                # DR-261: requests held for OpenShell's denial, once a batch
+                # (their own judging can queue a not-offered call).
+                self._release_held_guarded()
                 # DR-205: calls queued as "not offered" whose delay passed,
                 # judged after this batch's own listings are stored.
                 self._run_not_offered_guarded()
@@ -1900,7 +1903,9 @@ class Store(GuardrailCustody, DataActionsStore):
         }
         with self._write_transaction():
             # DR-205: a heartbeat arrives every minute while a tap is
-            # attached, so queued "not offered" checks run even when quiet.
+            # attached, so queued "not offered" checks run even when quiet,
+            # and so do requests held for OpenShell's denial (DR-261).
+            self._release_held_guarded()
             self._run_not_offered_guarded()
             self._db.execute(
                 """INSERT INTO collector_heartbeats

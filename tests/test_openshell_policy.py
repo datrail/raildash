@@ -10,15 +10,17 @@ from __future__ import annotations
 
 import json
 from contextlib import closing
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 
 from raildash import guardrail as g
+from raildash import guardrail_store
 from raildash import openshell_policy as osp
 from raildash.store import Store
 from test_guardrail import DECLARED, _lock, _propose, stored_requests, v1_bundle
-from test_guardrail_custody import asp, baseline
+from test_guardrail_custody import asp, baseline, load, request, send
 from test_guardrail_egress import egress
 
 FIXTURES = Path(__file__).parent / "fixtures" / "openshell-0.1.3"
@@ -517,6 +519,150 @@ def test_a_denial_changes_no_guardrail_state(store):
     assert (after["state"], after["rules"], after["rows"]) == (before["state"], before["rules"], before["rows"])
     assert after["openshell_denials"]["groups"]
 
+
+
+# ------------------------------------- a request OpenShell blocked (DR-261)
+
+def _blocked_post(path: str = "/markdown", status: int = 403) -> dict:
+    """The agent's POST to api.github.com as the collector captures it when
+    OpenShell's supervisor refuses it at L7: answered 403."""
+    row = request("api.github.com")
+    row["path"], row["status_code"] = path, status
+    return row
+
+
+def _l7_denial(row: dict, *, at: str | None = None, path: str = "/markdown") -> dict:
+    return {"denials": [{
+        "at": at or row["timestamp"], "hash": f"{abs(hash((row['interaction_id'], path))):032x}"[:32],
+        "kind": "http", "host": "api.github.com", "port": 443, "method": "POST", "path": path,
+        "binary": None, "policy": "github_api",
+        "reason": f"L7_REQUEST deny POST api.github.com:443{path} reason=POST {path} not permitted by policy"}],
+        "partial": None}
+
+
+def _adopted_in_sandbox(store, *, collector: bool = True) -> str:
+    alignment, ref = baseline(store, asp(egress_containment=egress()))
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    if collector:
+        store.record_openshell_policy(SANDBOX, COLLECTOR_POLICY)
+    return ref
+
+
+def _uploads(store, ref: str) -> list[str]:
+    return [row["item"] for row in store.guardrail_detail(ref)["rows"] if row["rule"] == "uploads"]
+
+
+def test_a_request_openshell_denied_after_its_capture_isnt_judged(store):
+    ref = _adopted_in_sandbox(store)
+    before = store.guardrail_detail(ref)
+    row = _blocked_post()
+    send(store, row)
+    detail = store.guardrail_detail(ref)
+    assert (detail["state"], detail["rows"]) == (before["state"], before["rows"])
+    assert detail["openshell_held"]["count"] == 1
+    # The collector's next poll carries OpenShell's denial of it: dropped.
+    store.record_openshell_denials(SANDBOX, _l7_denial(row))
+    detail = store.guardrail_detail(ref)
+    assert detail["openshell_held"] is None
+    assert (detail["state"], detail["rows"]) == (before["state"], before["rows"])
+    assert detail["openshell_denials"]["groups"][0]["requests"] == ["POST /markdown"]
+
+
+def test_a_request_openshell_denied_before_its_capture_arrived_isnt_judged(store):
+    ref = _adopted_in_sandbox(store)
+    before = store.guardrail_detail(ref)
+    row = _blocked_post()
+    store.record_openshell_denials(SANDBOX, _l7_denial(row))
+    send(store, row)
+    detail = store.guardrail_detail(ref)
+    assert detail["openshell_held"] is None
+    assert (detail["state"], detail["rows"]) == (before["state"], before["rows"])
+
+
+def test_a_403_openshell_didnt_deny_is_judged_once_the_hold_passes(store, monkeypatch):
+    ref = _adopted_in_sandbox(store)
+    row = _blocked_post()
+    send(store, row)
+    # A denial of another path, and one of this path a minute off, aren't it.
+    store.record_openshell_denials(SANDBOX, _l7_denial(row, path="/other"))
+    later = guardrail_store._instant(row["timestamp"]) + timedelta(minutes=1)
+    store.record_openshell_denials(SANDBOX, _l7_denial(row, at=store._receive_time(later)))  # noqa: SLF001
+    assert store.guardrail_detail(ref)["openshell_held"]["count"] == 1
+    monkeypatch.setattr(guardrail_store, "OPENSHELL_HOLD", timedelta(0))
+    # Any later ingest judges it, here the next ASP: the server answered
+    # 403 itself, so the body went out.
+    load(store, asp(egress_containment=egress()))
+    detail = store.guardrail_detail(ref)
+    assert detail["openshell_held"] is None and detail["state"] == g.STATE_VIOLATED
+    assert _uploads(store, ref) == ["api.github.com"]
+    assert store.guardrail_detail(ref)["openshell_held"] is None
+
+
+def test_a_quiet_agents_held_request_is_judged_on_the_collectors_heartbeat(store, monkeypatch):
+    ref = _adopted_in_sandbox(store)
+    send(store, _blocked_post())
+    monkeypatch.setattr(guardrail_store, "OPENSHELL_HOLD", timedelta(0))
+    store.record_heartbeat("collector", taps_attached=1, sent_at=store._receive_time())  # noqa: SLF001
+    detail = store.guardrail_detail(ref)
+    assert detail["openshell_held"] is None and _uploads(store, ref) == ["api.github.com"]
+
+def test_one_denial_excuses_one_request(store, monkeypatch):
+    """Two 403s for the same POST within the window and one denial: only
+    one was OpenShell's; the other is judged once the hold passes."""
+    ref = _adopted_in_sandbox(store)
+    first, second = _blocked_post(), _blocked_post()
+    second["timestamp"] = first["timestamp"]
+    send(store, first, second)
+    store.record_openshell_denials(SANDBOX, _l7_denial(first))
+    assert store.guardrail_detail(ref)["openshell_held"]["count"] == 1
+    assert _uploads(store, ref) == []
+    monkeypatch.setattr(guardrail_store, "OPENSHELL_HOLD", timedelta(0))
+    load(store, asp(egress_containment=egress()))
+    assert _uploads(store, ref) == ["api.github.com"]
+
+
+def test_a_request_held_when_the_guardrail_is_turned_off_is_never_judged(store, monkeypatch):
+    ref = _adopted_in_sandbox(store)
+    send(store, _blocked_post())
+    store.turn_off_guardrail(ref)
+    monkeypatch.setattr(guardrail_store, "OPENSHELL_HOLD", timedelta(0))
+    load(store, asp(egress_containment=egress()))
+    detail = store.guardrail_detail(ref)
+    assert (detail["state"], detail["openshell_held"], _uploads(store, ref)) == (g.STATE_NO_GUARDRAIL, None, [])
+
+
+def test_a_held_request_that_fails_to_judge_is_dropped_and_blocks_nothing(store, monkeypatch):
+    ref = _adopted_in_sandbox(store)
+    send(store, _blocked_post())
+    monkeypatch.setattr(guardrail_store, "OPENSHELL_HOLD", timedelta(0))
+    real = g.evaluate_request
+
+    def fails_for_the_held_one(contract, interaction, *args, **kwargs):
+        if interaction.get("status_code") == 403:
+            raise RuntimeError("boom")
+        return real(contract, interaction, *args, **kwargs)
+
+    monkeypatch.setattr(g, "evaluate_request", fails_for_the_held_one)
+    send(store, request("exfil.attacker.net"))
+    detail = store.guardrail_detail(ref)
+    # The held one failed and is gone; the batch's own request was judged.
+    assert detail["openshell_held"] is None and _uploads(store, ref) == ["exfil.attacker.net"]
+    monkeypatch.setattr(g, "evaluate_request", real)
+    send(store, request("second.attacker.net"))
+    assert sorted(_uploads(store, ref)) == ["exfil.attacker.net", "second.attacker.net"]
+
+def test_without_the_collector_or_without_a_403_a_request_is_judged_at_once(store):
+    ref = _adopted_in_sandbox(store, collector=False)
+    send(store, _blocked_post())
+    detail = store.guardrail_detail(ref)
+    assert detail["openshell_held"] is None and _uploads(store, ref) == ["api.github.com"]
+
+
+def test_a_request_the_server_answered_is_judged_at_once_with_the_collector(store):
+    ref = _adopted_in_sandbox(store)
+    send(store, _blocked_post(status=201))
+    detail = store.guardrail_detail(ref)
+    assert detail["openshell_held"] is None and _uploads(store, ref) == ["api.github.com"]
 
 def test_old_denials_leave_the_view_and_then_the_database(store):
     _, ref = baseline(store, asp(egress_containment=egress()))

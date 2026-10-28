@@ -622,6 +622,57 @@ def test_the_guardrail_downloads_as_an_openshell_policy(tmp_path):
             process.wait(timeout=5)
 
 
+def test_a_held_403_says_it_waits_for_openshells_log(tmp_path):
+    """DR-261: a request answered 403 while the collector reports on the
+    agent's sandbox isn't judged until OpenShell's log says whether it
+    blocked it, and the section says so even before any denial."""
+    from test_guardrail_custody import request, send
+    from test_guardrail_egress import egress
+
+    fixtures = Path(__file__).parent / "fixtures" / "openshell-0.1.3"
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    value = asp(listeners=[DEMO_LISTENER], egress_containment=egress("allow_list_enforced"))
+    made = store.make_baseline(store.load_asp(json.dumps(value).encode())["asp_id"], "v1.0")
+    store.adopt_guardrail(made["alignment_version"]["alignment_version_id"])
+    store.record_openshell_policy("fixture-agent", (fixtures / "collector-policy.json").read_bytes())
+    row = request("api.github.com")
+    row["path"], row["status_code"] = "/markdown", 403
+    send(store, row)
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            denials = card.locator(".guardrail-openshell-denials")
+            expect(denials).to_contain_text("Blocked by OpenShell (last 24 h)", timeout=TIMEOUT)
+            expect(denials).to_contain_text("1 request answered 403 since")
+            expect(denials).to_contain_text("waits for OpenShell's log: one it blocked isn't judged")
+            expect(denials.locator(".guardrail-openshell-denial-list")).to_have_count(0)
+            expect(card).not_to_contain_text("api.github.com · uploads")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
 def test_blocked_by_openshell_shows_the_collectors_denials(tmp_path):
     """DR-249: what `railmon openshell` posts (the policy and the first
     poll's denials of the recorded sandbox) shows under the Egress line."""
