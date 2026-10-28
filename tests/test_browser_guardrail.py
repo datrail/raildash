@@ -564,6 +564,64 @@ def test_an_imported_openshell_policy_shows_on_the_egress_line_and_seeds_the_pro
             process.wait(timeout=5)
 
 
+def test_the_guardrail_downloads_as_an_openshell_policy(tmp_path):
+    """DR-258 (DR-194 M4): with a version in force, the OpenShell section
+    offers the download, which carries the base policy's static sections,
+    audit endpoints and the apply/rollback steps; the panel says the same."""
+    from test_guardrail_custody import baseline
+    from test_guardrail_egress import egress
+
+    fixtures = Path(__file__).parent / "fixtures" / "openshell-0.1.3"
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    alignment, ref = baseline(store, asp(listeners=[DEMO_LISTENER], egress_containment=egress("allow_list_enforced")))
+    store.import_openshell_policy(ref, (fixtures / "base.policy-only.yaml").read_bytes())
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page(accept_downloads=True)
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            section = card.locator(".guardrail-openshell-export")
+            button = section.get_by_role("button", name="Download as OpenShell policy")
+            expect(button).to_be_visible(timeout=TIMEOUT)
+            with page.expect_download() as download_info:
+                button.click()
+            download = download_info.value
+            assert download.suggested_filename.startswith("openshell-policy-")
+            text = Path(download.path()).read_text()
+            assert text.startswith("# OpenShell policy exported by RailDash")
+            assert "filesystem_policy:" in text and "network_policies:" in text
+            assert "enforcement: enforce" not in text
+            expect(section.locator(".asp-status-msg")).to_contain_text("Downloaded openshell-policy-")
+            section.get_by_text("How to apply it, and roll it back").click()
+            expect(section).to_contain_text("openshell policy set <sandbox> --policy")
+            expect(section).to_contain_text("--rev <N> --base")
+            expect(section).not_to_contain_text("--dry-run")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
 def test_blocked_by_openshell_shows_the_collectors_denials(tmp_path):
     """DR-249: what `railmon openshell` posts (the policy and the first
     poll's denials of the recorded sandbox) shows under the Egress line."""

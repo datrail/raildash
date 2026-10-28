@@ -461,8 +461,9 @@ paths:
       description: >-
         Token-gated (DR-248, DR-194 M2). The body is the file as the user saved it: what
         `openshell sandbox get <name> --policy-only` prints (YAML), or `sandbox get -o json` /
-        `policy get --full -o json`. Only the network endpoints and the policy's revision and
-        source are kept, so no credential field is stored. It becomes the agent's newest policy
+        `policy get --full -o json`. Only the network endpoints, the policy's revision and
+        source, and the static sections an export starts from (`filesystem_policy`, `landlock`,
+        `process`, field by field) are kept, so no credential field is stored. It becomes the agent's newest policy
         (getGuardrail's `openshell_policy`) and changes no ASP, baseline or guardrail version.
         For an agent OpenShell contains, the proposal is then seeded from it (the proposal's
         `openshell`). The answer is the stored policy without `beyond_guardrail`, which
@@ -481,6 +482,31 @@ paths:
         '404': {description: No such agent}
         '413': {description: Body over 256 KiB}
         '422': {description: Empty, or not a readable OpenShell policy; detail says what was wrong}
+
+  /api/guardrails/{agent_ref}/openshell-policy/export:
+    get:
+      operationId: exportOpenshellPolicy
+      summary: Download as OpenShell policy - the guardrail version in force as an OpenShell policy file
+      description: >-
+        Token-gated (DR-258, DR-194 M4). Read-only: nothing is stored or sent to OpenShell. The
+        newest imported policy's static sections, or `version: 1` alone, with `network_policies`
+        replaced: one `audit` REST endpoint per `out_of_spec_calls.allowed_hosts` host, on the
+        ports the agent's newest policy gives it (else 443), `read-write` where
+        `uploads.allowed_hosts` covers it, with that policy's binaries; an HTTP MCP endpoint the
+        policy holds for an allowed host keeps its tool rules minus tools
+        `uploads.denied_tool_calls` names. The header comment lists what the file couldn't
+        carry and how to apply and roll it back.
+      parameters:
+        - {name: agent_ref, in: path, required: true, schema: {type: string, pattern: '^agt-[0-9a-f]{24}$'}}
+        - {$ref: '#/components/parameters/RailDashToken'}
+      responses:
+        '200':
+          description: The policy file, as an attachment named after the version
+          content:
+            application/yaml: {schema: {type: string}}
+        '403': {description: Missing or invalid X-RailDash-Token}
+        '404': {description: No such agent}
+        '409': {description: No guardrail version in force}
 
   /api/guardrail-rows/{row_id}/acknowledge:
     post:

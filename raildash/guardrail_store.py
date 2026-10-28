@@ -114,6 +114,9 @@ OPENSHELL_DENIAL_GROUPS_SHOWN = 50
 # The newest this many denials make the groups, so an agent retrying a
 # blocked call all day can't slow the panel; counts then are lower bounds.
 OPENSHELL_DENIALS_READ = 20_000
+# How many of an agent's newest imports an export looks through for one
+# that carries a base policy.
+OPENSHELL_BASE_SCAN = 50
 OPENSHELL_POLICIES_KEPT = 20
 OVERFLOW_RULE = "(overflow)"
 OVERFLOW_ITEM = "(overflow)"
@@ -1222,6 +1225,45 @@ class GuardrailCustody:
             # follows an import, carries it (DR-257).
             view.pop("beyond_guardrail")
             return {"agent_ref": ref, **view}
+
+    def _openshell_base_locked(self, kind: str, value: str) -> dict[str, Any] | None:
+        """The newest imported policy that carries static sections (an
+        export starts from them, design §4.5), with when it was imported.
+        The collector's posts carry none, and an import from before DR-258
+        kept none, so this can be older than the policy shown, or None."""
+        for row in self._db.execute(
+            "SELECT imported_at, record_json FROM openshell_policies "
+            "WHERE identity_kind = ? AND identity_value = ? ORDER BY policy_id DESC LIMIT ?",
+            (kind, value, OPENSHELL_BASE_SCAN),
+        ):
+            record = json.loads(row["record_json"])
+            if record.get("base"):
+                return {**record, "imported_at": row["imported_at"]}
+        return None
+
+    def export_openshell_policy(self, ref: str) -> dict[str, Any]:
+        """**Download as OpenShell policy** (DR-258, DR-194 M4, design
+        §4.5): the guardrail version in force as an OpenShell policy file,
+        on the agent's newest policy and the newest base policy it holds.
+        Raises `ValueError` (409) with no version in force: a proposal isn't
+        something to enforce. Read-only: nothing is stored, and nothing is
+        sent to OpenShell; the user applies the file."""
+        with self._lock:
+            kind, value = self._resolve_agent_ref(ref)
+            active = self._active_guardrail_row(kind, value)
+            if active is None:
+                raise ValueError("no guardrail version is in force: lock one before exporting it")
+            contract = json.loads(active["contract_json"])
+            exported = osp.export_policy(
+                contract["rules"],
+                self._openshell_policy_locked(kind, value),
+                self._openshell_base_locked(kind, value),
+                agent=ref,
+                version=f"{active['version']} ({active['guardrail_version_id']})",
+                exported_at=self._receive_time(),
+            )
+            return {"agent_ref": ref, "version": active["version"],
+                    "guardrail_version_id": active["guardrail_version_id"], **exported}
 
     def require_containment(self, ref: str, require: str = "contained") -> dict[str, Any]:
         """**Require containment** (DR-207 §4.4): a new v3 version, the

@@ -1287,6 +1287,27 @@ async def api_import_openshell_policy(agent_ref: str, request: Request) -> dict[
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.get("/api/guardrails/{agent_ref}/openshell-policy/export", dependencies=[Depends(require_local_token)])
+def api_export_openshell_policy(agent_ref: str) -> Response:
+    """**Download as OpenShell policy** (DR-194 M4, DR-258): the guardrail
+    version in force as an OpenShell policy file (YAML), every endpoint in
+    `audit`, with what it couldn't carry and the apply and rollback steps in
+    its header comment. 409 with no version in force. Token-gated: it names
+    the agent's hosts and binaries. The filename comes from the version's
+    own label, never from the policy."""
+    exported = _guardrail_call(get_store().export_openshell_policy, agent_ref)
+    label = re.sub(r"[^A-Za-z0-9._-]", "_", exported["version"])[:64] or "guardrail"
+    return Response(
+        content=exported["text"].encode(),
+        media_type="application/yaml",
+        headers={
+            "Content-Disposition": f'attachment; filename="openshell-policy-{label}.yaml"',
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 @app.post(
     "/v1/openshell/sandboxes/{sandbox}/policy",
     status_code=201,

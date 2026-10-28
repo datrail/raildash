@@ -1386,7 +1386,7 @@ function describeOpenshellEndpoint(endpoint) {
   return endpoint.provider ? `${text} (provider ${endpoint.provider})` : text;
 }
 
-function renderOpenshellPolicy(agentRef, policy, offerImport, refresh) {
+function renderOpenshellPolicy(agentRef, policy, offerImport, refresh, exportable = false) {
   const section = el("div", "guardrail-openshell");
   section.dataset.key = "openshell-policy";
   if (policy) {
@@ -1407,7 +1407,71 @@ function renderOpenshellPolicy(agentRef, policy, offerImport, refresh) {
     if (policy.beyond_guardrail) section.append(renderOpenshellBeyond(policy.beyond_guardrail));
   }
   if (offerImport) section.append(renderOpenshellImport(agentRef, Boolean(policy), refresh));
+  if (exportable) section.append(renderOpenshellExport(agentRef));
   return section;
+}
+
+// DR-258 (DR-194 M4, design §4.5): the guardrail in force as an OpenShell
+// policy the user applies (Lebin's §7 Q2, 2026-10-27). RailDash never sends
+// it to OpenShell. Every endpoint is `audit`, and the steps say how to apply
+// it and roll it back; `--dry-run` is `policy update`'s, not `policy set`'s.
+function renderOpenshellExport(agentRef) {
+  const wrap = el("div", "guardrail-openshell-export");
+  wrap.dataset.key = "openshell-export";
+  const button = el("button", "btn btn-quiet", "Download as OpenShell policy");
+  button.type = "button";
+  button.dataset.key = "openshell-export-download";
+  button.title = "The guardrail in force as an OpenShell policy, every endpoint in audit";
+  const status = el("span", "asp-status-msg");
+  status.setAttribute("aria-live", "polite");
+  button.addEventListener("click", async () => {
+    setInlineStatus(status, "Exporting…");
+    try {
+      const res = await tokenFetch(`/api/guardrails/${encodeURIComponent(agentRef)}/openshell-policy/export`);
+      const name = (/filename="([^"]+)"/.exec(res.headers.get("Content-Disposition") || "") || [])[1]
+        || "openshell-policy.yaml";
+      const href = URL.createObjectURL(await res.blob());
+      const link = el("a");
+      link.href = href;
+      link.download = name;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(href), 30_000);
+      setInlineStatus(status, `Downloaded ${name}.`, "ok");
+    } catch (error) {
+      setInlineStatus(status, `Not exported: ${error.message}`, "err");
+    }
+  });
+  const action = el("span", "guardrail-action");
+  action.append(button, status);
+  wrap.append(action);
+  const steps = el("details", "guardrail-openshell-apply");
+  steps.append(el("summary", null, "How to apply it, and roll it back"));
+  const list = el("ol");
+  const step = (text, command) => {
+    const item = el("li", null, text);
+    if (command) {
+      const pre = el("pre");
+      pre.append(el("code", null, command));
+      item.append(pre);
+    }
+    list.append(item);
+  };
+  step("Note the revision in force now, for rollback:", "openshell policy list <sandbox>");
+  step("Apply the file. It exits 1 if the sandbox rejects the revision, and under the default " +
+    "fail_closed a revision it can't load blocks the sandbox's traffic:",
+    "openshell policy set <sandbox> --policy openshell-policy-<version>.yaml --wait");
+  step("To roll back, take that revision's policy and set it again:",
+    "openshell policy get <sandbox> --rev <N> --base > before.yaml\n" +
+    "openshell policy set <sandbox> --policy before.yaml --wait");
+  steps.append(list);
+  steps.append(el("p", "hint",
+    "Every endpoint is audit: OpenShell logs what it would refuse and blocks nothing. The guardrail " +
+    "was proposed from what the agent was seen doing, so switch an endpoint to enforce knowingly. " +
+    "What the file couldn't carry is listed in its header comment."));
+  wrap.append(steps);
+  return wrap;
 }
 
 // DR-257 (design §4.5's comparison): what the policy lets the agent reach
@@ -2145,7 +2209,8 @@ async function loadGuardrails(focusKey = null) {
     // already held is shown whatever the newest ASP says.
     const contained = openshellEnforced(detail.egress && detail.egress.reading);
     if (contained || detail.openshell_policy) {
-      card.append(renderOpenshellPolicy(detail.agent_ref, detail.openshell_policy, contained, refresh));
+      card.append(renderOpenshellPolicy(detail.agent_ref, detail.openshell_policy, contained, refresh,
+        Boolean(detail.active)));
     }
     if (detail.openshell_denials) card.append(renderOpenshellDenials(detail.openshell_denials));
     if (detail.active) {

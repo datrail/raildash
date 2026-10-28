@@ -323,6 +323,7 @@ token, including both reads:
 | `POST /api/guardrails/{agent_ref}/egress-containment` `{}` or `{"require": "allow_list_enforced"}` | Require containment: a new version that requires the agent's egress be contained; `starts_violated` says whether the newest ASP already fails it |
 | `POST /v1/openshell/sandboxes/{sandbox}/policy` (`policy get --full -o json`) | `railmon openshell`: a sandbox's policy revision, read as an import is, shown for every agent whose ASP names that sandbox |
 | `POST /v1/openshell/sandboxes/{sandbox}/denials` `{"denials": [...], "partial": ...}` | `railmon openshell`: the denials its supervisor logged; a line already stored is skipped |
+| `GET /api/guardrails/{agent_ref}/openshell-policy/export` | Download as OpenShell policy: the guardrail version in force as an OpenShell policy file (YAML, every endpoint `audit`); 409 with no version in force |
 | `POST /api/guardrails/{agent_ref}/openshell-policy` (the file as saved) | Import OpenShell policy: store the output of `openshell sandbox get <name> --policy-only` (or a `-o json` view) as the agent's policy; 422 says what was wrong with a file that isn't one |
 
 The proposal allows each written path of the baseline exactly, plus one
@@ -371,8 +372,10 @@ with its ports, binaries, access or rules and `enforce`/`audit`, labels a
 provider's rules with the provider, and says when it was imported, as
 "as of" once it is older than the two-hour stale window. The policy is
 declared by the operator and sits beside the ASP: it changes no ASP,
-baseline or guardrail version, and only the endpoints are kept, so a
-credential a policy carries is never stored. A file that isn't a policy is
+baseline or guardrail version. Only the endpoints and the static
+sections an export starts from (`filesystem_policy`, `landlock` and
+`process`, field by field) are kept, so a credential a policy carries is
+never stored. A file that isn't a policy is
 refused with what was wrong, and the policy already held stays. While
 RailDash holds one, a proposal adds the policy's hosts to the hosts the
 agent may call (a wildcard kept, an endpoint with only `allowed_ips` or a
@@ -386,6 +389,24 @@ force's, or the proposal's), with its rule. A policy wildcard is covered only
 by a guardrail wildcard at or above it, and an endpoint with only
 `allowed_ips` or a wildcard form the guardrail can't write is listed as
 not comparable, never as covered. This is context: it changes no state.
+
+With a guardrail version in force, **Download as OpenShell policy** turns it
+into a policy file to apply to the sandbox yourself; RailDash never sends it
+to OpenShell. The file keeps the static sections of the newest imported
+policy (or is `version: 1` without one, and says so) and replaces
+`network_policies`. Each host the agent may call becomes one endpoint on the
+ports the policy already gives it, or 443. It is `read-only`, or
+`read-write` where the guardrail allows uploads there. Binaries are the
+policy's for that host, or else every binary the policy names. An MCP
+endpoint over HTTP keeps its tool rules, minus any tool the guardrail
+denies. Every endpoint is `enforcement: audit`: the guardrail was proposed
+from what the agent was seen doing, so switch an endpoint to `enforce`
+knowingly. The file's header comment lists what it couldn't carry (ports,
+upload sizes, service ports, saved files, MCP servers by name) and how to
+apply it and roll it back. Note the revision in force first; `openshell
+policy set <sandbox> --policy <file> --wait` applies it, and setting the
+output of `openshell policy get <sandbox> --rev <N> --base` again rolls it
+back.
 
 RailMon's opt-in `railmon openshell` collector posts the same policy
 whenever the sandbox loads a new revision, so the line shows "read by the
