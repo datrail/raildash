@@ -701,7 +701,8 @@ def export_policy(
     for host in sorted(out_of_spec["allowed_hosts"]):
         related = _host_endpoints(record, host)
         own = [e for e in related if endpoint_host_pattern(e) == host]
-        binaries = sorted({b for e in own or related for b in e["binaries"]})
+        binaries = (sorted({b for e in own for b in e["binaries"]})
+                    or sorted({b for e in related for b in e["binaries"]}))
         if not binaries and all_binaries:
             binaries = all_binaries
             widened.append(host)
@@ -722,7 +723,9 @@ def export_policy(
             # put through an HTTP parser.
             l7_ports = sorted({p for e in rest if e["protocol"] is not None for p in e["ports"]})
             l4_ports = sorted({p for e in rest if e["protocol"] is None for p in e["ports"]} - set(l7_ports))
-            if not l7_ports and not l4_ports:
+            # A port-less L4 endpoint stays port-less and L4, as written.
+            l4_bare = bool(rest) and not l7_ports and not l4_ports and all(e["protocol"] is None for e in rest)
+            if not l7_ports and not l4_ports and not l4_bare:
                 l7_ports = [EXPORT_PORT]
             # A pin holds only when every endpoint the host came from had one.
             pin = sorted({ip for e in rest for ip in e["allowed_ips"]}) if rest and all(
@@ -737,13 +740,14 @@ def export_policy(
                 endpoint.update(protocol="rest", enforcement="audit",
                                 access="read-write" if writes else "read-only")
                 endpoints.append(endpoint)
-            if l4_ports:
+            if l4_ports or l4_bare:
                 endpoint = {"host": host}
                 _ports(endpoint, l4_ports)
                 if pin:
                     endpoint["allowed_ips"] = pin
                 endpoints.append(endpoint)
-                gaps.append(f"{host}:{','.join(map(str, l4_ports))} stays L4 as in the policy: "
+                where = f"{host}:{','.join(map(str, l4_ports))}" if l4_ports else host
+                gaps.append(f"{where} stays L4 as in the policy: "
                             "no access preset, so uploads aren't limited there.")
             key = _rule_key(host, taken)
             rule: dict[str, Any] = {"name": key.replace("_", "-"), "endpoints": endpoints}

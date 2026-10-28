@@ -254,6 +254,24 @@ network_policies:
     assert rule["binaries"] == [{"path": "/bin/x"}]
 
 
+def test_a_hosts_own_rule_without_binaries_takes_a_covering_wildcards_and_bare_l4_stays_l4():
+    raw = b"""
+version: 1
+network_policies:
+  a: {endpoints: [{host: api.x.com, port: 443, protocol: rest}]}
+  w: {endpoints: [{host: "*.x.com", port: 443, protocol: rest}], binaries: [{path: /w}]}
+  o: {endpoints: [{host: other.com, port: 443}], binaries: [{path: /o}]}
+  d: {endpoints: [{host: db.x.com}], binaries: [{path: /d}]}
+"""
+    record = {**osp.parse_policy(raw), "imported_at": "t"}
+    out = export(rules(["api.x.com", "db.x.com"]), record, None)
+    network = out["policy"]["network_policies"]
+    assert network["raildash_api_x_com"]["binaries"] == [{"path": "/w"}]
+    assert network["raildash_db_x_com"]["endpoints"] == [{"host": "db.x.com"}]
+    gaps = "\n".join(out["gaps"])
+    assert "No policy rule names the binaries" not in gaps and "db.x.com stays L4" in gaps
+
+
 def test_an_imported_value_cant_break_out_of_the_header_comment():
     raw = b"""{"version": 1, "x\\nprocess:\\n  run_as_user: root\\n#": 1,
  "network_policies": {"r\\nlandlock: {compatibility: hard_requirement}\\n#": {
