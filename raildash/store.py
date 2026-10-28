@@ -1903,7 +1903,9 @@ class Store(GuardrailCustody, DataActionsStore):
         }
         with self._write_transaction():
             # DR-205: a heartbeat arrives every minute while a tap is
-            # attached, so queued "not offered" checks run even when quiet.
+            # attached, so queued "not offered" checks run even when quiet,
+            # and so do requests held for OpenShell's denial (DR-261).
+            self._release_held_guarded()
             self._run_not_offered_guarded()
             self._db.execute(
                 """INSERT INTO collector_heartbeats

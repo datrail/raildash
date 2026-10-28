@@ -598,6 +598,14 @@ def test_a_403_openshell_didnt_deny_is_judged_once_the_hold_passes(store, monkey
     assert store.guardrail_detail(ref)["openshell_held"] is None
 
 
+def test_a_quiet_agents_held_request_is_judged_on_the_collectors_heartbeat(store, monkeypatch):
+    ref = _adopted_in_sandbox(store)
+    send(store, _blocked_post())
+    monkeypatch.setattr(guardrail_store, "OPENSHELL_HOLD", timedelta(0))
+    store.record_heartbeat("collector", taps_attached=1, sent_at=store._receive_time())  # noqa: SLF001
+    detail = store.guardrail_detail(ref)
+    assert detail["openshell_held"] is None and _uploads(store, ref) == ["api.github.com"]
+
 def test_one_denial_excuses_one_request(store, monkeypatch):
     """Two 403s for the same POST within the window and one denial: only
     one was OpenShell's; the other is judged once the hold passes."""
