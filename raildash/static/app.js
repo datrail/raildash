@@ -524,27 +524,51 @@ const MKDTEMP = /^([^/]*[._-])([A-Za-z0-9]{6})$/;
 const MKDTEMP_ROOTS = ["/tmp/", "/var/tmp/", "/dev/shm/"];
 const READS_LEFT_OUT = "more distinct files than the cap (reads are left out first)";
 
-function mkdtempTemplate(part) {
+// DR-267: a prefix in `families` (mkdtempFamilies) folds an all-lower-case
+// random part too, as the server's mkdtemp_families does.
+function mkdtempTemplate(part, families = new Set()) {
   const match = MKDTEMP.exec(part);
-  if (!match || !/[A-Z0-9]/.test(match[2])) return part;
+  if (!match || (!/[A-Z0-9]/.test(match[2]) && !families.has(match[1]))) return part;
   return (match[1].match(/[\p{L}\p{N}]/gu) || []).length < 3 ? part : `${match[1]}*`;
 }
 
-function generatedNameTemplate(path) {
+function mkdtempParts(path) {
+  const cut = path.lastIndexOf("/") + 1;
+  if (!cut) return [];
+  const inTemp = MKDTEMP_ROOTS.some((root) => path.startsWith(root));
+  const parts = path.slice(0, cut - 1).split("/");
+  return parts.filter((part, index) => inTemp || parts.slice(0, index).includes(".cache"));
+}
+
+function mkdtempFamilies(paths) {
+  const families = new Set();
+  paths.forEach((path) => {
+    if (path.includes("*")) return;
+    mkdtempParts(path).forEach((part) => {
+      const match = MKDTEMP.exec(part);
+      if (match && /[A-Z0-9]/.test(match[2]) && (match[1].match(/[\p{L}\p{N}]/gu) || []).length >= 3) {
+        families.add(match[1]);
+      }
+    });
+  });
+  return families;
+}
+
+function generatedNameTemplate(path, families = new Set()) {
   if (path.includes("*")) return path;
   const cut = path.lastIndexOf("/") + 1;
   const name = path.slice(cut).replace(UUID_RUN, "*").replace(SQLITE_TEMP, "$1*");
   const inTemp = MKDTEMP_ROOTS.some((root) => path.startsWith(root));
   const parts = cut ? path.slice(0, cut - 1).split("/") : [];
   const directory = cut ? parts.map((part, index) =>
-    (inTemp || parts.slice(0, index).includes(".cache") ? mkdtempTemplate(part) : part)).join("/") + "/" : "";
+    (inTemp || parts.slice(0, index).includes(".cache") ? mkdtempTemplate(part, families) : part)).join("/") + "/" : "";
   return directory + name;
 }
 
-function foldedFileEntries(entries) {
+function foldedFileEntries(entries, families = new Set()) {
   const folded = new Map();
   entries.forEach((entry) => {
-    const path = generatedNameTemplate(entry.path);
+    const path = generatedNameTemplate(entry.path, families);
     const key = `${entry.layer ? 1 : 0}:${path}`;
     const seen = folded.get(key);
     folded.set(key, seen
@@ -568,7 +592,8 @@ function windowedFileEntries(before, after) {
     current = current.filter((entry) => !(readOnly(entry) && !listed.has(fileKey(entry))
       && (!lastRead || later(entry, lastRead))));
   }
-  return [foldedFileEntries(previous), foldedFileEntries(current)];
+  const families = mkdtempFamilies([...previous, ...current].map((entry) => entry.path));
+  return [foldedFileEntries(previous, families), foldedFileEntries(current, families)];
 }
 
 // Rows of [label, paths], in the order a reader cares about: what the
