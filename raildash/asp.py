@@ -13,7 +13,7 @@ import json
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from jsonschema import Draft202012Validator, FormatChecker
 
@@ -835,19 +835,51 @@ def only_reads_left_out(attribute: Any) -> bool:
     )
 
 
-def _mkdtemp_template(part: str) -> str:
+def _mkdtemp_template(part: str, families: frozenset[str] = frozenset()) -> str:
     match = _MKDTEMP.fullmatch(part)
-    if (match is None or not _MKDTEMP_RANDOM.search(match["random"])
-            or sum(character.isalnum() for character in match["prefix"]) < 3):
+    if match is None or sum(character.isalnum() for character in match["prefix"]) < 3:
+        return part
+    if not _MKDTEMP_RANDOM.search(match["random"]) and match["prefix"] not in families:
         return part
     return match["prefix"] + "*"
 
 
-def generated_name_template(path: str) -> str | None:
+def _mkdtemp_parts(path: str) -> list[str]:
+    """The directories of `path` a mkdtemp name may be: those below a temp
+    or cache directory. Not the file name."""
+    directory, slash, _ = path.rpartition("/")
+    if not slash:
+        return []
+    parts = directory.split("/")
+    in_temp = path.startswith(_MKDTEMP_ROOTS)
+    return [part for index, part in enumerate(parts) if in_temp or ".cache" in parts[:index]]
+
+
+def mkdtemp_families(paths: Iterable[str]) -> frozenset[str]:
+    """The mkdtemp prefixes these paths show as such: a directory where
+    `_mkdtemp_template` folds one, its random part holding a digit or a
+    capital (DR-267). Six random letters and digits are all lower case one
+    time in about 180 (OpenClaw's CLI's `openclaw-sqlite-readonly-v2-gbxhrn`,
+    several a turn), so one of a known family folds even then; a lone name
+    of that shape (`pip-wheels`) still doesn't."""
+    families: set[str] = set()
+    for path in paths:
+        if "*" in path:
+            continue
+        for part in _mkdtemp_parts(path):
+            match = _MKDTEMP.fullmatch(part)
+            if (match and _MKDTEMP_RANDOM.search(match["random"])
+                    and sum(character.isalnum() for character in match["prefix"]) >= 3):
+                families.add(match["prefix"])
+    return frozenset(families)
+
+
+def generated_name_template(path: str, families: frozenset[str] = frozenset()) -> str | None:
     """`path` with the parts a run mints afresh made `*`: each run of uuids
     and a SQLite temp file's random part in its file name, and a mkdtemp
     directory's random suffix in its directories below a temp or cache
-    directory. None when there is none,
+    directory (all lower case too, for a prefix in `families`,
+    `mkdtemp_families`). None when there is none,
     or the path already has a `*` (RailMon's own templates), which as a
     guardrail glob would match more than it says."""
     if "*" in path:
@@ -858,7 +890,7 @@ def generated_name_template(path: str) -> str | None:
         parts = directory.split("/")
         in_temp = path.startswith(_MKDTEMP_ROOTS)
         directory = "/".join(
-            _mkdtemp_template(part) if in_temp or ".cache" in parts[:index] else part
+            _mkdtemp_template(part, families) if in_temp or ".cache" in parts[:index] else part
             for index, part in enumerate(parts))
     folded = directory + slash + templated
     return folded if folded != path else None
@@ -906,9 +938,15 @@ def _comparable_file_access(
             )
         ]
 
+    # The mkdtemp families either list shows (DR-267), so an all-lower-case
+    # name of one folds on both sides alike.
+    families = mkdtemp_families(
+        entry["path"] for entry in (*before, *current_value)
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str))
+
     def folded(value: list[Any]) -> list[Any]:
         return [
-            {**entry, "path": generated_name_template(entry["path"]) or entry["path"]}
+            {**entry, "path": generated_name_template(entry["path"], families) or entry["path"]}
             if isinstance(entry, dict) and isinstance(entry.get("path"), str) else entry
             for entry in value
         ]

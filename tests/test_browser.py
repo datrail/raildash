@@ -612,6 +612,30 @@ def test_kernel_observed_files_sit_beside_the_asked_ones_and_a_new_write_is_drif
                 for line in row.locator(".asp-file-change").all()
             }
             assert changes == {"Newly written": ["/workspace/exfil.txt", "/workspace/sessions.json.1.*.tmp"]}
+
+            # DR-267: an all-lower-case mkdtemp name of a family the lists
+            # show reads as that family's one line, as the server folds it.
+            cache = "/home/u/.cache/oc"
+            families = bundle("bnd-browser-families", [WROTE, written(f"{cache}/oc-sqlite-Ab12cd/owner.sqlite"),
+                                                         written(f"{cache}/oc-sqlite-gbxhrn/owner.sqlite")],
+                              collected_at="2026-09-24T05:00:00Z")
+            response = page.request.post(
+                f"{url}/v1/evidence-bundles", data=encode(families),
+                headers={"X-RailDash-Token": token, "Content-Type": "application/json"},
+            )
+            assert response.status == 202, response.text()
+            page.locator("#refresh").click()
+            row = page.locator(".asp-state-card", has_text="Drift detected").first.locator(
+                ".asp-file-diff",
+                has=page.locator(".asp-diff-new", has_text="3 files [ANSWERED, observed]"),
+            )
+            row.wait_for()
+            row.locator(".drift-label", has_text="oc-sqlite-*").wait_for()
+            changes = {
+                line.get_attribute("data-kind"): line.locator(".drift-label").all_inner_texts()
+                for line in row.locator(".asp-file-change").all()
+            }
+            assert changes == {"Newly written": ["/home/u/.cache/oc/oc-sqlite-*/owner.sqlite", "/workspace/exfil.txt"]}
             assert errors == []
             browser.close()
     finally:
