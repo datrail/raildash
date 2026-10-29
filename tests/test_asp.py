@@ -29,6 +29,7 @@ from raildash.asp import (
     parse_bundle,
     resolve_identity,
     generated_name_template,
+    mkdtemp_families,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -984,6 +985,30 @@ def test_a_real_agents_fresh_sqlite_and_mkdtemp_names_are_not_newly_written():
         assert _window_drift(baseline, _windowed_v2([], [_file(path, write=True)])) == [
             (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
         ], path
+
+
+def test_an_all_lower_case_mkdtemp_name_of_a_known_family_folds_too():
+    """DR-267 (datrail-project run 40844275024): six random letters and
+    digits are all lower case about once in 180, and OpenClaw's CLI makes
+    several such directories a turn, so `openclaw-sqlite-readonly-v2-gbxhrn`
+    read as a newly written path. A family either list shows folds it; a
+    lone name of that shape is still someone's choice."""
+    cache = "/home/node/.cache/openclaw"
+    baseline = _windowed_v2([], [_file(f"{cache}/openclaw-sqlite-readonly-v2-jRu2h7/owner.sqlite", write=True)])
+    for fresh in ("gbxhrn", "QOnshQ"):
+        current = _windowed_v2([], [_file(f"{cache}/openclaw-sqlite-readonly-v2-{fresh}/owner.sqlite", write=True)])
+        assert _window_drift(baseline, current) == [], fresh
+    # And the other way round: a lower-case name locked in the baseline.
+    lower = _windowed_v2([], [_file(f"{cache}/openclaw-sqlite-readonly-v2-gbxhrn/owner.sqlite", write=True)])
+    later = _windowed_v2([], [_file(f"{cache}/openclaw-sqlite-readonly-v2-QOnshQ/owner.sqlite", write=True)])
+    assert _window_drift(lower, later) == []
+    # No family: pip-wheels is a name, and a new one is new.
+    pip = _windowed_v2([], [_file("/home/node/.cache/pip-wheels/a.whl", write=True)])
+    assert _window_drift(baseline, pip) == [(None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"])]
+    assert mkdtemp_families([f"{cache}/openclaw-sqlite-readonly-v2-jRu2h7/x", "/home/node/.cache/pip-wheels/a",
+                             "/tmp/ab-Xy12cd/x", "/tmp/tmp*/x", "/srv/run-Xy12cd/x"]) == {"openclaw-sqlite-readonly-v2-"}
+    assert generated_name_template("/tmp/run-gbxhrn/x") is None
+    assert generated_name_template("/tmp/run-gbxhrn/x", frozenset({"run-"})) == "/tmp/run-*/x"
 
 
 def _capped(value: dict, *, note: str) -> dict:
