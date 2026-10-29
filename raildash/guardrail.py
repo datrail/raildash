@@ -1255,6 +1255,9 @@ def egress_reading(attribute: Any) -> dict[str, Any] | None:
             via=value.get("via") if isinstance(value.get("via"), str) else None,
             gateway_peers=sorted({str(p) for n in networks for p in _list(n.get("gateway_peers"))}),
             reasons=[str(r) for r in _list(value.get("reasons"))],
+            # DR-266: how many endpoints OpenShell's allow-list holds, when
+            # `railmon openshell` read it for this sandbox; None when unread.
+            allow_list_entries=len(value["allow_list"]) if isinstance(value.get("allow_list"), list) else None,
         )
     return reading
 

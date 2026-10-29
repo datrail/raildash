@@ -1342,6 +1342,10 @@ function renderEgressLine(egress, policyHeld = false) {
     let [word, why] = EGRESS_WORDS[reading.level] || ["Unknown", reading.level];
     if (policyHeld && reading.level === "allow_list_enforced") {
       why = "it should not reach outside hosts itself; OpenShell enforces an allow-list (the imported policy is below)";
+    } else if (reading.level === "allow_list_enforced" && Number.isInteger(reading.allow_list_entries)) {
+      // DR-266: RailMon carried the allow-list, read from OpenShell by the collector.
+      const n = reading.allow_list_entries;
+      why = `it should not reach outside hosts itself; OpenShell enforces an allow-list of ${n} endpoint${n === 1 ? "" : "s"}, in the ASP`;
     }
     line.append(el("span", reading.contained ? "guardrail-egress-contained" : "guardrail-egress-open", word),
       document.createTextNode(`: ${why}`));

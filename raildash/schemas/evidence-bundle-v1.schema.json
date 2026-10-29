@@ -420,7 +420,136 @@
           "maxLength": 300
         },
         "allow_list": {
-          "const": null
+          "$comment": "DR-266. Null unless railmon openshell's copy of the sandbox's loaded OpenShell policy was current for this sandbox: then one entry per allowed endpoint and port, as `openshell policy get` returned it (host null for an endpoint named only by allowed_ips). Sorted by host, then port; at most 131072 bytes as compact JSON, checked in code.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "required": [
+              "host",
+              "allowed_ips",
+              "port",
+              "path",
+              "protocol",
+              "enforcement",
+              "access",
+              "rules",
+              "deny_rules",
+              "binaries"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "host": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 253
+              },
+              "allowed_ips": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                }
+              },
+              "port": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1,
+                "maximum": 65535
+              },
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 1024
+              },
+              "protocol": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "enforcement": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "access": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1,
+                "maxLength": 256
+              },
+              "rules": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "object",
+                  "minProperties": 1,
+                  "additionalProperties": false,
+                  "properties": {
+                    "method": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 1024
+                    },
+                    "path": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 1024
+                    },
+                    "command": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 1024
+                    },
+                    "operation_type": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 1024
+                    },
+                    "tool": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 1024
+                    }
+                  }
+                }
+              },
+              "deny_rules": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "binaries": {
+                "type": "array",
+                "maxItems": 32,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                }
+              }
+            }
+          }
         },
         "reasons": {
           "type": "array",
@@ -432,7 +561,7 @@
           }
         }
       },
-      "$comment": "DR-207. Whether the agent can open a connection to any outside host itself, read from Docker's view of the container (egress_containment). contained is true exactly for the first three levels. allow_list is always null in this pack: an enforced allow-list whose contents are not readable from the host, not an empty one. ANSWERED and PARTIAL carry this object; PARTIAL is always level open. RailMon writes null for ABSENT, BLIND and FAILED."
+      "$comment": "DR-207. Whether the agent can open a connection to any outside host itself, read from Docker's view of the container (egress_containment). contained is true exactly for the first three levels. allow_list is null unless the level is allow_list_enforced and railmon openshell's copy of the sandbox's policy was current (DR-266): null is an enforced allow-list whose contents were not read, not an empty one. ANSWERED and PARTIAL carry this object; PARTIAL is always level open. RailMon writes null for ABSENT, BLIND and FAILED."
     },
     "non_runtime_source": {
       "allOf": [
