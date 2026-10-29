@@ -187,6 +187,45 @@ def test_the_reading_never_calls_partial_contained():
     assert g.egress_reading(egress(status="BLIND")) == {"status": "BLIND", "level": None, "contained": None}
 
 
+def test_a_bundle_carrying_an_allow_list_is_taken_and_a_bad_one_refused(store):
+    """DR-266: v1's allow_list is null or RailMon's bounded list (RailMon's
+    schema, vendored), and v2 holds it to the same shape."""
+    from raildash.asp import BundleValidationError, parse_bundle
+    from test_guardrail import _single_agent_v2
+
+    entry = {"host": "api.github.com", "allowed_ips": [], "port": 443, "path": None, "protocol": "rest",
+             "enforcement": "enforce", "access": "read-only", "rules": [{"method": "GET", "path": "/zen"}],
+             "deny_rules": 0, "binaries": ["/usr/bin/python3"]}
+    value = _single_agent_v2([], [])
+    attribute = egress()
+    attribute["value"]["allow_list"] = [entry]
+    value["sandbox"]["attributes"]["egress_containment"] = attribute
+    assert parse_bundle(json.dumps(value).encode())
+    for bad in ({**entry, "port": "443"}, {**entry, "extra": 1}, {k: v for k, v in entry.items() if k != "path"},
+                {**entry, "rules": [{}]}):
+        broken = copy.deepcopy(value)
+        broken["sandbox"]["attributes"]["egress_containment"]["value"]["allow_list"] = [bad]
+        with pytest.raises(BundleValidationError, match="allow_list"):
+            parse_bundle(json.dumps(broken).encode())
+
+
+def test_the_reading_counts_an_allow_list_railmon_read():
+    # DR-266: RailMon carries the sandbox's allow-list when `railmon
+    # openshell` read it from OpenShell; null means unread, not empty.
+    assert g.egress_reading(egress())["allow_list_entries"] is None
+    read = egress()
+    read["value"]["allow_list"] = [
+        {"host": "api.github.com", "allowed_ips": [], "port": 443, "path": None, "protocol": "rest",
+         "enforcement": "enforce", "access": "read-only", "rules": [], "deny_rules": 0,
+         "binaries": ["/usr/bin/python3"]},
+        {"host": None, "allowed_ips": ["10.0.0.0/8"], "port": 443, "path": None, "protocol": None,
+         "enforcement": None, "access": None, "rules": [], "deny_rules": 0, "binaries": []},
+    ]
+    assert g.egress_reading(read)["allow_list_entries"] == 2
+    read["value"]["allow_list"] = []
+    assert g.egress_reading(read)["allow_list_entries"] == 0
+
+
 # ----------------------------------------------------------------- proposal
 
 
@@ -277,7 +316,8 @@ def test_require_containment_on_an_open_agent_says_it_starts_violated(store):
     assert g.EGRESS not in detail["rules"]
     assert detail["egress"] == {
         "reading": {"status": "ANSWERED", "level": "open", "contained": False, "enforcer": None, "via": None,
-                    "gateway_peers": [], "reasons": ["why open"], "stale": False, "multi_agent": False},
+                    "gateway_peers": [], "reasons": ["why open"], "allow_list_entries": None, "stale": False,
+                    "multi_agent": False},
         "proxy_declared": {"HTTPS_PROXY": "http://proxy.corp:3128"},
     }
     made = store.require_containment(ref)
