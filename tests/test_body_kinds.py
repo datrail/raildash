@@ -2,8 +2,8 @@
 
 Every expected kind is written down here, first over the captures in
 `fixtures/` (model and MCP traffic, the keyed capture's empty POSTs, a
-trimmed SSE request, and OpenClaw's start-up calls and model requests), then over bodies shaped as public APIs document them, then
-over each bound.
+trimmed SSE request, and OpenClaw's start-up calls and model requests),
+then over bodies shaped as public APIs document them, then over each bound.
 """
 
 from __future__ import annotations

@@ -5,22 +5,22 @@ outside CI with the config datrail-project's `openclaw-exec` and
 `openclaw-gateway` stack jobs use, read from the plaintext it wrote to each
 TLS connection on 2026-10-31:
 
-- the gateway form's three start-up calls, with its default config: the
+- the gateway form's three start-up calls, which that config leaves on: the
   update check to `telemetry.openclaw.ai`, the model catalog from
   `catalog.openclaw.ai` and the plugin feed from `clawhub.ai`, all `GET`s
   with no body;
 - one `openclaw agent exec` turn against the stack's model stub
-  (`tests/openclaw/model_stub.py`): the two `POST /v1/chat/completions`
-  requests, before and after its `write` tool call. They are unchanged
-  apart from stand-ins for values of the machine that captured them: the
-  model host (`my-model:8443`, as in the stack), the host name
-  (`openclaw-ci`), the kernel release (`6.8.0`) and the install and work
-  paths (`/usr/local/lib/node_modules`, `/home/node`). `content-length`
+  (datrail-project's `tests/openclaw/model_stub.py`): the two `POST
+  /v1/chat/completions` requests, before and after its `write` tool call.
+  They are unchanged apart from stand-ins for values of the machine that
+  captured them: the model host (`my-model:8443`, as in the stack), the host
+  name (`openclaw-ci`), the kernel release (`6.8.0`) and the install and
+  work paths (`/usr/local/lib/node_modules`, `/home/node`). `content-length`
   is dropped, since the rewrite changes it.
 
-Timestamps are rounded to the second. The model requests carry OpenClaw's
-own system prompt, tool definitions and skill descriptions, under its
-license below.
+Timestamps are approximate (within a minute); nothing reads them. The model
+requests carry OpenClaw's own system prompt, tool definitions and skill
+descriptions, under its license below.
 
 ## OpenClaw license
 
