@@ -2,7 +2,7 @@
 
 Every expected kind is written down here, first over the captures in
 `fixtures/` (model and MCP traffic, the keyed capture's empty POSTs, a
-trimmed SSE request and OpenClaw's start-up calls and model requests), then over bodies shaped as public APIs document them, then
+trimmed SSE request, and OpenClaw's start-up calls and model requests), then over bodies shaped as public APIs document them, then
 over each bound.
 """
 
@@ -45,10 +45,10 @@ REAL_CAPTURES = [
     ("codex-responses-captures.jsonl", ["upload/traffic"] * 3),
     # Keyed multi-agent capture: three POSTs of `{}`.
     ("keyed-capture.jsonl", ["parameters/shape"] * 3),
-    # OpenClaw 2026.10.8, as datrail-project's openclaw jobs run it: the
-    # gateway's three start-up GETs carry no body; one exec turn's two
-    # chat-completions POSTs, each about 37 KB (over the 16 KiB bound), are
-    # model traffic by their shape.
+    # OpenClaw 2026.10.8, configured as datrail-project's openclaw jobs run
+    # it: the gateway's three start-up GETs carry no body (so they are
+    # skipped here); one exec turn's two chat-completions POSTs are model
+    # traffic whatever their size (about 37 KB each).
     ("openclaw/captures.jsonl", ["upload/traffic"] * 2),
 ]
 
@@ -70,13 +70,14 @@ def test_openclaws_start_up_calls_carry_no_body():
     # classifier, so none of them can count against the uploads rule.
     starts = [e["request"] for e in exchanges("openclaw/captures.jsonl")
               if e["request"]["method"] == "GET"]
-    assert [(r["headers"]["host"], r["path"]) for r in starts] == [
-        ("telemetry.openclaw.ai", "/api/latest-version"),
+    assert sorted((r["headers"]["host"], r["path"]) for r in starts) == [
         ("catalog.openclaw.ai", "/models/v2/catalog.json"),
         ("clawhub.ai", "/v1/feeds/plugins"),
+        ("telemetry.openclaw.ai", "/api/latest-version"),
     ]
     assert not any(bk.request_carries_body(r) for r in starts)
-    assert {bk.stored_kind(e) for e in exchanges("openclaw/captures.jsonl")} == {"", "traffic"}
+    assert sorted(bk.stored_kind(e) for e in exchanges("openclaw/captures.jsonl")) == [
+        "", "", "", "traffic", "traffic"]
 
 
 def test_claude_codes_request_is_model_traffic_whatever_its_size():
