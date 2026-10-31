@@ -359,16 +359,20 @@ an upload again, and the hosts it only queried count as upload hosts.
 
 An Uploads row lists each body it was hit by: its kind, method, path
 template, size and why. **This is parameters** on a body RailDash couldn't
-decide, or decided from its shape, saves a version with that answer; it is
-not offered on a file, model traffic or a body past the daily budget. The
-panel offers **Narrow uploads** for an upload host the last 24 hours only
-sent parameters to: a version listing it as only queried, so a file sent
-there then counts. RailDash checks first that the move makes no request of
-that day and no stored row count, and offers nothing while 5,000 or more
-captures of every agent are in the day. A capture's **Bytes sent per host**
-splits each host's bytes by body kind (upload, unknown, model or MCP,
-parameters, no body kept); a request captured more than a day before
-RailDash first read body kinds reads as not classified.
+decide, or on one an earlier version's answer decided that the version in
+force doesn't carry, saves a version with that answer. It isn't offered on
+a file, model traffic or a body past the daily budget, nor on a row with no
+host or one flagged only by a size cap. The panel offers **Narrow uploads**
+for an upload host the last 24 hours only sent parameters to: a version
+listing it as only queried, so a file, a large body or one RailDash can't
+read sent there then counts. RailDash checks first that the move makes no
+request of that day and no stored row count, and offers nothing while the
+day holds 5,000 or more authenticated captures of all agents together. A
+capture's **Bytes sent per host** splits each host's bytes by body kind
+(upload, unknown, model or MCP, parameters, no body kept). A request is
+read as not classified when it was captured more than a day before
+RailDash first read body kinds, has no readable capture time, or was stored
+by an older RailDash.
 
 The proposal allows each written path of the baseline exactly, plus one
 glob it always shows: `**/__pycache__/*.pyc`, Python's bytecode caches.
