@@ -780,8 +780,9 @@ class GuardrailCustody:
         counted after it: a body judged late (its response came first, or
         OpenShell held it) can't slip under bodies already counted with
         later times. A capture time ahead of the server's clock, or none,
-        reads as now, so no stamp moves the window past what was counted;
-        old rows are pruned by the server's clock. A body with no host
+        reads as now, and one more than a day behind it as a day ago, so no
+        stamp moves the window off what is still kept: rows are pruned by
+        the server's clock, two days back. A body with no host
         stays as classified: the rule already reads it as an upload."""
         if body is None or body.get("kind") != _bk.PARAMETERS:
             return body
@@ -790,7 +791,7 @@ class GuardrailCustody:
             return body
         clock = _instant(now)
         when = g._instant(interaction.get("timestamp"))
-        when = clock if when is None or when > clock else when
+        when = clock if when is None or when > clock else max(when, clock - timedelta(seconds=_bk.DAY_SECONDS))
         uploads = contract["rules"]["uploads"]
         keys = g.drip_keys(host, contract["rules"]["out_of_spec_calls"]["allowed_hosts"])
         budgets, agent_budget = g.drip_budgets(uploads)

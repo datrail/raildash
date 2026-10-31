@@ -2026,6 +2026,8 @@ def propose_guardrail(
     if on:
         call_hosts = set(_declared_lists(attributes)[0] or ()) | set(seed["hosts"] if seed is not None else ())
         budget = _bk.ParametersBudget()
+        stamps = [stamp.timestamp() for stamp in (_instant(r.get("timestamp")) for r in requests) if stamp is not None]
+        latest = max(stamps, default=0.0)
         order = sorted(range(len(requests)), key=lambda i: (_instant(requests[i].get("timestamp")) is None,
                                                           _instant(requests[i].get("timestamp")) or 0, i))
         for i in order:
@@ -2034,8 +2036,8 @@ def propose_guardrail(
             if kinds[i] is None or host is None:
                 continue
             # One with no capture time is sorted last and counted at the
-            # latest time seen, so it still counts.
-            at = when.timestamp() if when is not None else float("-inf")
+            # latest time any request has, so it still counts.
+            at = when.timestamp() if when is not None else latest
             kinds[i] = budget.observe(kinds[i], drip_keys(host, call_hosts), at)
     dripped = [kind is not None and kind.get("step") == _bk.STEP_DRIP for kind in kinds]
     uploading = [

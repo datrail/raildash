@@ -457,11 +457,15 @@ def _counted(store) -> int:  # noqa: F811
         "SELECT coalesce(sum(bytes), 0) FROM guardrail_parameters_bytes WHERE budget_key = ?", (SEARCH,)).fetchone()[0]
 
 
-@pytest.mark.parametrize("arrange", ["reversed", "future", "no_time", "naive_time"])
+@pytest.mark.parametrize("arrange", ["reversed", "future", "no_time", "naive_time", "days_old"])
 def test_no_capture_time_gets_parameters_past_the_budget(store, arrange):  # noqa: F811
     """Late, future-stamped and unstamped bodies are all still bounded."""
     from datetime import datetime, timedelta, timezone
     ref, _ = _drip_agent(store)
+    if arrange == "days_old":
+        # A guardrail active for ten days: older captures are judged.
+        store._db.execute("UPDATE guardrail_bindings SET activated_at = ?",  # noqa: SLF001
+                          (store._receive_time(datetime.now(timezone.utc) - timedelta(days=10)),))  # noqa: SLF001
     requests = _queries(SEARCH, 120, start=_now())
     if arrange == "reversed":
         requests.reverse()
@@ -472,6 +476,8 @@ def test_no_capture_time_gets_parameters_past_the_budget(store, arrange):  # noq
             request["timestamp"] = None
         elif arrange == "naive_time":
             request["timestamp"] = datetime.now().isoformat()
+        elif arrange == "days_old":
+            request["timestamp"] = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     send(store, *requests)
     assert _counted(store) <= 256 * 1024
     assert rows(store, ref)[("uploads", SEARCH)]["counts"]
@@ -494,3 +500,12 @@ def test_merged_drip_keeps_the_largest_sums_and_adds_the_bytes():
     two = {"entries": {SEARCH: 90, "x": 5}, "agent": 300, "bytes": 20, "over": 50}
     assert g._merged_drip(one, two) == {"entries": {SEARCH: 100, "x": 5}, "agent": 300, "bytes": 20, "over": 60}
     assert g._merged_drip(one, {"entries": {SEARCH: "1"}, "agent": 1, "bytes": 1}) is None
+
+
+def test_the_proposal_counts_unstamped_bodies_too(store):  # noqa: F811
+    alignment, bundle = _lock(store, __import__("test_guardrail").v1_bundle(**DECLARED))
+    requests = _queries(SEARCH, 100, start="2026-08-15T00:00:00Z")
+    for request in requests:
+        request["timestamp"] = None
+    proposal = _propose(alignment, bundle, requests)
+    assert [v["item"] for v in proposal["would_be_violations"] if v["rule"] == "uploads"] == [SEARCH]
