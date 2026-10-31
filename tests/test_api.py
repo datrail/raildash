@@ -121,10 +121,14 @@ def test_observed_profile_summarises_one_capture(client):
     assert observed["tool_names_truncated"] is False
     # One fixture row has no host, so its 182 bytes belong to no destination.
     assert observed["upload_bytes"] == [
-        {"value": "api.anthropic.com", "count": 3, "total_bytes": 1087, "max_bytes": 531},
-        {"value": "host.openshell.internal:8091", "count": 2, "total_bytes": 540, "max_bytes": 318},
-        {"value": "exfil.attacker.net", "count": 1, "total_bytes": 182, "max_bytes": 182},
-        {"value": "registry.npmjs.org", "count": 1, "total_bytes": 182, "max_bytes": 182},
+        {"value": "api.anthropic.com", "count": 3, "total_bytes": 1087, "max_bytes": 531,
+         "by_kind": {"traffic": 1087}},
+        {"value": "host.openshell.internal:8091", "count": 2, "total_bytes": 540, "max_bytes": 318,
+         "by_kind": {"traffic": 540}},
+        {"value": "exfil.attacker.net", "count": 1, "total_bytes": 182, "max_bytes": 182,
+         "by_kind": {"no_body": 182}},
+        {"value": "registry.npmjs.org", "count": 1, "total_bytes": 182, "max_bytes": 182,
+         "by_kind": {"no_body": 182}},
     ]
     # delivery_track_package is not a file tool.
     assert observed["file_access"] == []
@@ -234,7 +238,7 @@ def test_observed_profile_bounds_individual_value_lengths(client, monkeypatch):
     assert observed["models"] == [{"value": "captured", "count": 1}]
     assert observed["tool_names"] == [{"value": "captured", "count": 1}]
     assert observed["upload_bytes"] == [
-        {"value": "captured", "count": 1, "total_bytes": 64, "max_bytes": 64}
+        {"value": "captured", "count": 1, "total_bytes": 64, "max_bytes": 64, "by_kind": {"parameters": 64}}
     ]
     assert observed["tool_names_truncated"] is True
     assert observed["truncated_dimensions"] == [
@@ -1222,8 +1226,9 @@ def test_observed_profile_sums_bytes_sent_per_host(client):
     ]).json()["observed"]
 
     assert observed["upload_bytes"] == [
-        {"value": "files.example", "count": 2, "total_bytes": 5_001_000, "max_bytes": 5_000_000},
-        {"value": "api.example", "count": 1, "total_bytes": 300, "max_bytes": 300},
+        {"value": "files.example", "count": 2, "total_bytes": 5_001_000, "max_bytes": 5_000_000,
+         "by_kind": {"no_body": 5_001_000}},
+        {"value": "api.example", "count": 1, "total_bytes": 300, "max_bytes": 300, "by_kind": {"no_body": 300}},
     ]
 
 
@@ -1241,7 +1246,7 @@ def test_a_request_size_that_is_not_a_byte_count_is_dropped_not_fatal(client):
 
     assert observed["interaction_count"] == 6
     assert observed["upload_bytes"] == [
-        {"value": "h.example", "count": 1, "total_bytes": 10, "max_bytes": 10}
+        {"value": "h.example", "count": 1, "total_bytes": 10, "max_bytes": 10, "by_kind": {"no_body": 10}}
     ]
     totals = client.get("/api/overview", params={"session_id": "odd-sizes"}).json()["totals"]
     assert totals["request_bytes"] == 10
@@ -1273,7 +1278,7 @@ def test_a_pre_existing_non_integer_size_never_shapes_upload_bytes(tmp_path):
     store._db.commit()
 
     assert store.observed_profile("old")["observed"]["upload_bytes"] == [
-        {"value": "h.example", "count": 1, "total_bytes": 10, "max_bytes": 10}
+        {"value": "h.example", "count": 1, "total_bytes": 10, "max_bytes": 10, "by_kind": {"no_body": 10}}
     ]
     store.close()
 
@@ -1293,7 +1298,7 @@ def test_an_agent_profile_counts_only_that_agents_bytes(client):
     ).json()["observed"]
 
     assert observed["upload_bytes"] == [
-        {"value": "files.example", "count": 1, "total_bytes": 100, "max_bytes": 100}
+        {"value": "files.example", "count": 1, "total_bytes": 100, "max_bytes": 100, "by_kind": {"no_body": 100}}
     ]
 
 

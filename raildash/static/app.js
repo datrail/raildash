@@ -2679,7 +2679,7 @@ function cappedChips(values, chips, key, noun) {
 // One profile dimension: a heading, an optional note, and a chip per value
 // with its count, or "None observed".
 function profileGroup(title, items, {
-  className, note, chipClass = "profile-chip", count, noun = "values", describe,
+  className, note, chipClass = "profile-chip", count, noun = "values", describe, detail,
 }) {
   const group = el("section", className ? `profile-group ${className}` : "profile-group");
   group.append(el("h3", null, title));
@@ -2692,6 +2692,8 @@ function profileGroup(title, items, {
     const chip = el("span", chipClass);
     chip.append(el("span", "profile-value", item.value));
     chip.append(el("span", "profile-count", count(item)));
+    const more = detail ? detail(item) : "";
+    if (more) chip.append(el("span", "profile-count profile-split", more));
     if (describe) {
       // Why, shown under the chip on hover and on keyboard focus (the chip
       // takes focus only when it has a reason), and read as its description.
@@ -2746,12 +2748,29 @@ function profileDataActions(items) {
   });
 }
 
+// REST uploads §4: what each host's bytes were, by body kind, in the
+// server's order (uploads first). A profile from before the split has none.
+const BODY_KIND_SPLIT_LABELS = {
+  upload: "upload", unknown: "unknown", traffic: "model or MCP", parameters: "parameters",
+  no_body: "no body kept", unclassified: "not classified",
+};
+
+function bodyKindSplit(item) {
+  const split = item.by_kind && typeof item.by_kind === "object" ? item.by_kind : null;
+  if (!split) return "";
+  return Object.entries(split)
+    .filter(([kind, bytes]) => Object.hasOwn(BODY_KIND_SPLIT_LABELS, kind) && typeof bytes === "number" && bytes > 0)
+    .map(([kind, bytes]) => `${BODY_KIND_SPLIT_LABELS[kind]} ${fmtBytes(bytes)}`)
+    .join(" · ");
+}
+
 function profileUploads(title, items) {
   return profileGroup(title, items, {
     noun: "hosts",
     chipClass: "profile-chip profile-chip-stacked",
     count: (item) =>
       `${fmtInt(item.count)} calls · ${fmtBytes(item.total_bytes)} · largest ${fmtBytes(item.max_bytes)}`,
+    detail: bodyKindSplit,
   });
 }
 

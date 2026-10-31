@@ -568,6 +568,9 @@ def normalise(interaction: dict[str, Any]) -> dict[str, Any]:
         "has_ticket": int(interaction_has_ticket(interaction)),
         "request_media_type": request_media_type(request),
         "content_kinds": ",".join(request_content_kinds(request)),
+        # REST uploads §4: classified here, from the exchange already read,
+        # rather than by parsing the stored `raw` again under the store lock.
+        "body_kind": _stored_body_kind(legacy),
         "agent_host_id": agent_host_id,
         "sandbox_name": sandbox_name,
         "agent_key": agent_key,
@@ -607,3 +610,10 @@ def read_jsonl(path: str) -> tuple[list[dict[str, Any]], int]:
             else:
                 skipped += 1
     return items, skipped
+
+
+def _stored_body_kind(exchange: Any) -> str:
+    # Imported here: `raildash.body_kinds` imports this module.
+    from .body_kinds import stored_kind
+
+    return stored_kind(exchange)

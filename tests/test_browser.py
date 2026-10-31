@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import socket
 import subprocess
 import sys
@@ -335,6 +336,11 @@ def test_capture_drift_shows_a_much_larger_upload_to_a_known_host(tmp_path):
             # The selected capture's observed profile lists the same fact.
             chip = page.locator(".profile-group", has_text="Bytes sent per host").locator(".profile-chip")
             chip.first.wait_for()
+            # REST uploads M2c: what those bytes were, by body kind.
+            assert chip.first.locator(".profile-split").inner_text().startswith("model or MCP ")
+            if os.environ.get("RAILDASH_SHOT_DIR"):
+                page.locator(".profile-group", has_text="Bytes sent per host").screenshot(
+                    path=os.path.join(os.environ["RAILDASH_SHOT_DIR"], "bytes-by-kind.png"))
             # The host name stays on one line at every grid width; the long
             # count used to squeeze it to one character per line (~1180px).
             for width in (1180, 1400, 900, 600):
