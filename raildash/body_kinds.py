@@ -10,7 +10,10 @@ wins:
    a body over 16 KiB, or a string over 1 KiB anywhere in it (a GraphQL
    body's `query` text excepted: step 4 bounds it);
 2. a user override, keyed by host, method and path template;
-3. an imported spec, which can only tighten (M3; not read here yet);
+3. the host's imported spec (`raildash.api_specs`), which can only tighten:
+   if the request's operation carries files or content for the request's
+   media type, the body is `upload`; any other operation leaves the body to
+   the steps below;
 4. the body's shape: a JSON object or urlencoded form of at most 4 KiB,
    whose keys and values are all short scalars (strings of at most 256
    characters), nested at most 4 deep, with at most 64 values, is
