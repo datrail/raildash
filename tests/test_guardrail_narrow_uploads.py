@@ -240,3 +240,16 @@ def test_routes_need_the_local_token_and_narrow_through_http(client):
                     headers={"X-RailDash-Token": app_module.LOCAL_TOKEN})
     assert res.status_code == 201, res.text
     assert json.loads(res.text)["guardrail"]["rules"]["uploads"]["parameters_only_hosts"] == [SEARCH]
+
+
+def test_repeats_of_a_stored_row_dont_recompute_the_offer_on_every_poll(store, monkeypatch):  # noqa: F811
+    ref, _ = _agent(store, SEARCH)
+    send(store, now(SEARCH, QUERY), now("evil.example", upload_body(), path="/v1/files"))
+    assert store.guardrail_detail(ref)["narrow_uploads_offer"] is not None
+    calls = []
+    real = g.narrow_uploads_hosts
+    monkeypatch.setattr(g, "narrow_uploads_hosts", lambda *a: calls.append(1) or real(*a))
+    for _ in range(3):
+        send(store, now("evil.example", upload_body(), path="/v1/files"))
+        assert store.guardrail_detail(ref)["narrow_uploads_offer"] is not None
+    assert calls == []

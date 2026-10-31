@@ -1317,11 +1317,15 @@ class GuardrailCustody:
         nothing to offer, every such host was dismissed, or the window holds
         more requests than are read (not every one could be checked).
 
+        The read limit counts every agent's captures in the window, since
+        they are read before they are given to this one.
+
         The detail route asks on every poll, so the answer is kept until
-        the version, the agent's rows or the dismissals change; new captures
-        (of any agent: who owns one is only known by reading it) are read at
-        most once a minute, and the window is moved every ten minutes. A
-        kept offer can be out of date, never wrong to accept: accepting
+        the version or the dismissals change, a row is added or
+        acknowledged, or ten minutes pass (the window moves); new captures
+        and repeats of a stored row (of any agent: who owns a capture is
+        only known by reading it) are read at most once a minute. A kept
+        offer can be out of date, never wrong to accept: accepting
         re-computes it."""
         active = self._active_guardrail_row(kind, value)
         if active is None or not g.body_kinds_on():
@@ -1329,7 +1333,7 @@ class GuardrailCustody:
         end = datetime.now(timezone.utc)
         dismissed = self._narrow_dismissed_locked(kind, value)
         rows_key = tuple(self._db.execute(
-            "SELECT count(*), max(row_id), max(last_seen), max(acknowledged_at), sum(hits) FROM guardrail_rows "
+            "SELECT count(*), max(row_id), max(acknowledged_at) FROM guardrail_rows "
             "WHERE identity_kind = ? AND identity_value = ?", (kind, value),
         ).fetchone())
         latest = self._db.execute("SELECT max(id) FROM interactions").fetchone()[0]
@@ -1338,7 +1342,7 @@ class GuardrailCustody:
         kept = cache.get((kind, value))
         if cached and kept is not None and kept["key"] == key:
             age = end.timestamp() - kept["at"]
-            if age < NARROW_OFFER_MAX_AGE and (kept["latest"] == latest or age < NARROW_OFFER_MIN_AGE):
+            if 0 <= age < NARROW_OFFER_MAX_AGE and (kept["latest"] == latest or age < NARROW_OFFER_MIN_AGE):
                 return kept["offer"]
         start = end - g.PROPOSAL_LOOKBACK
         offer = None
