@@ -684,7 +684,9 @@ def export_policy(
     never leaves the sandbox) gets an endpoint on
     the ports `record` (the newest policy) gives it, else 443: `protocol:
     rest`, `enforcement: audit`, `access: read-only`, or `read-write` where
-    `uploads.allowed_hosts` allows a body. In an enforced allow-list every
+    `uploads.allowed_hosts` allows a body or `parameters_only_hosts` names
+    a host the agent only queried (a gap: RailDash alone judges uploads
+    there). In an enforced allow-list every
     captured request already passed the policy, so its port is one of
     those. Ports the policy passes only at L4 stay L4 (a second endpoint),
     a host's own rules win over a wildcard's, and a pin to `allowed_ips`
@@ -714,7 +716,7 @@ def export_policy(
     denied = _denied_tools(uploads.get("denied_tool_calls", []))
     taken: set[str] = set()
     network: dict[str, Any] = {}
-    no_binary, widened, wildcards = [], [], []
+    no_binary, widened, wildcards, queried = [], [], [], []
     emitted_mcp: set[int] = set()
     loopback = sorted({h for h in [*out_of_spec["allowed_hosts"], *uploads["allowed_hosts"]] if _loopback(h)})
     if loopback:
@@ -758,7 +760,13 @@ def export_policy(
                 _ports(endpoint, l7_ports)
                 if pin:
                     endpoint["allowed_ips"] = pin
-                writes = pattern_covered(host, uploads["allowed_hosts"])
+                # A host it only queried is read-write too (REST uploads
+                # §4): OpenShell can't tell a query POST from an upload,
+                # and read-only would block its searches.
+                writes = pattern_covered(host, [*uploads["allowed_hosts"],
+                                                *uploads.get("parameters_only_hosts", [])])
+                if writes and not pattern_covered(host, uploads["allowed_hosts"]):
+                    queried.append(host)
                 endpoint.update(protocol="rest", enforcement="audit",
                                 access="read-write" if writes else "read-only")
                 endpoints.append(endpoint)
@@ -812,6 +820,10 @@ def export_policy(
     if wildcards:
         gaps.append("The guardrail's " + ", ".join(wildcards) + " matches subdomains at any depth; "
                     "check how your OpenShell version matches `*.` and use `**.` if it is one label only.")
+    if queried:
+        gaps.append("OpenShell can't tell a query POST from an upload, so these hosts the agent only "
+                    "queried are read-write, and uploads to them are judged by RailDash only: "
+                    + ", ".join(sorted(set(queried))) + ".")
     only_uploads = sorted(h for h in uploads["allowed_hosts"]
                           if not pattern_covered(h, out_of_spec["allowed_hosts"]) and not _loopback(h))
     if only_uploads:

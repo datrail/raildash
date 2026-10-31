@@ -349,7 +349,8 @@ def _merged_detail(rule: str, old: Mapping[str, Any], new: Mapping[str, Any]) ->
     """The detail a repeat leaves on a row: the new hit's, except that an
     `uploads` host row keeps the worst request seen, so that a later
     version re-checking it (`guardrail.item_allowed`) can't be passed by a
-    small last request after a large one. A `data_actions` row keeps every
+    small last request after a large one, and every body kind it was
+    hit by. A `data_actions` row keeps every
     undeclared argument it has seen, and that its upload came from one, so
     a later version's override can't clear it (DR-205)."""
     if rule == g.DATA_ACTIONS:
@@ -370,6 +371,11 @@ def _merged_detail(rule: str, old: Mapping[str, Any], new: Mapping[str, Any]) ->
     merged["carries_body"] = body
     merged["request_size"] = None if unknown or not sizes else max(sizes)
     merged["reasons"] = sorted({*(old.get("reasons") or ()), *(new.get("reasons") or ())})
+    # REST uploads: every body kind the row was hit by, so a later version's
+    # override clears it only if it answers each (`guardrail.item_allowed`).
+    merged.pop("bodies", None)
+    merged.pop("bodies_overflow", None)
+    merged.update(g.merge_row_bodies(old, new))
     return merged
 
 

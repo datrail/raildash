@@ -1314,6 +1314,20 @@ function renderGuardrailPolicy(rules, openshell = false) {
   add("Uploads to", listOrNone(rules.uploads.allowed_hosts));
   if (caps.length) add("Size caps", caps.map(([host, cap]) => `${host} ≤ ${fmtBytes(cap)}`).join(", "));
   if (rules.uploads.denied_tool_calls.length) add("Denied tool calls", rules.uploads.denied_tool_calls.join(", "));
+  // REST uploads (a v4 version only): hosts it only queried, the user's
+  // body-kind answers, and the drip check's raised bounds.
+  const queried = rules.uploads.parameters_only_hosts || [];
+  if (queried.length) add("Queried only (an upload there is flagged)", queried.join(", "));
+  const kinds = rules.uploads.body_kind_overrides || [];
+  if (kinds.length) {
+    add("Body kinds you set", kinds.map((entry) => `${entry.method} ${entry.host}${entry.path}: ${entry.kind}`).join("; "));
+  }
+  const budget = rules.uploads.parameters_budget;
+  if (budget) {
+    const parts = Object.entries(budget.entries || {}).map(([host, cap]) => `${host} ${fmtBytes(cap)}`);
+    if (budget.agent !== undefined) parts.push(`the agent ${fmtBytes(budget.agent)}`);
+    add("Parameters a day", parts.join(", "));
+  }
   add("Saved files", listOrNone(rules.saved_files.allowed, describeSavedFile));
   add("Service ports", listOrNone(rules.service_ports.allowed, (entry) => describePort(entry, openshell)));
   add("Hosts it may call", listOrNone(rules.out_of_spec_calls.allowed_hosts));

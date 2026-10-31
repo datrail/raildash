@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -770,6 +771,58 @@ def test_blocked_by_openshell_shows_the_collectors_denials(tmp_path):
                 "/usr/local/bin/python3.13 · 1 time")
             expect(rows.filter(has_text="example.org:443")).to_contain_text(
                 "tried an out-of-spec host; OpenShell blocked it")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def test_a_v4_versions_body_kind_members_read_in_words(tmp_path):
+    """REST uploads M2: the active version's policy names the hosts the
+    agent only queried, the body kinds the user set and a raised budget."""
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    value = asp(listeners=[DEMO_LISTENER])
+    asp_id = store.load_asp(json.dumps(value).encode())["asp_id"]
+    alignment = store.make_baseline(asp_id, "v1.0")["alignment_version"]
+    rules = store.propose_guardrail(alignment["alignment_version_id"])["guardrail"]["rules"]
+    rules["uploads"].update(
+        parameters_only_hosts=["api.search.example"],
+        body_kind_overrides=[{"host": "api.search.example", "method": "POST", "path": "/v1/query/*",
+                              "kind": "parameters"}],
+        parameters_budget={"agent": 2 * 1024 * 1024},
+    )
+    store.adopt_guardrail(alignment["alignment_version_id"], rules)
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            card.locator(".guardrail-active-policy > summary").click(timeout=TIMEOUT)
+            policy = card.locator(".guardrail-active-policy")
+            expect(policy).to_contain_text("Queried only (an upload there is flagged)api.search.example")
+            expect(policy).to_contain_text("POST api.search.example/v1/query/*: parameters")
+            expect(policy).to_contain_text("the agent 2.0 MB")
+            if os.environ.get("RAILDASH_SHOT_DIR"):
+                policy.screenshot(path=os.path.join(os.environ["RAILDASH_SHOT_DIR"], "v4-policy.png"))
             assert errors == []
             browser.close()
     finally:

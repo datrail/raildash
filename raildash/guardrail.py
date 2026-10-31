@@ -8,7 +8,11 @@ the alignment contract and every locked baseline stay as they are. The design
 is railxia/docs `design/2026-10-07-data-guardrail/data-guardrail-design.md`;
 section numbers below are its. Later versions add optional rules: v2
 `data_actions` (DR-205) and v3 `egress_containment` (DR-207,
-`design/2026-10-11-egress-containment`).
+`design/2026-10-11-egress-containment`); v4 gives `uploads` three optional
+members that body kinds read (REST uploads, `design/2026-10-30-rest-uploads`,
+M2): with body kinds on, only a body `raildash.body_kinds` can't show to be
+`parameters` is judged against the upload hosts. They are off by default
+until the drip check is wired (`RAILDASH_BODY_KINDS=on` turns them on).
 
 Like `raildash.asp`, this module has no database, HTTP or UI dependency and
 never reads the clock: every time it needs is an argument. Storage and the
@@ -47,7 +51,9 @@ and the pieces they are built from: `validate_guardrail`, `asp_is_stale`,
 `is_multi_agent`, `normalize_host`, `host_matches`, `host_allowed`,
 `glob_matches`, `file_kind`, `kernel_interface_path`, `saved_file_allowed`,
 `listener_allowed`, `listener_item`, `normalize_mcp_server`,
-`tool_call_server`, `mcp_item`, `carries_body` and `requested_tool_calls`.
+`tool_call_server`, `mcp_item`, `carries_body`, `requested_tool_calls`, and
+for body kinds `body_kinds_on`, `upload_hosts`, `request_body_kind`,
+`body_counts` and `merge_row_bodies`.
 
 Every violation is a plain dict: `rule`, `item` (the §4.5 row key: a host,
 `(unknown host)`, a path, `protocol/addr/port`, a tool name, or
@@ -124,6 +130,7 @@ a violation or an Unverified, never a Held:
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -135,6 +142,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from .asp import (
     BUNDLE_VERSION_V2, FILE_ACCESS_ATTRIBUTE, identity_problems, only_reads_left_out, generated_name_template,
 )
+from . import body_kinds as _bk
 from .ingest import _header, legacy_exchange
 from .json_safety import (
     MAX_SAFE_JSON_BYTES,
@@ -159,15 +167,23 @@ SCHEMA_V2: dict[str, Any] = json.loads(SCHEMA_V2_PATH.read_text())
 # `egress_containment` (`contract_version`), so one rule set has one encoding.
 SCHEMA_V3_PATH = SCHEMA_PATH.with_name("guardrail-version-v3.schema.json")
 SCHEMA_V3: dict[str, Any] = json.loads(SCHEMA_V3_PATH.read_text())
+# REST uploads (M2): v4 adds three optional members to `uploads`
+# (`UPLOADS_V4_MEMBERS`), and has `data_actions` and `egress_containment`
+# both optional. A version is v4 exactly when its `uploads` has one of them.
+SCHEMA_V4_PATH = SCHEMA_PATH.with_name("guardrail-version-v4.schema.json")
+SCHEMA_V4: dict[str, Any] = json.loads(SCHEMA_V4_PATH.read_text())
 _VALIDATORS = {
     1: _VALIDATOR,
     2: Draft202012Validator(SCHEMA_V2, format_checker=FormatChecker()),
     3: Draft202012Validator(SCHEMA_V3, format_checker=FormatChecker()),
+    4: Draft202012Validator(SCHEMA_V4, format_checker=FormatChecker()),
 }
 
 GUARDRAIL_CONTRACT_VERSION = SCHEMA["properties"]["guardrail_contract_version"]["const"]
 GUARDRAIL_CONTRACT_VERSION_V2 = SCHEMA_V2["properties"]["guardrail_contract_version"]["const"]
 GUARDRAIL_CONTRACT_VERSION_V3 = SCHEMA_V3["properties"]["guardrail_contract_version"]["const"]
+GUARDRAIL_CONTRACT_VERSION_V4 = SCHEMA_V4["properties"]["guardrail_contract_version"]["const"]
+UPLOADS_V4_MEMBERS = ("body_kind_overrides", "parameters_budget", "parameters_only_hosts")
 RULES = ("uploads", "saved_files", "service_ports", "out_of_spec_calls")
 DATA_ACTIONS = "data_actions"
 EGRESS = "egress_containment"
@@ -201,8 +217,11 @@ def contract_rules(contract: Mapping[str, Any] | None) -> tuple[str, ...]:
 
 
 def contract_version(rules: Mapping[str, Any]) -> int:
-    """The contract version a rule set is written at: v3 with
-    `egress_containment`, else v2 with `data_actions`, else v1."""
+    """The contract version a rule set is written at: v4 when `uploads`
+    has a body-kind member, else v3 with `egress_containment`, else v2 with
+    `data_actions`, else v1."""
+    if any(member in (rules.get("uploads") or {}) for member in UPLOADS_V4_MEMBERS):
+        return GUARDRAIL_CONTRACT_VERSION_V4
     if EGRESS in rules:
         return GUARDRAIL_CONTRACT_VERSION_V3
     if DATA_ACTIONS in rules:
@@ -338,6 +357,39 @@ def guardrail_problems(version: Any) -> list[str]:
     for host, cap in rules["uploads"]["max_request_bytes"].items():
         if type(cap) is not int:
             problems.append(f"rules.uploads.max_request_bytes.{host}: must be an integer")
+    problems.extend(_body_kind_problems(rules["uploads"]))
+    return problems
+
+
+def _body_kind_problems(uploads: Mapping[str, Any]) -> list[str]:
+    """v4's `uploads` members, past what the schema says: hosts normalized,
+    an override's host exact (it keys one host's requests, as Allow this
+    does), and every byte count a real integer."""
+    problems: list[str] = []
+    for host in uploads.get("parameters_only_hosts", []):
+        if not _is_host_pattern(host):
+            problems.append(f"rules.uploads.parameters_only_hosts: {host!r} is not a normalized host or *.host")
+    keys: set[tuple[str, str, str]] = set()
+    for index, entry in enumerate(uploads.get("body_kind_overrides", [])):
+        host = entry["host"]
+        if host.startswith("*.") or not _is_host_pattern(host):
+            problems.append(f"rules.uploads.body_kind_overrides.{index}.host: {host!r} is not a normalized exact host")
+        if _bk.path_template(entry["path"]) != entry["path"]:
+            # A literal path would never match a stored template.
+            problems.append(f"rules.uploads.body_kind_overrides.{index}.path: {entry['path']!r} is not a path "
+                            f"template (did you mean {_bk.path_template(entry['path'])!r}?)")
+        key = (host, entry["method"], entry["path"])
+        if key in keys:
+            problems.append(f"rules.uploads.body_kind_overrides.{index}: a second answer for {' '.join(key)}")
+        keys.add(key)
+    budget = uploads.get("parameters_budget") or {}
+    if "agent" in budget and type(budget["agent"]) is not int:
+        problems.append("rules.uploads.parameters_budget.agent: must be an integer")
+    for entry, cap in (budget.get("entries") or {}).items():
+        if not _is_host_pattern(entry):
+            problems.append(f"rules.uploads.parameters_budget.entries: {entry!r} is not a normalized host or *.host")
+        if type(cap) is not int:
+            problems.append(f"rules.uploads.parameters_budget.entries.{entry}: must be an integer")
     return problems
 
 
@@ -580,6 +632,145 @@ def carries_body(interaction: Mapping[str, Any]) -> bool:
     except ValueError:
         # A Content-Length that isn't a number still says a body was framed.
         return True
+
+
+# ------------------------------------------------------------- body kinds
+
+# REST uploads design §6 "Back-out": `off` restores "any body is an upload"
+# for the rule and the proposal, and reads `parameters_only_hosts` as upload
+# hosts, so a version proposed with the narrow seed doesn't turn Violated
+# on its own queries. Off by default until the drip check (§3, G6) is wired
+# in the store: without it a parameters-sized drip would go unbounded.
+BODY_KINDS_ENV = "RAILDASH_BODY_KINDS"
+BODY_KINDS_DEFAULT = False
+_OFF_VALUES = frozenset({"off", "0", "false", "no", "disabled"})
+_ON_VALUES = frozenset({"on", "1", "true", "yes", "enabled"})
+# A stored `uploads` host row keeps each distinct body it was hit by, up to
+# this many; past it the row can no longer be cleared by an override.
+MAX_ROW_BODIES = 16
+# Steps an override can answer (§4 "Re-checking stored rows"): not step 1's
+# hard signals, not traffic, not the drip check. Step 2 is the override.
+_OVERRIDABLE_STEPS = (_bk.STEP_OVERRIDE, _bk.STEP_SPEC, _bk.STEP_SHAPE, _bk.STEP_OTHER)
+_ROW_BODY_KEYS = ("kind", "source", "step", "method", "path_template", "bytes", "reasons")
+
+
+def body_kinds_on() -> bool:
+    """Whether body kinds are read at all: `RAILDASH_BODY_KINDS=on` or
+    `off` (the design's back-out switch; `0`/`false`/`no` too), else
+    `BODY_KINDS_DEFAULT`."""
+    value = os.environ.get(BODY_KINDS_ENV, "").strip().lower()
+    if value in _OFF_VALUES:
+        return False
+    if value in _ON_VALUES:
+        return True
+    return BODY_KINDS_DEFAULT
+
+
+def upload_hosts(uploads: Mapping[str, Any]) -> list[str]:
+    """The hosts a body may go to as an upload: `allowed_hosts`, and, with
+    body kinds off, `parameters_only_hosts` too."""
+    hosts = list(uploads["allowed_hosts"])
+    if not body_kinds_on():
+        hosts.extend(uploads.get("parameters_only_hosts", ()))
+    return hosts
+
+
+def request_body_kind(
+    interaction: Mapping[str, Any], overrides: Iterable[Mapping[str, Any]] = ()
+) -> dict[str, Any] | None:
+    """One stored request's body kind (REST uploads design §3), as a row
+    keeps it: kind, source, step, method, path template, bytes and reasons.
+    None when the request carries no body (`carries_body`). A row whose
+    capture can't be read, or that the classifier can't finish, is
+    `unknown`, which the rule reads as an upload (§5 "Fail closed"), and is
+    marked as decided at step 1: no hard signal could be checked, so no
+    override may clear it."""
+    if not carries_body(interaction):
+        return None
+    host = normalize_host(interaction.get("host"))
+    exchange = _exchange(interaction)
+    result: dict[str, Any] | None = None
+    if exchange is not None:
+        try:
+            result = _bk.classify_exchange(exchange, host=host, overrides=overrides)
+        except Exception:  # noqa: BLE001 - fail closed: the body stays an upload
+            result = None
+        request = exchange.get("request")
+        method = request.get("method") if isinstance(request, dict) else None
+    else:
+        method = interaction.get("method")
+    if result is None:
+        result = {
+            "kind": _bk.UNKNOWN, "source": _bk.SOURCE_HARD, "step": _bk.STEP_HARD,
+            "reasons": ["capture not readable"], "path_template": _bk.path_template(interaction.get("path")),
+            "bytes": interaction.get("request_size") if type(interaction.get("request_size")) is int else None,
+        }
+    body = {key: result.get(key) for key in _ROW_BODY_KEYS}
+    body["method"] = str(method or "").upper()[:16]
+    body["reasons"] = [str(reason) for reason in body.get("reasons") or []][: _bk.MAX_REASONS]
+    return body
+
+
+def body_counts(body: Mapping[str, Any], host: str | None, uploads: Mapping[str, Any]) -> bool:
+    """Whether one classified body counts as an upload under a version's
+    `uploads` rule: `upload` and `unknown` do, `parameters` doesn't. The
+    version's own override is applied to a body steps 2-5 decided, so
+    **This is parameters** clears it; one an earlier version's override
+    decided, with no override for it now, reads as `unknown`. Step 1, model
+    and MCP traffic and the drip check keep what they decided."""
+    if not body_kinds_on():
+        return True
+    kind = body.get("kind")
+    if body.get("step") in _OVERRIDABLE_STEPS:
+        method = str(body.get("method") or "").upper()
+        template = body.get("path_template")
+        override = _bk._override(uploads.get("body_kind_overrides", ()), host, method, template)
+        if override is not None:
+            kind = override
+        elif body.get("step") == _bk.STEP_OVERRIDE:
+            kind = _bk.UNKNOWN
+    return kind != _bk.PARAMETERS
+
+
+def _row_uploads(detail: Mapping[str, Any], host: str, uploads: Mapping[str, Any]) -> bool:
+    """Whether a stored `uploads` host row's bodies count as an upload
+    under `uploads`. A row with no `bodies` (written before body kinds, or
+    with them off) or past `MAX_ROW_BODIES` reads as an upload, as before."""
+    bodies = detail.get("bodies")
+    if not body_kinds_on() or detail.get("bodies_overflow") or not isinstance(bodies, list) or not bodies:
+        return True
+    return any(not isinstance(body, Mapping) or body_counts(body, host, uploads) for body in bodies)
+
+
+def merge_row_bodies(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str, Any]:
+    """The `bodies` and `bodies_overflow` a repeat leaves on an `uploads`
+    host row: every distinct body of both hits, so a later version's
+    override clears the row only if it answers each of them. A hit that
+    carried a body without a `bodies` list reads as an upload, so the merged
+    row keeps none."""
+    lists = [d.get("bodies") if _row_carries_body(d) else [] for d in (old, new)]
+    if any(not isinstance(found, list) for found in lists):
+        return {}
+    merged: list[Any] = []
+    seen: set[str] = set()
+    overflow = bool(old.get("bodies_overflow") or new.get("bodies_overflow"))
+    for body in (*lists[0], *lists[1]):
+        key = json.dumps(
+            {k: body.get(k) for k in ("kind", "source", "step", "method", "path_template")}
+            if isinstance(body, Mapping) else body,
+            sort_keys=True, default=str,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(merged) >= MAX_ROW_BODIES:
+            overflow = True
+            break
+        merged.append(body)
+    result: dict[str, Any] = {"bodies": merged}
+    if overflow:
+        result["bodies_overflow"] = True
+    return result
 
 
 def _stored_raw(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -961,8 +1152,12 @@ def evaluate_request(
 
     upload_reasons: list[str] = []
     body = carries_body(interaction)
-    if body:
-        if not host_allowed(host, uploads["allowed_hosts"]):
+    # REST uploads §3: only an `upload` or `unknown` body is judged against
+    # the upload hosts; every body still meets the size cap. A body with no
+    # host stays an upload: nothing can key an answer to it.
+    kind = request_body_kind(interaction, uploads.get("body_kind_overrides", ())) if body and body_kinds_on() else None
+    if body and (kind is None or host is None or body_counts(kind, host, uploads)):
+        if not host_allowed(host, upload_hosts(uploads)):
             upload_reasons.append("body_to_unlisted_host")
     cap = _size_cap(host, uploads["max_request_bytes"]) if host is not None else None
     if cap is not None:
@@ -977,7 +1172,7 @@ def evaluate_request(
             _violation(
                 "uploads", item, OBSERVED, source,
                 kind="host", reasons=upload_reasons, request_size=size, max_request_bytes=cap,
-                carries_body=body,
+                carries_body=body, **({"bodies": [kind]} if kind is not None else {}),
             )
         )
     calls = requested_tool_calls(interaction)
@@ -1495,7 +1690,7 @@ def item_allowed(guardrail: Mapping[str, Any], violation: Mapping[str, Any]) -> 
         # version that flagged it gave: a later version can drop the host
         # from `allowed_hosts` or add a cap, and the row must count again.
         body = _row_carries_body(detail)
-        if body and not host_allowed(item, uploads["allowed_hosts"]):
+        if body and _row_uploads(detail, item, uploads) and not host_allowed(item, upload_hosts(uploads)):
             return False
         cap = _size_cap(item, uploads["max_request_bytes"])
         size = detail.get("request_size")
@@ -1715,6 +1910,11 @@ def propose_guardrail(
     agent sent a body to) stays out when every endpoint covering it refuses
     a body; a body the agent sent there is listed as a would-be violation. The answer's `openshell` says what came
     from the policy, with its revision.
+
+    With body kinds on (REST uploads §3, G5), "a body" above means one
+    `request_body_kind` doesn't call `parameters`: a host the agent only
+    queried seeds `uploads.parameters_only_hosts` instead (never one the
+    imported policy refuses a body to), which makes the version a v4.
     """
     if is_multi_agent(bundle):
         return {"guardrail": None, "would_be_violations": [], "empty_because": {}, "reason": MULTI_AGENT}
@@ -1741,13 +1941,39 @@ def propose_guardrail(
                 seed["withheld_upload_hosts"].add(host)
             else:
                 upload_hosts.add(host)
+    # REST uploads §3 (G5): only an `upload` or `unknown` body seeds its
+    # host; one that only passed parameters doesn't. Model and MCP traffic
+    # is always an upload, so the provider is still seeded.
+    on = body_kinds_on()
+    uploading = []
     for request in requests:
+        found = request_body_kind(request) if on else None
+        uploading.append(carries_body(request) and (
+            found is None or normalize_host(request.get("host")) is None or found["kind"] != _bk.PARAMETERS
+        ))
+    parameters_hosts: set[str] = set()
+    for request, sends in zip(requests, uploading):
         host = normalize_host(request.get("host"))
-        if carries_body(request) and host is not None and _is_host_pattern(host):
-            if seed is not None and _osp.refuses_body(openshell_policy, host):
-                seed["withheld_upload_hosts"].add(host)
-                continue
-            upload_hosts.add(host)
+        if host is None or not _is_host_pattern(host):
+            continue
+        if not sends:
+            if carries_body(request):
+                parameters_hosts.add(host)
+            continue
+        if seed is not None and _osp.refuses_body(openshell_policy, host):
+            seed["withheld_upload_hosts"].add(host)
+            continue
+        upload_hosts.add(host)
+    # Hosts it only queried: recorded, so the OpenShell export keeps them
+    # read-write and the back-out switch reads them as upload hosts (§4).
+    # One the imported policy refuses a body to stays out: listing it would
+    # make the export allow what the policy didn't.
+    parameters_only = sorted(
+        host for host in parameters_hosts
+        if host not in upload_hosts
+        and not (seed is not None and (host in seed["withheld_upload_hosts"]
+                                       or _osp.refuses_body(openshell_policy, host)))
+    )
 
     files = attributes.get(FILE_ACCESS_ATTRIBUTE) or {}
     saved: list[dict[str, Any]] = [dict(BYTECODE_CACHE_ENTRY)]
@@ -1796,6 +2022,7 @@ def propose_guardrail(
                 "allowed_hosts": sorted(upload_hosts),
                 "max_request_bytes": {},
                 "denied_tool_calls": [],
+                **({"parameters_only_hosts": parameters_only} if parameters_only else {}),
             },
             "saved_files": {"allowed": saved},
             "service_ports": {"allowed": ports},
@@ -1811,16 +2038,16 @@ def propose_guardrail(
     # contained gets a regression alarm.
     if egress is not None and egress["contained"]:
         guardrail["rules"][EGRESS] = {"require": "contained"}
-        guardrail["guardrail_contract_version"] = contract_version(guardrail["rules"])
+    guardrail["guardrail_contract_version"] = contract_version(guardrail["rules"])
     # What the agent called before the lock that nothing declared: not
     # seeded, since surfacing it is what the rule is for.
     seen: set[str] = set()
-    for request in requests:
+    for request, sends in zip(requests, uploading):
         for found in evaluate_request(guardrail, request)["out_of_spec_calls"]:
             if found["item"] not in seen:
                 seen.add(found["item"])
                 would_be.append(found)
-        if not carries_body(request):
+        if not sends:
             continue
         host = normalize_host(request.get("host"))
         if seed is not None and host in seed["withheld_upload_hosts"]:
@@ -2003,6 +2230,12 @@ def with_item_allowed(rules: Mapping[str, Any], row: Mapping[str, Any]) -> dict[
         _refuse_wildcard_host(item)
         if not host_allowed(item, uploads["allowed_hosts"]):
             uploads["allowed_hosts"] = sorted([*uploads["allowed_hosts"], item])
+        # A host it only queried while learning becomes an upload host (§4);
+        # an empty list is dropped, so the rule set keeps one encoding.
+        if item in uploads.get("parameters_only_hosts", ()):
+            uploads["parameters_only_hosts"] = [h for h in uploads["parameters_only_hosts"] if h != item]
+            if not uploads["parameters_only_hosts"]:
+                del uploads["parameters_only_hosts"]
         if not item_allowed({"rules": updated}, row):
             # Listing the host doesn't lift a size cap; changing one is an edit.
             raise ValueError("this upload is over the host's size cap; edit the cap instead")
