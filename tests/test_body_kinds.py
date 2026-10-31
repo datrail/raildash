@@ -202,6 +202,12 @@ def test_the_exchanges_own_size_counts_when_the_kept_body_is_smaller():
     # A small request's head is not counted as body.
     small = exchange({"q": "x"}, request={"first_line": "POST /v1/q HTTP/1.1"}, request_size=80)
     assert bk.classify_exchange(small, host="h")["kind"] == bk.PARAMETERS
+    # With content_length kept, stripped credential headers don't count as body.
+    authed = exchange({"q": "invoices", "limit": 10},
+                      request={"first_line": "POST /v1/q HTTP/1.1", "content_length": 27},
+                      request_size=27 + 4000)
+    result = bk.classify_exchange(authed, host="h")
+    assert (result["kind"], result["bytes"]) == (bk.PARAMETERS, 27)
     assert bk.body_bytes({"a": 1}, {}, 20000.0) == 20000
     assert bk.body_bytes({"a": 1}, {"Content-Length": 99999}) == 99999
 
@@ -342,6 +348,10 @@ def test_an_override_decides_after_the_hard_signals_and_before_the_shape():
     assert kind({"raw": "not json"}, path="/v1/q", overrides=overrides)["kind"] == bk.PARAMETERS
     # Nothing overrules a hard signal.
     assert kind({"q": "x" * 2000}, path="/v1/q", overrides=overrides)["step"] == bk.STEP_HARD
+    # An unknown host matches no override.
+    assert bk.classify(method="POST", host=None, path="/v1/q", headers=JSON, body={"raw": "x"},
+                       overrides=[{"method": "POST", "path": "/v1/q", "kind": "parameters"}]
+                       )["kind"] == bk.UNKNOWN
     # Another host, method or path isn't the override's.
     assert kind({"raw": "not json"}, path="/v1/q2", overrides=overrides)["kind"] == bk.UNKNOWN
     other = bk.classify(method="PUT", host="api.example", path="/v1/q", headers=JSON,

@@ -168,18 +168,22 @@ def body_bytes(body: Any, headers: Any = None, framed: Any = None) -> int:
 
 def framed_bytes(exchange: Mapping[str, Any]) -> int | None:
     """What the capture says the request's body was, or `None` when it says
-    nothing: the parser's own `content_length`, else the exchange's
-    `request_size` less its request line and the headers that were kept.
+    nothing: the parser's own `content_length` when it kept one, else the
+    exchange's `request_size` less its request line and the headers that
+    were kept.
 
-    Headers RailMon removed (credentials) are still in `request_size`, so
-    for an HTTP/1 request this overstates the body, which errs towards an
-    upload; it is used for the size bounds only. An HTTP/2 head is
-    compressed, so there it can understate, and the kept body's own size
-    is the floor.
+    Headers RailMon removed (credentials, cookies) are still in
+    `request_size`, so for an HTTP/1 request that estimate overstates the
+    body, which errs towards an upload; it is used only when no length was
+    kept (a chunked request). An HTTP/2 head is compressed, so there it can
+    understate, and the kept body's own size is the floor.
     """
     request = exchange.get("request")
     request = request if isinstance(request, dict) else {}
-    sizes = [_as_int(request.get("content_length"))]
+    exact = _as_int(request.get("content_length"))
+    if exact is not None:
+        return exact
+    sizes = []
     total = _as_int(exchange.get("request_size"))
     if total is not None:
         head = len(str(request.get("first_line") or "")) + 4
@@ -496,7 +500,8 @@ def _override(overrides: Iterable[Mapping[str, Any]], host: str | None, method: 
     """Step 2: the user's kind for this host, method and path template."""
     for item in overrides or ():
         if (
-            isinstance(item, Mapping)
+            host is not None
+            and isinstance(item, Mapping)
             and item.get("kind") in (UPLOAD, PARAMETERS)
             and item.get("host") == host
             and str(item.get("method") or "").upper() == method
@@ -532,6 +537,10 @@ def classify(
     method = str(method or "").upper()
     template = path_template(path)
     size = max(body_bytes(body, headers, framed), body_bytes(None, None, exact))
+    if size > MAX_BODY_BYTES and _raw_text(body) is not None:
+        # Not parsed first: whatever it is, it is an upload.
+        return _result(UPLOAD, SOURCE_HARD, STEP_HARD, [f"body over {MAX_BODY_BYTES // 1024} KiB"],
+                       template, size)
     value, parsed, unparsed = _json_value(body)
 
     if is_model_request(value) or is_jsonrpc(value):
