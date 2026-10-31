@@ -1926,6 +1926,76 @@ function renderDataActionWhy(tool, action, active, refresh) {
   return details;
 }
 
+// REST uploads: an `uploads` host row's bodies, each with its kind, method,
+// path template and reasons, and **This is parameters** on a body an
+// override can answer (steps 2-5): never on a hard upload (step 1), model or
+// MCP traffic (step 0) or one the drip check made an upload (step 6).
+const BODY_KIND_OVERRIDABLE_STEPS = [2, 3, 4, 5];
+const BODY_KIND_STEP_LABELS = { 0: "model or MCP traffic", 1: "upload", 2: "your answer", 6: "daily parameters budget" };
+
+function bodyKindOverridden(uploads, host, body) {
+  return (uploads.body_kind_overrides || []).find((entry) =>
+    entry.host === host && entry.method === body.method && entry.path === body.path_template);
+}
+
+// Whether **This is parameters** could make a version the server accepts
+// and that could clear the row: a real host that was flagged as not an
+// upload host (not only a size cap), and a method and path template the
+// contract can key (raildash.guardrail._body_kind_problems).
+function bodyKindAnswerable(row, body) {
+  const reasons = Array.isArray(row.detail.reasons) ? row.detail.reasons : [];
+  return row.item !== "(unknown host)" && reasons.includes("body_to_unlisted_host")
+    && typeof body.method === "string" && /^[A-Z]{1,16}$/.test(body.method)
+    && typeof body.path_template === "string" && body.path_template.startsWith("/")
+    && body.path_template.length <= 1024;
+}
+
+function renderBodyKinds(row, active, refresh) {
+  const bodies = Array.isArray(row.detail.bodies) ? row.detail.bodies : [];
+  if (!bodies.length) return null;
+  const list = el("ul", "guardrail-bodies");
+  const uploads = active ? active.guardrail.rules.uploads : null;
+  let offered = 0;
+  bodies.forEach((body) => {
+    if (!body || typeof body !== "object") return;
+    const li = el("li");
+    const answered = uploads ? bodyKindOverridden(uploads, row.item, body) : undefined;
+    // An earlier version's answer the version in force doesn't carry reads
+    // as unknown, as the server reads it (raildash.guardrail.body_counts).
+    const lost = body.step === 2 && uploads && !answered;
+    const kind = lost ? "unknown" : body.kind;
+    const step = lost ? "earlier answer not in this version" : BODY_KIND_STEP_LABELS[body.step];
+    const what = `${kind}${step && kind !== step ? ` (${step})` : ""} · ${body.method || "?"} ${body.path_template || ""}` +
+      `${typeof body.bytes === "number" ? ` · ${fmtBytes(body.bytes)}` : ""}`;
+    li.append(el("span", null, what));
+    const reasons = Array.isArray(body.reasons) ? body.reasons.filter((r) => typeof r === "string") : [];
+    if (reasons.length) li.append(el("span", "muted", ` — ${reasons.join("; ")}`));
+    if (answered) {
+      li.append(el("span", "muted", ` · you marked it ${answered.kind}`));
+    } else if (uploads && !row.acknowledged && !row.allowed_by && kind !== "parameters"
+               && BODY_KIND_OVERRIDABLE_STEPS.includes(body.step) && bodyKindAnswerable(row, body)) {
+      offered += 1;
+      li.append(guardrailButton("This is parameters", async () => {
+        const rules = JSON.parse(JSON.stringify(active.guardrail.rules));
+        const answers = (rules.uploads.body_kind_overrides || []).filter((entry) =>
+          !(entry.host === row.item && entry.method === body.method && entry.path === body.path_template));
+        answers.push({ host: row.item, method: body.method, path: body.path_template, kind: "parameters" });
+        rules.uploads.body_kind_overrides = answers;
+        await postJSON(
+          `/api/guardrail-versions/${encodeURIComponent(active.guardrail.guardrail_version_id)}/edit`, { rules });
+        refresh();
+      }, { quiet: true, key: `parameters:${row.row_id}:${body.method}:${body.path_template}` }));
+    }
+    list.append(li);
+  });
+  if (row.detail.bodies_overflow) {
+    list.append(el("li", "muted", "More bodies than are kept: an answer can't clear this row."));
+  } else if (offered && bodies.length > 1) {
+    list.append(el("li", "muted", "The row stops counting once no body on it reads as an upload."));
+  }
+  return list;
+}
+
 function renderGuardrailRow(row, refresh, hasActive, active = null) {
   const tr = el("tr");
   if (row.counts) tr.dataset.counts = "true";
@@ -1933,6 +2003,10 @@ function renderGuardrailRow(row, refresh, hasActive, active = null) {
   item.append(el("code", null, row.overflow ? `${row.count} more items` : row.item));
   if (row.rule === "data_actions" && row.detail.tool && row.detail.action !== "unreadable") {
     item.append(renderDataActionWhy(row.detail.tool, row.detail.action, active, refresh));
+  }
+  if (row.rule === "uploads" && row.detail.kind === "host") {
+    const bodies = renderBodyKinds(row, active, refresh);
+    if (bodies) item.append(bodies);
   }
   // The server's own verdict: a row counts only while unacknowledged and
   // disallowed by the version in force, so none counts with no guardrail.

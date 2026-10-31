@@ -832,3 +832,86 @@ def test_a_v4_versions_body_kind_members_read_in_words(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_an_upload_rows_bodies_say_why_and_this_is_parameters_clears_it(tmp_path):
+    """REST uploads M2c: an `uploads` row lists each body's kind, method,
+    path template and reasons, and **This is parameters** on an unknown body
+    saves a version whose answer clears the row; a hard upload offers none."""
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    value = asp(listeners=[DEMO_LISTENER])
+    asp_id = store.load_asp(json.dumps(value).encode())["asp_id"]
+    alignment = store.make_baseline(asp_id, "v1.0")["alignment_version"]
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    store.close()
+
+    def rest_capture(url, token, host, path, body, content_type="application/json"):
+        item = copy.deepcopy(capture()[0])
+        item["timestamp"] = _now()
+        item["interaction_id"] = f"{host}{path}"
+        text = body if isinstance(body, str) else json.dumps(body)
+        item["request"]["method"] = "POST"
+        item["request"]["path"] = path
+        item["request"]["body"] = body
+        item["request"]["headers"].update({"host": host, "content-type": content_type,
+                                           "content-length": str(len(text))})
+        if host is None:
+            del item["request"]["headers"]["host"]
+            item["interaction_id"] = f"nohost{path}"
+        _post(url, "/webhook/http-interactions", token,
+              json.dumps({"session_id": "browser", "interactions": [item]}).encode())
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        token = (tmp_path / "raildash.db.token").read_text().strip()
+        _heartbeat(url, token)
+        rest_capture(url, token, "api.search.example", "/v1/search/12345",
+                     {"filter": {"a": {"b": {"c": {"d": 1}}}}})
+        rest_capture(url, token, "files.example", "/v1/files", "x" * 20000, "application/octet-stream")
+        rest_capture(url, token, None, "/v1/deep", {"filter": {"a": {"b": {"c": {"d": 1}}}}})
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            search = card.locator("tr", has=page.locator("code", has_text="api.search.example")).filter(
+                has=page.locator(".guardrail-bodies"))
+            expect(search).to_contain_text("unknown · POST /v1/search/*", timeout=TIMEOUT)
+            expect(search).to_contain_text("counts")
+            files = card.locator("tr", has=page.locator("code", has_text="files.example")).filter(
+                has=page.locator(".guardrail-bodies"))
+            expect(files).to_contain_text("application/octet-stream body")
+            expect(files.get_by_role("button", name="This is parameters")).to_have_count(0)
+            # No host: nothing can key an answer, so none is offered.
+            nohost = card.locator("tr", has=page.locator("code", has_text="(unknown host)")).filter(
+                has=page.locator(".guardrail-bodies"))
+            expect(nohost).to_contain_text("unknown · POST /v1/deep")
+            expect(nohost.get_by_role("button", name="This is parameters")).to_have_count(0)
+            if os.environ.get("RAILDASH_SHOT_DIR"):
+                card.locator(".guardrail-rows").screenshot(
+                    path=os.path.join(os.environ["RAILDASH_SHOT_DIR"], "body-kinds-rows.png"))
+            search.get_by_role("button", name="This is parameters").click()
+            expect(search).to_contain_text("you marked it parameters", timeout=TIMEOUT)
+            expect(search).to_contain_text("allowed by g2", timeout=TIMEOUT)
+            card.locator(".guardrail-active-policy > summary").click()
+            expect(card.locator(".guardrail-active-policy")).to_contain_text(
+                "POST api.search.example/v1/search/*: parameters")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
