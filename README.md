@@ -319,6 +319,8 @@ token, including both reads:
 | `GET /api/guardrails/{agent_ref}/data-actions-offer` | `{"offer": ...}`: the *Add data actions* proposal for an agent whose guardrail predates the rule, or `null` |
 | `POST /api/guardrails/{agent_ref}/data-actions` `{}` or `{"rule": {...}}` | Add data actions: a new version with the active rules plus `data_actions`, as proposed or as edited |
 | `POST /api/guardrails/{agent_ref}/data-actions/dismiss` `{}` | Dismiss the *Add data actions* offer; it isn't offered again |
+| `POST /api/guardrails/{agent_ref}/narrow-uploads` `{"hosts": [...]}` | Narrow uploads: a new version moving the offered upload hosts (the detail's `narrow_uploads_offer`) to `parameters_only_hosts`; 409 for a host not in the offer now |
+| `POST /api/guardrails/{agent_ref}/narrow-uploads/dismiss` `{"hosts": [...]}` | Dismiss the *Narrow uploads* offer for those upload hosts; they aren't offered again |
 | `GET /api/data-actions/tool?name=...` | One tool's classification (actions, reasons) and the schemas behind it, for the panel's **Why** |
 | `POST /api/guardrails/{agent_ref}/egress-containment` `{}` or `{"require": "allow_list_enforced"}` | Require containment: a new version that requires the agent's egress be contained; `starts_violated` says whether the newest ASP already fails it |
 | `POST /v1/openshell/sandboxes/{sandbox}/policy` (`policy get --full -o json`) | `railmon openshell`: a sandbox's policy revision, read as an import is, shown for every agent whose ASP names that sandbox |
@@ -354,6 +356,23 @@ these three is contract v4. The exported OpenShell policy makes a
 queried-only host `read-write`, since OpenShell can't tell a query from an
 upload. `RAILDASH_BODY_KINDS=off` turns body kinds off: every body is then
 an upload again, and the hosts it only queried count as upload hosts.
+
+An Uploads row lists each body it was hit by: its kind, method, path
+template, size and why. **This is parameters** on a body RailDash couldn't
+decide, or on one an earlier version's answer decided that the version in
+force doesn't carry, saves a version with that answer. It isn't offered on
+a file, model traffic or a body past the daily budget, nor on a row with no
+host or one flagged only by a size cap. The panel offers **Narrow uploads**
+for an upload host the last 24 hours only sent parameters to: a version
+listing it as only queried, so a file, a large body or one RailDash can't
+read sent there then counts. RailDash checks first that the move makes no
+request of that day and no stored row count, and offers nothing while the
+day holds 5,000 or more authenticated captures of all agents together. A
+capture's **Bytes sent per host** splits each host's bytes by body kind
+(upload, unknown, model or MCP, parameters, no body kept). A request is
+read as not classified when it was captured more than a day before
+RailDash first read body kinds, has no readable capture time, or was stored
+by an older RailDash.
 
 The proposal allows each written path of the baseline exactly, plus one
 glob it always shows: `**/__pycache__/*.pyc`, Python's bytecode caches.
