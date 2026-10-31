@@ -731,7 +731,9 @@ def _drip_fits(drip: Any, uploads: Mapping[str, Any]) -> bool:
     the agent (§4: a version raising `parameters_budget` clears the row)."""
     if not isinstance(drip, Mapping):
         return False
-    size, agent, entries = drip.get("bytes"), drip.get("agent"), drip.get("entries")
+    # `over` is every byte the check made an upload on this row's repeats
+    # (`merge_row_bodies`), so a budget must fit all of them, not just one.
+    size, agent, entries = drip.get("over", drip.get("bytes")), drip.get("agent"), drip.get("entries")
     if type(size) is not int or type(agent) is not int or not isinstance(entries, Mapping):
         return False
     budgets, agent_budget = drip_budgets(uploads)
@@ -787,20 +789,23 @@ def merge_row_bodies(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str
     if any(not isinstance(found, list) for found in lists):
         return {}
     merged: list[Any] = []
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     overflow = bool(old.get("bodies_overflow") or new.get("bodies_overflow"))
     for body in (*lists[0], *lists[1]):
         key = json.dumps(
-            {k: body.get(k) for k in ("kind", "source", "step", "method", "path_template", "drip")}
+            {k: body.get(k) for k in ("kind", "source", "step", "method", "path_template")}
             if isinstance(body, Mapping) else body,
             sort_keys=True, default=str,
         )
         if key in seen:
+            index = seen[key]
+            if isinstance(body, Mapping) and body.get("step") == _bk.STEP_DRIP:
+                merged[index] = {**merged[index], "drip": _merged_drip(merged[index].get("drip"), body.get("drip"))}
             continue
-        seen.add(key)
         if len(merged) >= MAX_ROW_BODIES:
             overflow = True
             break
+        seen[key] = len(merged)
         merged.append(body)
     if not merged and not overflow:
         return {}
@@ -808,6 +813,25 @@ def merge_row_bodies(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str
     if overflow:
         result["bodies_overflow"] = True
     return result
+
+
+def _merged_drip(old: Any, new: Any) -> dict[str, Any] | None:
+    """Two drip hits on one row's body, as one: the largest sums each was
+    judged on, and every byte both made an upload (`over`), so the row
+    clears only under budgets all of it fits. Sums that can't be read
+    leave none, which never clears."""
+    def readable(drip: Any) -> bool:
+        return (isinstance(drip, Mapping) and type(drip.get("agent")) is int and type(drip.get("bytes")) is int
+                and type(drip.get("over", drip["bytes"])) is int and isinstance(drip.get("entries"), Mapping)
+                and all(type(v) is int for v in drip["entries"].values()))
+    if not (readable(old) and readable(new)):
+        return None
+    entries = dict(old["entries"])
+    for key, total in new["entries"].items():
+        entries[key] = max(entries.get(key, 0), total)
+    over = old.get("over", old["bytes"]) + new.get("over", new["bytes"])
+    return {"entries": entries, "agent": max(old["agent"], new["agent"]),
+            "bytes": max(old["bytes"], new["bytes"]), "over": over}
 
 
 def _stored_raw(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -2007,9 +2031,12 @@ def propose_guardrail(
         for i in order:
             host = normalize_host(requests[i].get("host"))
             when = _instant(requests[i].get("timestamp"))
-            if kinds[i] is None or host is None or when is None:
+            if kinds[i] is None or host is None:
                 continue
-            kinds[i] = budget.observe(kinds[i], drip_keys(host, call_hosts), when.timestamp())
+            # One with no capture time is sorted last and counted at the
+            # latest time seen, so it still counts.
+            at = when.timestamp() if when is not None else float("-inf")
+            kinds[i] = budget.observe(kinds[i], drip_keys(host, call_hosts), at)
     dripped = [kind is not None and kind.get("step") == _bk.STEP_DRIP for kind in kinds]
     uploading = [
         carries_body(request) and not drip and (

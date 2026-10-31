@@ -441,3 +441,56 @@ def test_the_proposal_runs_the_drip_check_over_the_window(store):  # noqa: F811
     assert uploads.get("parameters_only_hosts") == [SEARCH]
     [row] = [v for v in proposal["would_be_violations"] if v["rule"] == "uploads"]
     assert row["item"] == SEARCH and row["detail"]["bodies"][0]["step"] == bk.STEP_DRIP
+
+
+def _drip_agent(store):  # noqa: F811
+    alignment, ref = baseline(store)
+    live(store)
+    rules = store.propose_guardrail(alignment["alignment_version_id"])["guardrail"]["rules"]
+    rules["out_of_spec_calls"]["allowed_hosts"] = [*rules["out_of_spec_calls"]["allowed_hosts"], SEARCH]
+    active = store.adopt_guardrail(alignment["alignment_version_id"], rules)
+    return ref, active
+
+
+def _counted(store) -> int:  # noqa: F811
+    return store._db.execute(  # noqa: SLF001
+        "SELECT coalesce(sum(bytes), 0) FROM guardrail_parameters_bytes WHERE budget_key = ?", (SEARCH,)).fetchone()[0]
+
+
+@pytest.mark.parametrize("arrange", ["reversed", "future", "no_time", "naive_time"])
+def test_no_capture_time_gets_parameters_past_the_budget(store, arrange):  # noqa: F811
+    """Late, future-stamped and unstamped bodies are all still bounded."""
+    from datetime import datetime, timedelta, timezone
+    ref, _ = _drip_agent(store)
+    requests = _queries(SEARCH, 120, start=_now())
+    if arrange == "reversed":
+        requests.reverse()
+    for i, request in enumerate(requests):
+        if arrange == "future":
+            request["timestamp"] = (datetime.now(timezone.utc) + timedelta(days=30 + i)).isoformat()
+        elif arrange == "no_time":
+            request["timestamp"] = None
+        elif arrange == "naive_time":
+            request["timestamp"] = datetime.now().isoformat()
+    send(store, *requests)
+    assert _counted(store) <= 256 * 1024
+    assert rows(store, ref)[("uploads", SEARCH)]["counts"]
+
+
+def test_a_drip_row_needs_a_budget_that_fits_every_byte_it_made_an_upload(store):  # noqa: F811
+    ref, active = _drip_agent(store)
+    send(store, *_queries(SEARCH, 300, start=_now()))
+    row = rows(store, ref)[("uploads", SEARCH)]
+    [drip] = [b["drip"] for b in row["detail"]["bodies"] if b["step"] == bk.STEP_DRIP]
+    assert drip["over"] > 400 * 1024  # some 200 bodies past the budget, all on one entry
+    rules = json.loads(json.dumps(active["guardrail"]["rules"]))
+    rules["uploads"]["parameters_budget"] = {"entries": {SEARCH: 262 * 1024}}
+    store.edit_guardrail(active["guardrail"]["guardrail_version_id"], rules)
+    assert rows(store, ref)[("uploads", SEARCH)]["counts"]
+
+
+def test_merged_drip_keeps_the_largest_sums_and_adds_the_bytes():
+    one = {"entries": {SEARCH: 100}, "agent": 200, "bytes": 10}
+    two = {"entries": {SEARCH: 90, "x": 5}, "agent": 300, "bytes": 20, "over": 50}
+    assert g._merged_drip(one, two) == {"entries": {SEARCH: 100, "x": 5}, "agent": 300, "bytes": 20, "over": 60}
+    assert g._merged_drip(one, {"entries": {SEARCH: "1"}, "agent": 1, "bytes": 1}) is None

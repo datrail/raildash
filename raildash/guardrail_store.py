@@ -201,6 +201,8 @@ CREATE TABLE IF NOT EXISTS guardrail_parameters_bytes (
 );
 CREATE INDEX IF NOT EXISTS guardrail_parameters_bytes_window
     ON guardrail_parameters_bytes(identity_kind, identity_value, budget_key, at);
+CREATE INDEX IF NOT EXISTS guardrail_parameters_bytes_age
+    ON guardrail_parameters_bytes(identity_kind, identity_value, at);
 
 CREATE TABLE IF NOT EXISTS guardrail_marks (
     identity_kind  TEXT NOT NULL,
@@ -772,29 +774,37 @@ class GuardrailCustody:
         `parameters` body that would take any budget it counts against past
         its day's bound (`parameters_budget`, else 256 KiB per entry and 1 MiB
         for the agent) is an upload instead, with the sums it was judged on,
-        and adds nothing; one that fits is counted. Sums are over the 24 h up
-        to the body's capture time; a body without a readable capture time
-        or host isn't counted and stays as classified."""
+        and adds nothing; one that fits is counted.
+
+        The window is the 24 h before the body's capture time, and everything
+        counted after it: a body judged late (its response came first, or
+        OpenShell held it) can't slip under bodies already counted with
+        later times. A capture time ahead of the server's clock, or none,
+        reads as now, so no stamp moves the window past what was counted;
+        old rows are pruned by the server's clock. A body with no host
+        stays as classified: the rule already reads it as an upload."""
         if body is None or body.get("kind") != _bk.PARAMETERS:
             return body
         host = g.normalize_host(interaction.get("host"))
-        when = g._instant(interaction.get("timestamp"))
-        if host is None or when is None:
+        if host is None:
             return body
+        clock = _instant(now)
+        when = g._instant(interaction.get("timestamp"))
+        when = clock if when is None or when > clock else when
         uploads = contract["rules"]["uploads"]
         keys = g.drip_keys(host, contract["rules"]["out_of_spec_calls"]["allowed_hosts"])
         budgets, agent_budget = g.drip_budgets(uploads)
-        start, end = self._receive_time(when - timedelta(seconds=_bk.DAY_SECONDS)), self._receive_time(when)
+        start, at = self._receive_time(when - timedelta(seconds=_bk.DAY_SECONDS)), self._receive_time(when)
         self._db.execute(
             "DELETE FROM guardrail_parameters_bytes WHERE identity_kind = ? AND identity_value = ? AND at < ?",
-            (kind, value, self._receive_time(when - timedelta(seconds=2 * _bk.DAY_SECONDS))),
+            (kind, value, self._receive_time(clock - timedelta(seconds=2 * _bk.DAY_SECONDS))),
         )
 
         def total(key: str) -> int:
             return self._db.execute(
                 "SELECT coalesce(sum(bytes), 0) FROM guardrail_parameters_bytes "
-                "WHERE identity_kind = ? AND identity_value = ? AND budget_key = ? AND at > ? AND at <= ?",
-                (kind, value, key, start, end),
+                "WHERE identity_kind = ? AND identity_value = ? AND budget_key = ? AND at > ?",
+                (kind, value, key, start),
             ).fetchone()[0]
 
         size = int(body.get("bytes") or 0)
@@ -815,7 +825,7 @@ class GuardrailCustody:
         self._db.executemany(
             "INSERT INTO guardrail_parameters_bytes (identity_kind, identity_value, budget_key, at, bytes) "
             "VALUES (?, ?, ?, ?, ?)",
-            [(kind, value, key, end, size) for key in ("", *keys)],
+            [(kind, value, key, at, size) for key in ("", *keys)],
         )
         return body
 
