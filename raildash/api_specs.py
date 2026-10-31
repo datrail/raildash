@@ -149,9 +149,9 @@ class _Walk:
         if schema.get("format") in ("binary", "byte"):
             self._add(f"{via} is format {schema['format']}")
         if schema.get("contentEncoding"):
-            self._add(f"{via} is {schema['contentEncoding']}")
+            self._add(f"{via} is {_text(str(schema['contentEncoding'])) or 'encoded'}")
         if schema.get("contentMediaType"):
-            self._add(f"{via} has media type {schema['contentMediaType']}")
+            self._add(f"{via} has media type {_text(str(schema['contentMediaType'])) or 'set'}")
         properties = schema.get("properties")
         if isinstance(properties, Mapping):
             for name, spec in properties.items():
@@ -160,7 +160,7 @@ class _Walk:
                 why = data_carrying(str(name), {})
                 if why is not None:
                     self._add(why.replace("argument", "property"))
-                self.walk(spec, depth + 1, refs, f'property "{name}"')
+                self.walk(spec, depth + 1, refs, f'property "{_text(str(name)) or name}"')
         if isinstance(schema.get("items"), Mapping):
             self.walk(schema["items"], depth + 1, refs, "an array item")
         if isinstance(schema.get("additionalProperties"), Mapping):
@@ -230,6 +230,8 @@ def _segment_tokens(segment: str) -> tuple[tuple[int, str], ...] | None:
             params = 0
         params += 1
         pos = found.end()
+    if not tokens and params == 0:
+        return None  # a stray `{` with no parameter: a plain literal
     tokens.append((params, segment[pos:]))
     return tuple(tokens)
 
@@ -297,7 +299,7 @@ def parse_spec(raw: bytes) -> dict[str, Any]:
             media: dict[str, list[str]] = {}
             body = _request_body(document, operation)
             content = body.get("content") if isinstance(body, Mapping) else None
-            if body is False:
+            if body is False or (isinstance(body, Mapping) and "content" in body and not isinstance(content, Mapping)):
                 media["*/*"] = [UNREADABLE_BODY]
             elif isinstance(content, Mapping):
                 for media_type, entry in content.items():
@@ -370,15 +372,16 @@ def match(index: Mapping[str, Any] | None, method: Any, path: Any) -> dict[str, 
         return None
     path = path.split("?", 1)[0].split("#", 1)[0]
     method = method.upper()
-    candidates = [path]
-    for base in index.get("base_paths") or ():
-        if path == base or path.startswith(base + "/"):
-            candidates.append(path[len(base):] or "/")
-    # The best match over the path as sent and with each base path
-    # stripped; between equal matches, one with an upload mark (a spec can
-    # only tighten).
+    # The path with a server base path stripped is tried first, then as
+    # sent; the first that matches anything gives the best match it has,
+    # and between equal matches one with an upload mark (a spec can only
+    # tighten).
+    candidates = [path[len(base):] or "/" for base in index.get("base_paths") or ()
+                  if path == base or path.startswith(base + "/")] + [path]
     best: tuple[Any, dict[str, Any]] | None = None
     for candidate in candidates:
+        if best is not None:
+            break
         segments = _segments(candidate)
         for operation in index.get("operations") or ():
             if operation.get("method") != method:

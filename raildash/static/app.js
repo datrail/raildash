@@ -2406,7 +2406,7 @@ async function loadGuardrails(focusKey = null) {
   try {
     const agents = await getJSONWithToken("/api/guardrails");
     // The specs list failing doesn't take the agents' cards down with it.
-    specs = await getJSONWithToken("/api/api-specs").then((found) => found.specs || [], () => []);
+    specs = await getJSONWithToken("/api/api-specs").then((found) => (found && Array.isArray(found.specs) ? found.specs : []), () => []);
     // One agent's failure is shown in its card, not as the dashboard down.
     const settled = await Promise.allSettled(agents.map(
       (agent) => getJSONWithToken(`/api/guardrails/${encodeURIComponent(agent.agent_ref)}`)

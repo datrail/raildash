@@ -368,3 +368,26 @@ def test_between_equal_matches_a_marked_operation_wins():
     raw = spec({"/v1/{x}": {"post": {"operationId": "plain", "requestBody": {"content": {"application/json": {}}}}},
                 "/v1/{y}/": {"post": {"operationId": "marked", "requestBody": {"content": {"application/zip": {}}}}}})
     assert a.match(a.parse_spec(raw), "POST", "/v1/7")["operation_id"] == "marked"
+
+
+# ------------------------------------------------ review of 2246f0b
+
+
+def test_a_request_body_whose_content_isnt_a_mapping_marks_the_operation():
+    [op] = a.parse_spec(spec({"/up": {"post": {"operationId": "up", "requestBody": {"content": ["x"]}}}}))["operations"]
+    assert op["media"] == {"*/*": [a.UNREADABLE_BODY]}
+    # An empty body object declares nothing: no mark.
+    [op] = a.parse_spec(spec({"/up": {"post": {"operationId": "up", "requestBody": {}}}}))["operations"]
+    assert op["media"] == {}
+
+
+def test_a_stray_brace_is_a_literal():
+    assert a._segment_tokens("foo{") is None  # noqa: SLF001
+    index = a.parse_spec(spec({"/foo{": {"post": {}}}))
+    assert a.match(index, "POST", "/zzzfoo{") is None and a.match(index, "POST", "/foo{") is not None
+
+
+def test_the_base_stripped_path_is_tried_first():
+    raw = spec({"/api/up/{z}": {"post": {"operationId": "raw"}},
+                "/up/{q}": {"post": {"operationId": "stripped"}}}, servers=[{"url": "https://h/api"}])
+    assert a.match(a.parse_spec(raw), "POST", "/api/up/load")["operation_id"] == "stripped"

@@ -1709,11 +1709,21 @@ class GuardrailCustody:
         with self._lock:
             # The parsed indexes judging already keeps, not a parse per poll.
             specs = self._api_specs_locked()
-            return [
-                {"host": row["host"], "imported_at": row["imported_at"], "current": row["host"] in specs,
-                 **api_specs.summary(specs.get(row["host"], {"sha256": row["sha256"]}))}
-                for row in self._db.execute("SELECT host, sha256, imported_at FROM api_specs ORDER BY host")
-            ]
+            out = []
+            for row in self._db.execute("SELECT host, sha256, imported_at FROM api_specs ORDER BY host"):
+                index = specs.get(row["host"])
+                if index is None:
+                    # One an older RailDash wrote, read once for its counts.
+                    stored = self._db.execute(
+                        "SELECT index_json FROM api_specs WHERE host = ?", (row["host"],)).fetchone()
+                    try:
+                        index = json.loads(stored[0])
+                    except (TypeError, ValueError):
+                        index = None
+                    index = index if isinstance(index, dict) else {"sha256": row["sha256"]}
+                out.append({"host": row["host"], "imported_at": row["imported_at"],
+                            "current": row["host"] in specs, **api_specs.summary(index)})
+            return out
 
     def remove_api_spec(self, host: str) -> dict[str, Any]:
         with self._write_transaction():
