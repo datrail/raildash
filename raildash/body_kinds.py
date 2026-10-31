@@ -90,7 +90,8 @@ FORM_MEDIA_TYPE = "application/x-www-form-urlencoded"
 GRAPHQL_KEYS = frozenset(("query", "variables", "operationName"))
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
-_OPAQUE = re.compile(r"[A-Za-z0-9_\-.~=%]*[0-9][A-Za-z0-9_\-.~=%]*")
+_OPAQUE_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.~=%")
+_EOL = re.compile(r"[\n\r]")
 
 
 # ----------------------------------------------------------------- inputs
@@ -101,6 +102,8 @@ def _header(headers: Any, name: str) -> str | None:
         return None
     for key, value in headers.items():
         if isinstance(key, str) and key.lower() == name:
+            if isinstance(value, (list, tuple)):
+                return ", ".join(str(v) for v in value)
             return value if isinstance(value, str) else None if value is None else str(value)
     return None
 
@@ -169,7 +172,10 @@ def framed_bytes(exchange: Mapping[str, Any]) -> int | None:
     `request_size` less its request line and the headers that were kept.
 
     Headers RailMon removed (credentials) are still in `request_size`, so
-    this can only overstate the body, which errs towards an upload.
+    for an HTTP/1 request this overstates the body, which errs towards an
+    upload; it is used for the size bounds only. An HTTP/2 head is
+    compressed, so there it can understate, and the kept body's own size
+    is the floor.
     """
     request = exchange.get("request")
     request = request if isinstance(request, dict) else {}
@@ -185,17 +191,56 @@ def framed_bytes(exchange: Mapping[str, Any]) -> int | None:
     return max(known) if known else None
 
 
-def _json_value(body: Any) -> tuple[Any, bool]:
-    """The body as JSON and whether it parsed: a kept object as itself, a
-    kept text tried once within RailDash's JSON bounds."""
+class _RepeatedKey(ValueError):
+    pass
+
+
+def _no_repeated_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out = dict(pairs)
+    if len(out) != len(pairs):
+        raise _RepeatedKey
+    return out
+
+
+def _json_value(body: Any) -> tuple[Any, bool, str | None]:
+    """The body as JSON, whether it parsed, and why not: a kept object as
+    itself, a kept text tried once within RailDash's JSON bounds. A text
+    that repeats a key doesn't parse: a decoder keeps one of the values, so
+    what was read wouldn't be all that was sent."""
     text = _raw_text(body)
     if text is None:
-        return body, isinstance(body, dict)
+        return body, isinstance(body, dict), None
     try:
         check_json_structure(text)
-        return json.loads(text), True
+        return json.loads(text, object_pairs_hook=_no_repeated_keys), True, None
+    except _RepeatedKey:
+        return text, False, "a repeated JSON key"
     except (JSONStructureTooComplex, ValueError, RecursionError):
-        return text, False
+        return text, False, None
+
+
+def _kept_bytes_upper(value: Any) -> int:
+    """The most a request could have taken to send a kept JSON object: its
+    compact text (escaped, the larger form) plus generous room for
+    whitespace around every token. More framed than this means the parser
+    kept less than was sent (a repeated key keeps only its last value)."""
+    tokens = sum(1 for _ in _strings(value)) + _other_tokens(value)
+    compact = len(json.dumps(value, separators=(",", ":"), ensure_ascii=True))
+    return compact + 16 * tokens + 64
+
+
+def _other_tokens(value: Any) -> int:
+    """Containers and non-string scalars in a JSON value."""
+    count, stack = 0, [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            count += 1 + sum(1 for v in item.values() if not isinstance(v, (dict, list, str)))
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            count += 1 + sum(1 for v in item if not isinstance(v, (dict, list, str)))
+            stack.extend(item)
+    return count
 
 
 def is_model_request(body: Any) -> bool:
@@ -222,7 +267,8 @@ def path_template(path: Any) -> str:
         if segment and (
             segment.isdigit()
             or _UUID.fullmatch(segment)
-            or (len(segment) >= 20 and _OPAQUE.fullmatch(segment))
+            or (len(segment) >= 20 and set(segment) <= _OPAQUE_CHARS
+                and any(c.isdigit() for c in segment))
         ):
             out.append("*")
         else:
@@ -301,9 +347,8 @@ def _graphql_start(text: str) -> bool:
         while pos < len(text) and text[pos] in " \t\n\r,\ufeff":
             pos += 1
         if pos < len(text) and text[pos] == "#":
-            end = min((i for i in (text.find("\n", pos), text.find("\r", pos)) if i >= 0),
-                      default=len(text))
-            pos = end
+            eol = _EOL.search(text, pos)
+            pos = eol.start() if eol else len(text)
             continue
         return bool(_GRAPHQL_START.match(text, pos))
 
@@ -469,6 +514,7 @@ def classify(
     headers: Any,
     body: Any,
     framed: Any = None,
+    exact: Any = None,
     size_known: bool = True,
     overrides: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
@@ -476,14 +522,17 @@ def classify(
     decided it, reasons, path template and size (§3 steps 1-5).
 
     `host` is compared as the caller normalized it. `framed` is the size
-    the capture recorded (`framed_bytes`); `size_known=False` says it
+    the capture recorded (`framed_bytes`), which can overstate the body;
+    `exact` is the parser's own body length, if it kept one, and with
+    `Content-Length` is what shows a kept object is less than was sent.
+    `size_known=False` says it
     recorded none and no `Content-Length` was sent either, so the kept body
     alone can't show the request was small, and it isn't parameters.
     """
     method = str(method or "").upper()
     template = path_template(path)
-    size = body_bytes(body, headers, framed)
-    value, parsed = _json_value(body)
+    size = max(body_bytes(body, headers, framed), body_bytes(None, None, exact))
+    value, parsed, unparsed = _json_value(body)
 
     if is_model_request(value) or is_jsonrpc(value):
         return _result(UPLOAD, SOURCE_TRAFFIC, STEP_NOT_REST,
@@ -497,6 +546,7 @@ def classify(
     hard = [f"{t} body" for t in mtypes if t in FILE_MEDIA_TYPES or t.startswith(FILE_MEDIA_FAMILIES)]
     if size > MAX_BODY_BYTES:
         hard.append(f"body over {MAX_BODY_BYTES // 1024} KiB")
+        return _result(UPLOAD, SOURCE_HARD, STEP_HARD, hard, template, size)
     if parsed:
         # A GraphQL query's text is bounded by step 4 instead, but only a
         # query-only document within that bound: anything else in `query`
@@ -508,7 +558,7 @@ def classify(
                     and graphql_queries_only(query) is None):
                 skip = (id(value), "query")
         strings: Iterable[str] = _strings(value, skip)
-    elif isinstance(value, str) and mtype == FORM_MEDIA_TYPE and size <= MAX_BODY_BYTES:
+    elif isinstance(value, str) and mtype == FORM_MEDIA_TYPE:
         strings = [s for pair in parse_qsl(value, keep_blank_values=True) for s in pair]
     else:
         # Text that is neither JSON nor a form is one string.
@@ -532,6 +582,11 @@ def classify(
         return _result(UNKNOWN, SOURCE_SHAPE, STEP_OTHER, ["body size not recorded"], template, size)
     if len(mtypes) > 1:
         return _result(UNKNOWN, SOURCE_SHAPE, STEP_OTHER, ["two content types"], template, size)
+    if unparsed is not None:
+        return _result(UNKNOWN, SOURCE_SHAPE, STEP_OTHER, [unparsed], template, size)
+    sent = [n for n in (_as_int(exact), _as_int(_header(headers, "content-length"))) if n is not None]
+    if parsed and _raw_text(body) is None and sent and max(sent) > _kept_bytes_upper(value):
+        return _result(UNKNOWN, SOURCE_SHAPE, STEP_OTHER, ["more sent than was kept"], template, size)
     kind, reasons = _shape(value, parsed, mtype, size)
     step = STEP_SHAPE if kind == PARAMETERS else STEP_OTHER
     return _result(kind, SOURCE_SHAPE, step, reasons, template, size)
@@ -551,6 +606,7 @@ def classify_exchange(
     return classify(
         method=request.get("method"), host=host, path=_split_host_path(request)[1],
         headers=request.get("headers"), body=request.get("body"), framed=framed,
+        exact=request.get("content_length"),
         size_known=framed is not None or _header(request.get("headers"), "content-length") is not None,
         overrides=overrides,
     )

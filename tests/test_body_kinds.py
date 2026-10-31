@@ -206,6 +206,30 @@ def test_the_exchanges_own_size_counts_when_the_kept_body_is_smaller():
     assert bk.body_bytes({"a": 1}, {"Content-Length": 99999}) == 99999
 
 
+def test_a_repeated_key_hides_nothing():
+    # `{"note": "<900 x A>", "note": "ok"}`: kept as text, it doesn't parse.
+    text = '{"note": "' + "A" * 900 + '", "note": "ok"}'
+    assert kind({"raw": text})["reasons"] == ["a repeated JSON key"]
+    assert kind({"raw": text}, {"content-type": "text/plain"})["kind"] == bk.UNKNOWN
+    # Kept parsed (RailMon's parser kept the last), the exact length shows it.
+    assert kind({"note": "ok"}, exact=len(text))["reasons"] == ["more sent than was kept"]
+    assert kind({"note": "ok"}, {**JSON, "content-length": str(len(text))})["kind"] == bk.UNKNOWN
+    # The estimate from request_size, which stripped headers inflate, doesn't.
+    assert kind({"note": "ok"}, framed=len(text))["kind"] == bk.PARAMETERS
+    # Pretty-printed or ASCII-escaped bodies are not mistaken for it.
+    body = {"query": "naïve café", "filters": {"year": 2026, "tags": ["a", "b"]}, "limit": 10}
+    for sent in (json.dumps(body, indent=4), json.dumps(body)):
+        assert kind(body, exact=len(sent.encode()))["kind"] == bk.PARAMETERS
+
+
+def test_hostile_texts_are_read_in_linear_time():
+    import time
+    start = time.monotonic()
+    assert kind({"query": "#\n" * 1_000_000})["step"] == bk.STEP_HARD
+    assert bk.path_template("/" + "a1" * 50_000 + "!") .startswith("/a1")
+    assert time.monotonic() - start < 2
+
+
 def test_with_no_recorded_size_a_body_isnt_parameters():
     assert bk.classify_exchange(exchange({"q": "x"}), host="h")["reasons"] == [
         "body size not recorded"]
