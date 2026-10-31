@@ -1289,6 +1289,119 @@ class GuardrailCustody:
             self._event(kind, value, "dismiss_data_actions", active["guardrail_version_id"], {})
             return {"agent_ref": ref, "dismissed": True}
 
+    # ---------------------------------------------- narrow uploads (§4)
+
+    def _narrow_dismissed_key(self, kind: str, value: str) -> str:
+        return f"narrow_uploads_dismissed:{kind}:{value}"
+
+    def _narrow_dismissed_locked(self, kind: str, value: str) -> list[str]:
+        found = self._db.execute(
+            "SELECT value FROM settings WHERE key = ?", (self._narrow_dismissed_key(kind, value),)
+        ).fetchone()
+        try:
+            hosts = json.loads(found[0]) if found is not None else []
+        except ValueError:
+            return []
+        return [h for h in hosts if isinstance(h, str)] if isinstance(hosts, list) else []
+
+    def _narrow_offer_locked(self, kind: str, value: str, *, cached: bool = True) -> dict[str, Any] | None:
+        """REST uploads §4's *narrow uploads* offer: the active version's
+        upload hosts that, over the agent's requests of the last 24 hours
+        (the proposal's window), were only sent `parameters` bodies, and
+        that moving to `parameters_only_hosts` makes no request or stored
+        row count (`guardrail.narrow_uploads_hosts`). None when there is
+        nothing to offer, every such host was dismissed, or the window holds
+        more requests than are read (not every one could be checked).
+
+        The detail route asks on every poll, so the answer is kept until
+        the version, the agent's requests or rows, the dismissals or the
+        ten-minute slot change."""
+        active = self._active_guardrail_row(kind, value)
+        if active is None or not g.body_kinds_on():
+            return None
+        end = datetime.now(timezone.utc)
+        dismissed = self._narrow_dismissed_locked(kind, value)
+        rows_key = tuple(self._db.execute(
+            "SELECT count(*), max(row_id), max(last_seen), max(acknowledged_at), sum(hits) FROM guardrail_rows "
+            "WHERE identity_kind = ? AND identity_value = ?", (kind, value),
+        ).fetchone())
+        latest = self._db.execute("SELECT max(id) FROM interactions").fetchone()[0]
+        key = (active["guardrail_version_id"], latest, rows_key, tuple(dismissed), int(end.timestamp()) // 600)
+        cache = self.__dict__.setdefault("_narrow_offer_cache", {})
+        if cached and (kind, value) in cache and cache[(kind, value)][0] == key:
+            return cache[(kind, value)][1]
+        start = end - g.PROPOSAL_LOOKBACK
+        requests = self._owned_requests_locked(kind, value, start, end)
+        offer = None
+        if len(requests) < PROPOSAL_MAX_REQUESTS:
+            rows = [
+                self._row_view(row) for row in self._db.execute(
+                    "SELECT * FROM guardrail_rows WHERE identity_kind = ? AND identity_value = ?", (kind, value),
+                )
+            ]
+            contract = json.loads(active["contract_json"])
+            hosts = [h for h in g.narrow_uploads_hosts(contract, requests, rows) if h["host"] not in dismissed]
+            if hosts:
+                offer = {"hosts": hosts, "version": contract["version"],
+                         "window": {"start": self._receive_time(start), "end": self._receive_time(end)}}
+        cache[(kind, value)] = (key, offer)
+        return offer
+
+    def narrow_uploads_offer(self, ref: str) -> dict[str, Any] | None:
+        with self._lock:
+            kind, value = self._resolve_agent_ref(ref)
+            return self._narrow_offer_locked(kind, value)
+
+    def _narrow_hosts_arg(self, hosts: Any) -> list[str]:
+        if (not isinstance(hosts, list) or not hosts
+                or not all(isinstance(h, str) for h in hosts) or len(set(hosts)) != len(hosts)):
+            raise ValueError("hosts must be a non-empty list of distinct hosts")
+        return hosts
+
+    def narrow_uploads(self, ref: str, hosts: Any) -> dict[str, Any]:
+        """**Narrow uploads**: a new version moving `hosts`, every one in the
+        current offer (re-computed now, not read from the cache), from
+        `uploads.allowed_hosts` to `parameters_only_hosts`."""
+        hosts = self._narrow_hosts_arg(hosts)
+        with self._write_transaction():
+            kind, value = self._resolve_agent_ref(ref)
+            active = self._active_guardrail_row(kind, value)
+            if active is None:
+                raise ValueError("this agent has no active guardrail")
+            offer = self._narrow_offer_locked(kind, value, cached=False)
+            offered = {h["host"] for h in offer["hosts"]} if offer is not None else set()
+            missing = [h for h in hosts if h not in offered]
+            if missing:
+                raise ValueError(f"not in the narrow uploads offer now: {', '.join(missing)}")
+            contract = json.loads(active["contract_json"])
+            rules = json.loads(json.dumps(contract["rules"]))
+            uploads = rules["uploads"]
+            uploads["allowed_hosts"] = [h for h in uploads["allowed_hosts"] if h not in hosts]
+            uploads["parameters_only_hosts"] = sorted({*uploads.get("parameters_only_hosts", ()), *hosts})
+            created = self._create_version_locked(
+                kind, value, rules, derived_from=contract["derived_from"]["alignment_version_id"],
+                created_by="narrow_uploads", detail={"hosts": hosts},
+            )
+            return self._version_view(created, active=True)
+
+    def dismiss_narrow_uploads(self, ref: str, hosts: Any) -> dict[str, Any]:
+        """**Dismiss** the *narrow uploads* offer for `hosts`: they aren't
+        offered again for this agent; a host not dismissed still can be."""
+        hosts = self._narrow_hosts_arg(hosts)
+        with self._write_transaction():
+            kind, value = self._resolve_agent_ref(ref)
+            active = self._active_guardrail_row(kind, value)
+            if active is None:
+                raise ValueError("this agent has no active guardrail")
+            dismissed = sorted({*self._narrow_dismissed_locked(kind, value), *hosts})
+            self._db.execute(
+                "INSERT INTO settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (self._narrow_dismissed_key(kind, value), json.dumps(dismissed)),
+            )
+            self._event(kind, value, "dismiss_narrow_uploads", active["guardrail_version_id"], {"hosts": hosts})
+            return {"agent_ref": ref, "dismissed": hosts}
+
     def _egress_locked(self, kind: str, value: str) -> dict[str, Any] | None:
         """The newest ASP's egress containment and declared proxy, as the
         panel's Egress line shows them (DR-207 §4.4), or None with no ASP.
@@ -1952,6 +2065,7 @@ class GuardrailCustody:
                 "agent_ref": ref,
                 "agent_identity": self._identity_object(kind, value),
                 "data_actions_offer_available": self._data_actions_offer_available_locked(kind, value),
+                "narrow_uploads_offer": self._narrow_offer_locked(kind, value) if active is not None else None,
                 "egress": self._egress_locked(kind, value),
                 "openshell_policy": self._openshell_policy_view_locked(kind, value, allowed_hosts),
                 "openshell_denials": self._openshell_denials_locked(kind, value, allowed_hosts),

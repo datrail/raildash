@@ -1247,6 +1247,37 @@ async def api_dismiss_data_actions(agent_ref: str, request: Request) -> dict[str
     return _guardrail_call(get_store().dismiss_data_actions, agent_ref)
 
 
+async def _narrow_hosts(request: Request) -> list[str]:
+    hosts = (await _control_object(request)).get("hosts")
+    if (not isinstance(hosts, list) or not hosts or len(hosts) > 1000
+            or not all(isinstance(h, str) for h in hosts) or len(set(hosts)) != len(hosts)):
+        raise HTTPException(422, "hosts must be a non-empty list of distinct hosts")
+    return hosts
+
+
+@app.post(
+    "/api/guardrails/{agent_ref}/narrow-uploads",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_narrow_uploads(agent_ref: str, request: Request) -> dict[str, Any]:
+    """**Narrow uploads** (REST uploads §4): a new version moving the
+    offered upload hosts to `parameters_only_hosts`. Body `{"hosts": [...]}`,
+    each in the current offer (the detail route's `narrow_uploads_offer`)."""
+    return _guardrail_call(get_store().narrow_uploads, agent_ref, await _narrow_hosts(request))
+
+
+@app.post(
+    "/api/guardrails/{agent_ref}/narrow-uploads/dismiss",
+    status_code=201,
+    dependencies=[Depends(require_local_token)],
+)
+async def api_dismiss_narrow_uploads(agent_ref: str, request: Request) -> dict[str, Any]:
+    """**Dismiss** the *narrow uploads* offer for `{"hosts": [...]}`; they
+    aren't offered again."""
+    return _guardrail_call(get_store().dismiss_narrow_uploads, agent_ref, await _narrow_hosts(request))
+
+
 @app.post(
     "/api/guardrails/{agent_ref}/egress-containment",
     status_code=201,

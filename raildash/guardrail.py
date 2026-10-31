@@ -134,7 +134,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator, FormatChecker
@@ -1182,6 +1182,14 @@ def _size_cap(host: str, caps: Mapping[str, int]) -> int | None:
 _CLASSIFY = object()
 
 
+def body_needs_upload_host(body: bool, kind: Mapping[str, Any] | None, host: str | None,
+                           uploads: Mapping[str, Any]) -> bool:
+    """Whether a request's body must go to an upload host under `uploads`:
+    any body with body kinds unread (`kind` None) or no host, else one
+    that counts as an upload (`body_counts`)."""
+    return body and (kind is None or host is None or body_counts(kind, host, uploads))
+
+
 def evaluate_request(
     guardrail: Mapping[str, Any], interaction: Mapping[str, Any], *, body_kind: Any = _CLASSIFY
 ) -> dict[str, Any]:
@@ -1229,7 +1237,7 @@ def evaluate_request(
         kind = request_body_kind(interaction, uploads.get("body_kind_overrides", ()))
     else:
         kind = body_kind
-    if body and (kind is None or host is None or body_counts(kind, host, uploads)):
+    if body_needs_upload_host(body, kind, host, uploads):
         if not host_allowed(host, upload_hosts(uploads)):
             upload_reasons.append("body_to_unlisted_host")
     cap = _size_cap(host, uploads["max_request_bytes"]) if host is not None else None
@@ -1947,6 +1955,100 @@ OPENSHELL_DNS_ENTRIES: tuple[dict[str, Any], ...] = (
 )
 
 
+def window_body_kinds(
+    requests: Sequence[Mapping[str, Any]], *, call_hosts: Iterable[str],
+    budget: _bk.ParametersBudget, overrides: Iterable[Mapping[str, Any]] = (),
+) -> list[dict[str, Any] | None]:
+    """Each stored request's body kind over a window (None with no body),
+    with the drip check run in capture-time order against `budget`, keyed
+    by the `out_of_spec_calls` hosts `call_hosts` (§3). The proposal and the
+    *narrow uploads* offer judge a window this way."""
+    overrides = list(overrides)
+    call_hosts = set(call_hosts)
+    kinds = [request_body_kind(request, overrides) for request in requests]
+    stamps = [stamp.timestamp() for stamp in (_instant(r.get("timestamp")) for r in requests) if stamp is not None]
+    latest = max(stamps, default=0.0)
+    order = sorted(range(len(requests)), key=lambda i: (_instant(requests[i].get("timestamp")) is None,
+                                                      _instant(requests[i].get("timestamp")) or 0, i))
+    for i in order:
+        host = normalize_host(requests[i].get("host"))
+        when = _instant(requests[i].get("timestamp"))
+        if kinds[i] is None or host is None:
+            continue
+        # One with no capture time is sorted last and counted at the
+        # latest time any request has, so it still counts.
+        at = when.timestamp() if when is not None else latest
+        kinds[i] = budget.observe(kinds[i], drip_keys(host, call_hosts), at)
+    return kinds
+
+
+def narrow_uploads_hosts(
+    guardrail: Mapping[str, Any], requests: Sequence[Mapping[str, Any]],
+    rows: Iterable[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """REST uploads §4's *narrow uploads* offer: the `uploads.allowed_hosts`
+    entries a version could move to `parameters_only_hosts` without making
+    anything count.
+
+    `requests` are the agent's stored requests over the window the offer
+    reads (the caller's), `rows` its stored guardrail rows. An entry is
+    offered when at least one request in the window sent a `parameters`
+    body to a host it matches, and, under the version with it moved (and
+    every entry offered before it), no request's body would have gone to a
+    host that isn't an upload host and no stored row that doesn't count
+    now would. Bodies are classified with the version's own overrides and
+    the drip check is run over the window with its own budgets, as the
+    store judges them. Returns `[{"host", "requests", "bytes"}]`, the
+    parameters bodies seen per entry, in `allowed_hosts` order; empty with
+    body kinds off (the version would read the same)."""
+    if not body_kinds_on():
+        return []
+    rules = guardrail["rules"]
+    uploads = rules["uploads"]
+    entries, agent_budget = drip_budgets(uploads)
+    kinds = window_body_kinds(
+        requests, call_hosts=rules["out_of_spec_calls"]["allowed_hosts"],
+        budget=_bk.ParametersBudget(entry_budgets=entries, agent_budget=agent_budget),
+        overrides=uploads.get("body_kind_overrides", ()),
+    )
+    bodies = [
+        (normalize_host(request.get("host")), kind)
+        for request, kind in zip(requests, kinds)
+        if carries_body(request)
+    ]
+    rows = [row for row in rows if not row_counts(guardrail, row)]
+
+    def narrowed(moved: Sequence[str]) -> dict[str, Any]:
+        new = json.loads(json.dumps(rules))
+        new_uploads = new["uploads"]
+        new_uploads["allowed_hosts"] = [h for h in new_uploads["allowed_hosts"] if h not in moved]
+        only = list(new_uploads.get("parameters_only_hosts", ()))
+        new_uploads["parameters_only_hosts"] = sorted({*only, *moved})
+        return {**guardrail, "rules": new}
+
+    def safe(candidate: Mapping[str, Any]) -> bool:
+        new_uploads = candidate["rules"]["uploads"]
+        if any(body_needs_upload_host(True, kind, host, new_uploads)
+               and not host_allowed(host, upload_hosts(new_uploads)) for host, kind in bodies):
+            return False
+        return not any(row_counts(candidate, row) for row in rows)
+
+    offered: list[dict[str, Any]] = []
+    moved: list[str] = []
+    for entry in uploads["allowed_hosts"]:
+        seen = [kind for host, kind in bodies
+                if host is not None and host_matches(host, entry)
+                and kind is not None and not body_counts(kind, host, uploads)]
+        if not seen or not safe(narrowed([*moved, entry])):
+            continue
+        moved.append(entry)
+        offered.append({
+            "host": entry, "requests": len(seen),
+            "bytes": sum(kind["bytes"] for kind in seen if type(kind.get("bytes")) is int),
+        })
+    return offered
+
+
 def propose_guardrail(
     alignment: Mapping[str, Any],
     bundle: Mapping[str, Any],
@@ -2021,24 +2123,11 @@ def propose_guardrail(
     # the budgets the proposal will have (the defaults) keyed by the hosts
     # it will allow calls to; a body it makes an upload seeds nothing and is
     # listed as a would-be violation instead.
-    on = body_kinds_on()
-    kinds: list[dict[str, Any] | None] = [request_body_kind(request) if on else None for request in requests]
-    if on:
+    if body_kinds_on():
         call_hosts = set(_declared_lists(attributes)[0] or ()) | set(seed["hosts"] if seed is not None else ())
-        budget = _bk.ParametersBudget()
-        stamps = [stamp.timestamp() for stamp in (_instant(r.get("timestamp")) for r in requests) if stamp is not None]
-        latest = max(stamps, default=0.0)
-        order = sorted(range(len(requests)), key=lambda i: (_instant(requests[i].get("timestamp")) is None,
-                                                          _instant(requests[i].get("timestamp")) or 0, i))
-        for i in order:
-            host = normalize_host(requests[i].get("host"))
-            when = _instant(requests[i].get("timestamp"))
-            if kinds[i] is None or host is None:
-                continue
-            # One with no capture time is sorted last and counted at the
-            # latest time any request has, so it still counts.
-            at = when.timestamp() if when is not None else latest
-            kinds[i] = budget.observe(kinds[i], drip_keys(host, call_hosts), at)
+        kinds = window_body_kinds(requests, call_hosts=call_hosts, budget=_bk.ParametersBudget())
+    else:
+        kinds = [None] * len(requests)
     dripped = [kind is not None and kind.get("step") == _bk.STEP_DRIP for kind in kinds]
     uploading = [
         carries_body(request) and not drip and (
