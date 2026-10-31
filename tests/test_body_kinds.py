@@ -1,9 +1,9 @@
 """REST uploads M1: body kinds (REST uploads design §3 and §6).
 
 Every expected kind is written down here, first over the captures in
-`fixtures/` (model and MCP traffic, the keyed capture's empty POSTs and a
-trimmed SSE request), then over bodies shaped as public APIs document them, then
-over each bound.
+`fixtures/` (model and MCP traffic, the keyed capture's empty POSTs, a
+trimmed SSE request, and OpenClaw's start-up calls and model requests),
+then over bodies shaped as public APIs document them, then over each bound.
 """
 
 from __future__ import annotations
@@ -45,6 +45,11 @@ REAL_CAPTURES = [
     ("codex-responses-captures.jsonl", ["upload/traffic"] * 3),
     # Keyed multi-agent capture: three POSTs of `{}`.
     ("keyed-capture.jsonl", ["parameters/shape"] * 3),
+    # OpenClaw 2026.10.8, configured as datrail-project's openclaw jobs run
+    # it: the gateway's three start-up GETs carry no body (so they are
+    # skipped here); one exec turn's two chat-completions POSTs are model
+    # traffic whatever their size (about 37 KB each).
+    ("openclaw/captures.jsonl", ["upload/traffic"] * 2),
 ]
 
 
@@ -58,6 +63,21 @@ def test_real_captures(name, expected):
         result = bk.classify_exchange(exchange, host="h")
         got.append(f"{result['kind']}/{result['source']}")
     assert got == expected
+
+
+def test_openclaws_start_up_calls_carry_no_body():
+    # Its update check, model catalog and plugin feed: nothing for the
+    # classifier, so none of them can count against the uploads rule.
+    starts = [e["request"] for e in exchanges("openclaw/captures.jsonl")
+              if e["request"]["method"] == "GET"]
+    assert sorted((r["headers"]["host"], r["path"]) for r in starts) == [
+        ("catalog.openclaw.ai", "/models/v2/catalog.json"),
+        ("clawhub.ai", "/v1/feeds/plugins"),
+        ("telemetry.openclaw.ai", "/api/latest-version"),
+    ]
+    assert not any(bk.request_carries_body(r) for r in starts)
+    assert sorted(bk.stored_kind(e) for e in exchanges("openclaw/captures.jsonl")) == [
+        "", "", "", "traffic", "traffic"]
 
 
 def test_claude_codes_request_is_model_traffic_whatever_its_size():
