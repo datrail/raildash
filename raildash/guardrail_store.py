@@ -105,6 +105,10 @@ GUARDRAIL_ACK_RETENTION_DAYS = 30
 # The proposal reads at most this many of the agent's requests from the
 # 24 h before the lock, newest first.
 PROPOSAL_MAX_REQUESTS = 5_000
+# REST uploads §4: how long a computed *narrow uploads* offer is kept
+# before new captures are read again, and before the window is moved.
+NARROW_OFFER_MIN_AGE = 60
+NARROW_OFFER_MAX_AGE = 600
 MAX_GUARDRAIL_EVENTS_SHOWN = 100
 # DR-249: Blocked by OpenShell shows a day of denials (design §4.3), and
 # keeps a week, for an agent whose page isn't open every day.
@@ -1314,8 +1318,11 @@ class GuardrailCustody:
         more requests than are read (not every one could be checked).
 
         The detail route asks on every poll, so the answer is kept until
-        the version, the agent's requests or rows, the dismissals or the
-        ten-minute slot change."""
+        the version, the agent's rows or the dismissals change; new captures
+        (of any agent: who owns one is only known by reading it) are read at
+        most once a minute, and the window is moved every ten minutes. A
+        kept offer can be out of date, never wrong to accept: accepting
+        re-computes it."""
         active = self._active_guardrail_row(kind, value)
         if active is None or not g.body_kinds_on():
             return None
@@ -1326,14 +1333,23 @@ class GuardrailCustody:
             "WHERE identity_kind = ? AND identity_value = ?", (kind, value),
         ).fetchone())
         latest = self._db.execute("SELECT max(id) FROM interactions").fetchone()[0]
-        key = (active["guardrail_version_id"], latest, rows_key, tuple(dismissed), int(end.timestamp()) // 600)
+        key = (active["guardrail_version_id"], rows_key, tuple(dismissed))
         cache = self.__dict__.setdefault("_narrow_offer_cache", {})
-        if cached and (kind, value) in cache and cache[(kind, value)][0] == key:
-            return cache[(kind, value)][1]
+        kept = cache.get((kind, value))
+        if cached and kept is not None and kept["key"] == key:
+            age = end.timestamp() - kept["at"]
+            if age < NARROW_OFFER_MAX_AGE and (kept["latest"] == latest or age < NARROW_OFFER_MIN_AGE):
+                return kept["offer"]
         start = end - g.PROPOSAL_LOOKBACK
-        requests = self._owned_requests_locked(kind, value, start, end)
         offer = None
-        if len(requests) < PROPOSAL_MAX_REQUESTS:
+        # The read limit is on every agent's captures, before they are given
+        # to this one: past it, this agent's oldest could be missing.
+        total = self._db.execute(
+            "SELECT count(*) FROM interactions WHERE authenticated = 1 AND timestamp_ns BETWEEN ? AND ?",
+            (int(start.timestamp() * 1e9), int(end.timestamp() * 1e9)),
+        ).fetchone()[0]
+        if total < PROPOSAL_MAX_REQUESTS:
+            requests = self._owned_requests_locked(kind, value, start, end)
             rows = [
                 self._row_view(row) for row in self._db.execute(
                     "SELECT * FROM guardrail_rows WHERE identity_kind = ? AND identity_value = ?", (kind, value),
@@ -1344,7 +1360,7 @@ class GuardrailCustody:
             if hosts:
                 offer = {"hosts": hosts, "version": contract["version"],
                          "window": {"start": self._receive_time(start), "end": self._receive_time(end)}}
-        cache[(kind, value)] = (key, offer)
+        cache[(kind, value)] = {"key": key, "latest": latest, "at": end.timestamp(), "offer": offer}
         return offer
 
     def narrow_uploads_offer(self, ref: str) -> dict[str, Any] | None:
@@ -1393,6 +1409,10 @@ class GuardrailCustody:
             active = self._active_guardrail_row(kind, value)
             if active is None:
                 raise ValueError("this agent has no active guardrail")
+            listed = json.loads(active["contract_json"])["rules"]["uploads"]["allowed_hosts"]
+            unlisted = [h for h in hosts if h not in listed]
+            if unlisted:
+                raise ValueError(f"not an upload host of the active version: {', '.join(unlisted)}")
             dismissed = sorted({*self._narrow_dismissed_locked(kind, value), *hosts})
             self._db.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) "

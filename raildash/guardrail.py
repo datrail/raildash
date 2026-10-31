@@ -1994,9 +1994,9 @@ def narrow_uploads_hosts(
     reads (the caller's), `rows` its stored guardrail rows. An entry is
     offered when at least one request in the window sent a `parameters`
     body to a host it matches, and, under the version with it moved (and
-    every entry offered before it), no request's body would have gone to a
-    host that isn't an upload host and no stored row that doesn't count
-    now would. Bodies are classified with the version's own overrides and
+    every entry offered before it), no request's body that doesn't count
+    now would go to a host that isn't an upload host, and no stored row
+    that doesn't count now would count. Bodies are classified with the version's own overrides and
     the drip check is run over the window with its own budgets, as the
     store judges them. Returns `[{"host", "requests", "bytes"}]`, the
     parameters bodies seen per entry, in `allowed_hosts` order; empty with
@@ -2011,10 +2011,16 @@ def narrow_uploads_hosts(
         budget=_bk.ParametersBudget(entry_budgets=entries, agent_budget=agent_budget),
         overrides=uploads.get("body_kind_overrides", ()),
     )
+    # Only what doesn't count now is re-checked: a body or row that already
+    # counts (an upload elsewhere, a body with no host) says nothing about
+    # the move, and would otherwise withhold every offer from a Violated agent.
     bodies = [
-        (normalize_host(request.get("host")), kind)
-        for request, kind in zip(requests, kinds)
-        if carries_body(request)
+        (host, kind)
+        for host, kind in (
+            (normalize_host(request.get("host")), kind)
+            for request, kind in zip(requests, kinds) if carries_body(request)
+        )
+        if not (body_needs_upload_host(True, kind, host, uploads) and not host_allowed(host, upload_hosts(uploads)))
     ]
     rows = [row for row in rows if not row_counts(guardrail, row)]
 

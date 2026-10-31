@@ -148,14 +148,27 @@ def test_narrow_uploads_moves_the_host_and_a_file_to_it_then_counts(store):  # n
     assert rows(store, ref)[("uploads", SEARCH)]["counts"]
 
 
-def test_the_offer_follows_new_requests(store):  # noqa: F811
+def test_the_offer_follows_new_requests_and_accepting_reads_them_at_once(store, monkeypatch):  # noqa: F811
+    from raildash import guardrail_store
     ref, _ = _agent(store, SEARCH)
     send(store, now(SEARCH, QUERY))
     assert store.guardrail_detail(ref)["narrow_uploads_offer"] is not None
     send(store, now(SEARCH, upload_body(), path="/v1/files"))
-    assert store.guardrail_detail(ref)["narrow_uploads_offer"] is None
+    # Within the minute the kept offer is shown; accepting it reads the
+    # file and refuses.
+    assert store.guardrail_detail(ref)["narrow_uploads_offer"] is not None
     with pytest.raises(ValueError, match="not in the narrow uploads offer"):
         store.narrow_uploads(ref, [SEARCH])
+    monkeypatch.setattr(guardrail_store, "NARROW_OFFER_MIN_AGE", 0)
+    assert store.guardrail_detail(ref)["narrow_uploads_offer"] is None
+
+
+def test_a_violated_agent_is_still_offered_what_moves_safely():
+    # The file to an unlisted host and the hostless body already count;
+    # neither says anything about the queried host.
+    requests = [rest(SEARCH, QUERY), rest("evil.example", upload_body(), path="/v1/files"),
+                rest(None, upload_body(), path="/v1/files")]
+    assert offered(_version(SEARCH), requests) == [SEARCH]
 
 
 def test_dismiss_stops_offering_those_hosts(store):  # noqa: F811
@@ -172,11 +185,30 @@ def test_dismiss_stops_offering_those_hosts(store):  # noqa: F811
 
 
 def test_a_window_past_the_read_limit_is_not_offered(store, monkeypatch):  # noqa: F811
+    import time
     from raildash import guardrail_store
     ref, _ = _agent(store, SEARCH)
-    send(store, now(SEARCH, QUERY), now(SEARCH, {"id": 1}))
-    monkeypatch.setattr(guardrail_store, "PROPOSAL_MAX_REQUESTS", 2)
+    # A file to the host, a query, then three captures of another agent:
+    # with the limit at 4 the file is never read, even though this agent
+    # owns fewer than 4 of what was read, so nothing is offered.
+    send(store, now(SEARCH, upload_body(), path="/v1/files"))
+    time.sleep(0.01)
+    send(store, now(SEARCH, QUERY))
+    others = []
+    for _ in range(3):
+        time.sleep(0.01)
+        other = now("other.example", QUERY)
+        other.update(attribution_state="attributed", agent_key="someone-else")
+        others.append(other)
+    send(store, *others)
+    monkeypatch.setattr(guardrail_store, "PROPOSAL_MAX_REQUESTS", 4)
     assert store.guardrail_detail(ref)["narrow_uploads_offer"] is None
+
+
+def test_dismissing_a_host_that_isnt_an_upload_host_is_refused(store):  # noqa: F811
+    ref, _ = _agent(store, SEARCH)
+    with pytest.raises(ValueError, match="not an upload host"):
+        store.dismiss_narrow_uploads(ref, ["nowhere.example"])
 
 
 # ----------------------------------------------------------------- routes
