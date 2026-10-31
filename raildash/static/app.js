@@ -1926,6 +1926,56 @@ function renderDataActionWhy(tool, action, active, refresh) {
   return details;
 }
 
+// REST uploads: an `uploads` host row's bodies, each with its kind, method,
+// path template and reasons, and **This is parameters** on a body an
+// override can answer (steps 2-5): never on a hard upload (step 1), model or
+// MCP traffic (step 0) or one the drip check made an upload (step 6).
+const BODY_KIND_OVERRIDABLE_STEPS = [2, 3, 4, 5];
+const BODY_KIND_STEP_LABELS = { 0: "model or MCP traffic", 1: "upload", 2: "your answer", 6: "daily parameters budget" };
+
+function bodyKindOverridden(uploads, host, body) {
+  return (uploads.body_kind_overrides || []).find((entry) =>
+    entry.host === host && entry.method === body.method && entry.path === body.path_template);
+}
+
+function renderBodyKinds(row, active, refresh) {
+  const bodies = Array.isArray(row.detail.bodies) ? row.detail.bodies : [];
+  if (!bodies.length) return null;
+  const list = el("ul", "guardrail-bodies");
+  const uploads = active ? active.guardrail.rules.uploads : null;
+  bodies.forEach((body) => {
+    if (!body || typeof body !== "object") return;
+    const li = el("li");
+    const step = BODY_KIND_STEP_LABELS[body.step];
+    const what = `${body.kind}${step && body.kind !== step ? ` (${step})` : ""} · ${body.method || "?"} ${body.path_template || ""}` +
+      `${typeof body.bytes === "number" ? ` · ${fmtBytes(body.bytes)}` : ""}`;
+    li.append(el("span", null, what));
+    const reasons = Array.isArray(body.reasons) ? body.reasons.filter((r) => typeof r === "string") : [];
+    if (reasons.length) li.append(el("span", "muted", ` — ${reasons.join("; ")}`));
+    const answered = uploads ? bodyKindOverridden(uploads, row.item, body) : undefined;
+    if (answered) {
+      li.append(el("span", "muted", ` · you marked it ${answered.kind}`));
+    } else if (uploads && !row.acknowledged && !row.allowed_by && body.kind !== "parameters"
+               && BODY_KIND_OVERRIDABLE_STEPS.includes(body.step) && body.method && body.path_template) {
+      li.append(guardrailButton("This is parameters", async () => {
+        const rules = JSON.parse(JSON.stringify(active.guardrail.rules));
+        const answers = (rules.uploads.body_kind_overrides || []).filter((entry) =>
+          !(entry.host === row.item && entry.method === body.method && entry.path === body.path_template));
+        answers.push({ host: row.item, method: body.method, path: body.path_template, kind: "parameters" });
+        rules.uploads.body_kind_overrides = answers;
+        await postJSON(
+          `/api/guardrail-versions/${encodeURIComponent(active.guardrail.guardrail_version_id)}/edit`, { rules });
+        refresh();
+      }, { quiet: true, key: `parameters:${row.row_id}:${body.method}:${body.path_template}` }));
+    }
+    list.append(li);
+  });
+  if (row.detail.bodies_overflow) {
+    list.append(el("li", "muted", "More bodies than are kept: an answer can't clear this row."));
+  }
+  return list;
+}
+
 function renderGuardrailRow(row, refresh, hasActive, active = null) {
   const tr = el("tr");
   if (row.counts) tr.dataset.counts = "true";
@@ -1933,6 +1983,10 @@ function renderGuardrailRow(row, refresh, hasActive, active = null) {
   item.append(el("code", null, row.overflow ? `${row.count} more items` : row.item));
   if (row.rule === "data_actions" && row.detail.tool && row.detail.action !== "unreadable") {
     item.append(renderDataActionWhy(row.detail.tool, row.detail.action, active, refresh));
+  }
+  if (row.rule === "uploads" && row.detail.kind === "host") {
+    const bodies = renderBodyKinds(row, active, refresh);
+    if (bodies) item.append(bodies);
   }
   // The server's own verdict: a row counts only while unacknowledged and
   // disallowed by the version in force, so none counts with no guardrail.
