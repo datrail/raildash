@@ -915,3 +915,70 @@ def test_an_upload_rows_bodies_say_why_and_this_is_parameters_clears_it(tmp_path
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_narrow_uploads_moves_a_host_only_sent_queries(tmp_path):
+    """REST uploads M2c: an upload host the last 24 hours only sent
+    parameters is offered as *Narrow uploads*; accepting it saves a version
+    that lists the host as only queried, and the offer goes."""
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    value = asp(listeners=[DEMO_LISTENER])
+    asp_id = store.load_asp(json.dumps(value).encode())["asp_id"]
+    alignment = store.make_baseline(asp_id, "v1.0")["alignment_version"]
+    rules = store.propose_guardrail(alignment["alignment_version_id"])["guardrail"]["rules"]
+    rules["uploads"]["allowed_hosts"] = sorted({*rules["uploads"]["allowed_hosts"], "api.search.example"})
+    rules["out_of_spec_calls"]["allowed_hosts"] = sorted(
+        {*rules["out_of_spec_calls"]["allowed_hosts"], "api.search.example"})
+    store.adopt_guardrail(alignment["alignment_version_id"], rules)
+    store.close()
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        token = (tmp_path / "raildash.db.token").read_text().strip()
+        _heartbeat(url, token)
+        from datetime import datetime
+        item = copy.deepcopy(capture()[0])
+        item["timestamp"] = _now()
+        # RailMon's timestamp_ns is wall-clock (epoch ms x 1e6).
+        item["timestamp_ns"] = int(datetime.fromisoformat(item["timestamp"].replace("Z", "+00:00")).timestamp() * 1e9)
+        item["interaction_id"] = "narrow-query"
+        text = json.dumps({"q": "invoices 2026", "limit": 20})
+        item["request"].update(method="POST", path="/v1/query", body=json.loads(text))
+        item["request"]["headers"].update({"host": "api.search.example", "content-type": "application/json",
+                                           "content-length": str(len(text))})
+        _post(url, "/webhook/http-interactions", token,
+              json.dumps({"session_id": "browser", "interactions": [item]}).encode())
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            card = page.locator("#guardrail-body .guardrail-card")
+            offer = card.locator(".guardrail-narrow-uploads-offer")
+            expect(offer).to_contain_text("api.search.example · 1 parameters body", timeout=TIMEOUT)
+            if os.environ.get("RAILDASH_SHOT_DIR"):
+                offer.screenshot(path=os.path.join(os.environ["RAILDASH_SHOT_DIR"], "narrow-uploads-offer.png"))
+            offer.get_by_role("button", name="Narrow uploads").click()
+            expect(card.locator(".guardrail-narrow-uploads-offer")).to_have_count(0, timeout=TIMEOUT)
+            card.locator(".guardrail-active-policy > summary").click()
+            policy = card.locator(".guardrail-active-policy")
+            expect(policy).to_contain_text("g2")
+            expect(policy).to_contain_text("Hosts it only queriedapi.search.example")
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

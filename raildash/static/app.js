@@ -1781,6 +1781,40 @@ function renderDataActionsOffer(agentRef, refresh) {
   return section;
 }
 
+// REST uploads §4: upload hosts the last 24 hours only sent parameters to,
+// which a version can move to parameters-only. The server already checked
+// that moving them makes no request or stored row count; nothing is
+// applied until the user asks.
+function renderNarrowUploadsOffer(agentRef, offer, refresh) {
+  const section = el("section", "guardrail-offers guardrail-narrow-uploads-offer");
+  section.append(el("h5", null, "Narrow uploads"));
+  section.append(el("p", "muted",
+    `In the last 24 hours these upload hosts were only sent parameters (queries, IDs, filters), never a file. ` +
+    `Moving them to parameters-only means a file or large body sent to them counts; queries still don't.`));
+  const list = el("ul", "guardrail-narrow-hosts");
+  const hosts = offer.hosts.map((entry) => entry.host);
+  offer.hosts.forEach((entry) => {
+    const li = el("li");
+    li.append(el("code", null, entry.host),
+      el("span", "muted", ` · ${fmtInt(entry.requests)} parameters ${entry.requests === 1 ? "body" : "bodies"}` +
+        ` · ${fmtBytes(entry.bytes)}`));
+    list.append(li);
+  });
+  section.append(list);
+  const base = `/api/guardrails/${encodeURIComponent(agentRef)}/narrow-uploads`;
+  const actions = el("div", "asp-actions");
+  actions.append(guardrailButton("Narrow uploads", async () => {
+    await postJSON(base, { hosts });
+    refresh();
+  }, { key: `narrow-uploads:${agentRef}` }));
+  actions.append(guardrailButton("Dismiss", async () => {
+    await postJSON(`${base}/dismiss`, { hosts });
+    refresh();
+  }, { quiet: true, key: `narrow-uploads-dismiss:${agentRef}` }));
+  section.append(actions);
+  return section;
+}
+
 function renderDataActionsPolicy(rule) {
   const dl = el("dl", "guardrail-policy");
   const add = (term, text) => dl.append(el("dt", null, term), el("dd", null, text));
@@ -2359,6 +2393,10 @@ async function loadGuardrails(focusKey = null) {
         "plain TCP, DNS or a stdio MCP server isn't seen."));
       if (detail.offers.length) card.append(renderGuardrailOffers(detail.agent_ref, detail.active, detail.offers, refresh));
       if (detail.data_actions_offer_available) card.append(renderDataActionsOffer(detail.agent_ref, refresh));
+      if (detail.narrow_uploads_offer && Array.isArray(detail.narrow_uploads_offer.hosts)
+          && detail.narrow_uploads_offer.hosts.length) {
+        card.append(renderNarrowUploadsOffer(detail.agent_ref, detail.narrow_uploads_offer, refresh));
+      }
       card.append(renderGuardrailRows(detail.rows, refresh, true, detail.agent_ref, detail.active));
       const policy = el("details", "guardrail-active-policy");
       policy.dataset.key = "policy";
