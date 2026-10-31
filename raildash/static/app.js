@@ -1607,6 +1607,77 @@ function renderOpenshellDenials(denials, held) {
 // The import: the file `openshell sandbox get <name> --policy-only` prints,
 // sent as it is. A file that isn't a policy is refused with what was wrong,
 // and the policy already held stays.
+// REST uploads M3: OpenAPI specs imported per host. A matched operation
+// whose request body carries files or content makes its requests uploads,
+// however small; any other leaves the body's shape to decide.
+function renderApiSpecs(specs, refresh) {
+  const section = el("section", "guardrail-api-specs");
+  section.dataset.agentRef = "api-specs";
+  section.append(el("h4", null, "API specs"));
+  section.append(el("p", "muted",
+    "Import a service's OpenAPI spec for its host, and requests to it are read with it: an operation " +
+    "that takes files or content makes its requests uploads, however small. A spec never makes a body " +
+    "parameters. Applies to requests judged from then on, for every agent."));
+  const list = el("ul", "guardrail-api-spec-list");
+  specs.forEach((spec) => {
+    const li = el("li");
+    li.append(el("code", null, spec.host));
+    const name = [spec.title, spec.version].filter((part) => typeof part === "string" && part).join(" ");
+    li.append(el("span", "muted", ` ${name ? `${name} · ` : ""}${fmtInt(spec.operations || 0)} operations, ` +
+      `${fmtInt(spec.upload_operations || 0)} take files or content` +
+      (spec.current ? "" : " · from an older RailDash: import it again")));
+    li.append(guardrailButton("Remove", async () => {
+      await tokenFetch(apiUrl(`/api/api-specs/${encodeURIComponent(spec.host)}`), { method: "DELETE" });
+      refresh();
+    }, { quiet: true, key: `api-spec-remove:${spec.host}` }));
+    list.append(li);
+  });
+  if (specs.length) section.append(list);
+  const form = el("div", "guardrail-action");
+  const host = el("input");
+  host.type = "text";
+  host.placeholder = "api.example.com";
+  host.setAttribute("aria-label", "Host the spec is for");
+  host.dataset.key = "api-spec-host";
+  const input = el("input");
+  input.type = "file";
+  input.accept = ".yaml,.yml,.json,text/yaml,application/json";
+  input.hidden = true;
+  const button = el("button", "btn btn-quiet", "Import an API spec");
+  button.type = "button";
+  button.dataset.key = "api-spec-import";
+  const status = el("span", "asp-status-msg");
+  status.setAttribute("aria-live", "polite");
+  button.addEventListener("click", () => {
+    if (!host.value.trim()) {
+      setInlineStatus(status, "Enter the host the spec is for first.", "err");
+      return;
+    }
+    input.click();
+  });
+  input.addEventListener("change", async () => {
+    const file = input.files && input.files[0];
+    input.value = "";
+    if (!file) return;
+    guardrailBusy += 1;
+    setInlineStatus(status, `Importing ${file.name}…`);
+    try {
+      const result = await postRawBody(
+        `/api/api-specs?host=${encodeURIComponent(host.value.trim())}`, await file.arrayBuffer());
+      setInlineStatus(status, `Imported for ${result.host}: ${fmtInt(result.operations)} operations, ` +
+        `${fmtInt(result.upload_operations)} take files or content.`, "ok");
+      refresh();
+    } catch (error) {
+      setInlineStatus(status, `Not imported: ${error.message}`, "err");
+    } finally {
+      guardrailBusy -= 1;
+    }
+  });
+  form.append(host, input, button, status);
+  section.append(form);
+  return section;
+}
+
 function renderOpenshellImport(agentRef, held, refresh) {
   const wrap = el("span", "guardrail-action");
   const input = el("input");
@@ -1965,7 +2036,9 @@ function renderDataActionWhy(tool, action, active, refresh) {
 // override can answer (steps 2-5): never on a hard upload (step 1), model or
 // MCP traffic (step 0) or one the drip check made an upload (step 6).
 const BODY_KIND_OVERRIDABLE_STEPS = [2, 3, 4, 5];
-const BODY_KIND_STEP_LABELS = { 0: "model or MCP traffic", 1: "upload", 2: "your answer", 6: "daily parameters budget" };
+const BODY_KIND_STEP_LABELS = {
+  0: "model or MCP traffic", 1: "upload", 2: "your answer", 3: "from the API spec", 6: "daily parameters budget",
+};
 
 function bodyKindOverridden(uploads, host, body) {
   return (uploads.body_kind_overrides || []).find((entry) =>
@@ -2329,8 +2402,10 @@ async function loadGuardrails(focusKey = null) {
     || body.querySelector('.guardrail-editor[open], .guardrail-why[data-dirty="true"]'))) return;
   const generation = ++guardrailGeneration;
   let details;
+  let specs = [];
   try {
     const agents = await getJSONWithToken("/api/guardrails");
+    specs = (await getJSONWithToken("/api/api-specs")).specs || [];
     // One agent's failure is shown in its card, not as the dashboard down.
     const settled = await Promise.allSettled(agents.map(
       (agent) => getJSONWithToken(`/api/guardrails/${encodeURIComponent(agent.agent_ref)}`)
@@ -2345,7 +2420,7 @@ async function loadGuardrails(focusKey = null) {
     return;
   }
   if (generation !== guardrailGeneration) return;  // a later load draws instead
-  const fingerprint = JSON.stringify(details);
+  const fingerprint = JSON.stringify([details, specs]);
   if (focusKey === null && fingerprint === lastGuardrailRender) return;
   lastGuardrailRender = fingerprint;
 
@@ -2431,6 +2506,9 @@ async function loadGuardrails(focusKey = null) {
     if (detail.events.length) card.append(renderGuardrailHistory(detail.events));
     body.append(card);
   });
+  if (details.length || specs.length) {
+    body.append(renderApiSpecs(specs, () => loadGuardrails("api-specs").catch((error) => console.error(error))));
+  }
   restoreGuardrailView(body, before, focusKey);
   const announcement = details
     .map((detail) => `${identityLabel(detail.agent_identity)}: ${guardrailStatePresentation(detail.state)[0]}`)

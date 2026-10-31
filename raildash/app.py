@@ -41,6 +41,7 @@ from .json_safety import (
 from .guardrail import GuardrailValidationError
 from . import classifier_model
 from . import openshell_policy as osp
+from . import api_specs
 from .store import Store
 from .asp import (
     DEFAULT_DRIFT_PAGE_SIZE,
@@ -1316,6 +1317,33 @@ async def api_import_openshell_policy(agent_ref: str, request: Request) -> dict[
         )
     except osp.PolicyImportError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/api-specs", dependencies=[Depends(require_local_token)])
+def api_list_api_specs() -> dict[str, Any]:
+    """REST uploads M3: the imported API specs, one per host, with how many
+    operations each has and how many carry files or content."""
+    return {"specs": get_store().api_spec_list()}
+
+
+@app.post("/api/api-specs", status_code=201, dependencies=[Depends(require_local_token)])
+async def api_import_api_spec(request: Request, host: str = Query(..., min_length=1, max_length=253)) -> dict[str, Any]:
+    """**Import an API spec** (REST uploads §4 "Specs"): the body is an
+    OpenAPI 3.x file (JSON or YAML) for `host`, replacing any spec that host
+    had. 422 with what was wrong for a bad host or a file that isn't a
+    spec, which stores nothing."""
+    raw = await _bounded_raw_body(request, api_specs.MAX_SPEC_BYTES)
+    try:
+        return await run_in_threadpool(get_store().import_api_spec, host, raw)
+    except api_specs.SpecImportError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.delete("/api/api-specs/{host}", dependencies=[Depends(require_local_token)])
+def api_remove_api_spec(host: str) -> dict[str, Any]:
+    """Remove a host's imported spec; its requests are judged on their
+    shape alone again. 404 when it has none."""
+    return _guardrail_call(get_store().remove_api_spec, host)
 
 
 @app.get("/api/guardrails/{agent_ref}/openshell-policy/export", dependencies=[Depends(require_local_token)])

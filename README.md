@@ -321,6 +321,9 @@ token, including both reads:
 | `POST /api/guardrails/{agent_ref}/data-actions/dismiss` `{}` | Dismiss the *Add data actions* offer; it isn't offered again |
 | `POST /api/guardrails/{agent_ref}/narrow-uploads` `{"hosts": [...]}` | Narrow uploads: a new version moving the offered upload hosts (the detail's `narrow_uploads_offer`) to `parameters_only_hosts`; 409 for a host not in the offer now |
 | `POST /api/guardrails/{agent_ref}/narrow-uploads/dismiss` `{"hosts": [...]}` | Dismiss the *Narrow uploads* offer for those upload hosts; they aren't offered again |
+| `GET /api/api-specs` | The imported API specs, one per host: title, version, operations, and how many take files or content |
+| `POST /api/api-specs?host=...` (the spec file) | Import an API spec: an OpenAPI 3.x file (JSON or YAML) for one host, replacing any it had; 422 says what was wrong with a bad host or a file that isn't a spec |
+| `DELETE /api/api-specs/{host}` | Remove a host's spec; 404 when it has none |
 | `GET /api/data-actions/tool?name=...` | One tool's classification (actions, reasons) and the schemas behind it, for the panel's **Why** |
 | `POST /api/guardrails/{agent_ref}/egress-containment` `{}` or `{"require": "allow_list_enforced"}` | Require containment: a new version that requires the agent's egress be contained; `starts_violated` says whether the newest ASP already fails it |
 | `POST /v1/openshell/sandboxes/{sandbox}/policy` (`policy get --full -o json`) | `railmon openshell`: a sandbox's policy revision, read as an import is, shown for every agent whose ASP names that sandbox |
@@ -373,6 +376,23 @@ capture's **Bytes sent per host** splits each host's bytes by body kind
 read as not classified when it was captured more than a day before
 RailDash first read body kinds, has no readable capture time, or was stored
 by an older RailDash.
+
+**Import an API spec** (under the guardrail cards) takes an OpenAPI 3.x
+file, JSON or YAML, for one host. RailDash keeps an index of its operations,
+not the file. A request to the host is matched to an operation by method and
+path (the spec's server base path stripped; literal segments before
+parameters; a final parameter such as GitHub's `{path}` may take the rest of
+the path). If the operation's request body, for the media type sent, takes a
+file media type or has a data-carrying property (`format: binary` or
+`byte`, `contentEncoding`, `contentMediaType`, or a name such as `content`,
+`file` or `data`, following `$ref`s within the spec), the body is an upload
+however small; the row says which operation and property. Any other
+operation leaves the body's shape to decide and is only named among the
+reasons. A spec never makes a body parameters, and **This is parameters**
+still answers one it made an upload. It applies to requests judged after
+the import, for every agent. A spec whose schema can't be read to the end
+(a remote `$ref`, or past 10 levels or 2,000 schema nodes) makes that
+operation's bodies uploads.
 
 The proposal allows each written path of the baseline exactly, plus one
 glob it always shows: `**/__pycache__/*.pyc`, Python's bytecode caches.
