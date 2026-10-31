@@ -982,3 +982,60 @@ def test_narrow_uploads_moves_a_host_only_sent_queries(tmp_path):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=5)
+
+
+def test_an_api_spec_is_imported_for_a_host_and_listed(tmp_path):
+    """REST uploads M3: **Import an API spec** takes a host and a file; the
+    panel lists the spec with how many operations take files or content,
+    refuses a file that isn't a spec with why, and Remove drops it."""
+    database = tmp_path / "raildash.db"
+    store = Store(database)
+    value = asp(listeners=[DEMO_LISTENER])
+    asp_id = store.load_asp(json.dumps(value).encode())["asp_id"]
+    alignment = store.make_baseline(asp_id, "v1.0")["alignment_version"]
+    store.adopt_guardrail(alignment["alignment_version_id"])
+    store.close()
+    spec_file = Path(__file__).parent / "fixtures" / "openapi" / "github-excerpt.json"
+    bad_file = tmp_path / "swagger.json"
+    bad_file.write_text('{"swagger": "2.0", "paths": {}}')
+
+    port = _free_port()
+    url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [sys.executable, "-m", "raildash.cli", "--db", str(database),
+         "serve", "--host", "127.0.0.1", "--port", str(port)],
+        cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    try:
+        _wait_until_ready(url, process)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            page = browser.new_page()
+            errors: list[str] = []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.goto(url)
+            section = page.locator("#guardrail-body .guardrail-api-specs")
+            expect(section).to_contain_text("API specs", timeout=TIMEOUT)
+            section.get_by_label("Host the spec is for").fill("api.github.com")
+            with page.expect_file_chooser() as chooser:
+                section.get_by_role("button", name="Import an API spec").click()
+            chooser.value.set_files(str(bad_file))
+            expect(section).to_contain_text("Not imported: a Swagger 2.0 spec", timeout=TIMEOUT)
+            with page.expect_file_chooser() as chooser:
+                section.get_by_role("button", name="Import an API spec").click()
+            chooser.value.set_files(str(spec_file))
+            expect(section.locator(".guardrail-api-spec-list")).to_contain_text(
+                "api.github.com GitHub v3 REST API 1.1.4 · 7 operations, 2 take files or content", timeout=TIMEOUT)
+            if os.environ.get("RAILDASH_SHOT_DIR"):
+                section.screenshot(path=os.path.join(os.environ["RAILDASH_SHOT_DIR"], "api-specs.png"))
+            section.get_by_role("button", name="Remove").click()
+            expect(section.locator(".guardrail-api-spec-list")).to_have_count(0, timeout=TIMEOUT)
+            assert errors == []
+            browser.close()
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)

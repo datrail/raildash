@@ -89,8 +89,10 @@ Where the design is silent this module chooses:
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
+import re
 import sqlite3
 import sys
 import uuid
@@ -105,6 +107,19 @@ GUARDRAIL_ACK_RETENTION_DAYS = 30
 # The proposal reads at most this many of the agent's requests from the
 # 24 h before the lock, newest first.
 PROPOSAL_MAX_REQUESTS = 5_000
+# REST uploads M3: what an imported spec's host may be, besides an IP
+# literal: DNS labels of letters, digits, `-` and `_`.
+_HOST_NAME = re.compile(r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?(?:\.[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?)*")
+
+
+def _ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
 # REST uploads §4: how long a computed *narrow uploads* offer is kept
 # before new captures are read again, and before the window is moved.
 NARROW_OFFER_MIN_AGE = 60
@@ -250,6 +265,17 @@ CREATE TABLE IF NOT EXISTS openshell_policies (
 );
 CREATE INDEX IF NOT EXISTS openshell_policies_identity
     ON openshell_policies(identity_kind, identity_value, policy_id);
+
+-- REST uploads M3: an OpenAPI spec the user imported for one host, as
+-- `raildash.api_specs.parse_spec` indexes it (operations and their upload
+-- marks; the file itself isn't kept). Requests to the host are classified
+-- with it from then on (step 3), for every agent.
+CREATE TABLE IF NOT EXISTS api_specs (
+    host        TEXT PRIMARY KEY,
+    sha256      TEXT NOT NULL,
+    imported_at TEXT NOT NULL,
+    index_json  TEXT NOT NULL
+);
 
 -- DR-249 (DR-194 M3): what `railmon openshell` posts, keyed by the sandbox's
 -- name, which an ASP of an agent in it carries as `sandbox_name` (DR-247).
@@ -759,7 +785,10 @@ class GuardrailCustody:
         body_kind = None
         if g.body_kinds_on() and g.carries_body(interaction):
             uploads = contract["rules"]["uploads"]
-            body_kind = g.request_body_kind(interaction, uploads.get("body_kind_overrides", ()))
+            body_kind = g.request_body_kind(
+                interaction, uploads.get("body_kind_overrides", ()),
+                self._api_specs_locked().get(g.normalize_host(interaction.get("host")) or ""),
+            )
             body_kind = self._drip_check_locked(kind, value, contract, interaction, body_kind, now)
         result = g.evaluate_request(contract, interaction, body_kind=body_kind)
         if not result["tool_calls"]["readable"]:
@@ -1071,6 +1100,7 @@ class GuardrailCustody:
             version=self._next_version_label(kind, value),
             created_at=self._receive_time(),
             openshell_policy=self._openshell_policy_locked(kind, value),
+            specs=self._api_specs_locked(),
         )
         result["data_actions_blocked"] = []
         if result["guardrail"] is not None:
@@ -1337,7 +1367,7 @@ class GuardrailCustody:
             "WHERE identity_kind = ? AND identity_value = ?", (kind, value),
         ).fetchone())
         latest = self._db.execute("SELECT max(id) FROM interactions").fetchone()[0]
-        key = (active["guardrail_version_id"], rows_key, tuple(dismissed))
+        key = (active["guardrail_version_id"], rows_key, tuple(dismissed), self._api_specs_stamp())
         cache = self.__dict__.setdefault("_narrow_offer_cache", {})
         kept = cache.get((kind, value))
         if cached and kept is not None and kept["key"] == key:
@@ -1360,7 +1390,8 @@ class GuardrailCustody:
                 )
             ]
             contract = json.loads(active["contract_json"])
-            hosts = [h for h in g.narrow_uploads_hosts(contract, requests, rows) if h["host"] not in dismissed]
+            hosts = [h for h in g.narrow_uploads_hosts(contract, requests, rows, self._api_specs_locked())
+                     if h["host"] not in dismissed]
             if hosts:
                 offer = {"hosts": hosts, "version": contract["version"],
                          "window": {"start": self._receive_time(start), "end": self._receive_time(end)}}
@@ -1618,6 +1649,88 @@ class GuardrailCustody:
         age = _instant(self._receive_time()) - _instant(record["imported_at"])
         beyond = None if allowed_hosts is None else osp.beyond_guardrail(record, allowed_hosts)
         return {**record, "stale": age > g.STALE_MAX, "beyond_guardrail": beyond}
+
+    # ------------------------------------------------- API specs (M3)
+
+    def _api_specs_stamp(self) -> tuple[Any, ...]:
+        return tuple(self._db.execute(
+            "SELECT count(*), max(imported_at), group_concat(host || ':' || sha256) "
+            "FROM (SELECT host, sha256, imported_at FROM api_specs ORDER BY host)"
+        ).fetchone())
+
+    def _api_specs_locked(self) -> dict[str, dict[str, Any]]:
+        """Every imported spec's index, by host. Kept parsed until a spec
+        is imported or removed (judging reads it for every request)."""
+        stamp = self._api_specs_stamp()
+        cached = self.__dict__.get("_api_specs_cache")
+        if cached is not None and cached[0] == stamp:
+            return cached[1]
+        specs: dict[str, dict[str, Any]] = {}
+        for row in self._db.execute("SELECT host, index_json FROM api_specs"):
+            try:
+                index = json.loads(row["index_json"])
+            except ValueError:
+                continue
+            # An index another RailDash version wrote is read as no spec:
+            # the panel says to import it again.
+            if isinstance(index, dict) and index.get("index_version") == api_specs.INDEX_VERSION:
+                specs[row["host"]] = index
+        self.__dict__["_api_specs_cache"] = (stamp, specs)
+        return specs
+
+    @staticmethod
+    def _api_spec_host(host: Any) -> str:
+        normalized = g.normalize_host(host) if isinstance(host, str) else None
+        if (normalized is None or normalized != host or host.startswith("*.") or not g._is_host_pattern(host)
+                or not (_HOST_NAME.fullmatch(host) or _ip_literal(host))):
+            raise api_specs.SpecImportError(
+                "host must be one normalized host name (lower case, no scheme, path or wildcard)")
+        return normalized
+
+    def import_api_spec(self, host: Any, raw: bytes) -> dict[str, Any]:
+        """**Import an API spec** (REST uploads §4 "Specs"): index an
+        OpenAPI 3.x file for one host, replacing any spec it had. Raises
+        `SpecImportError` for a bad host or a file that isn't a spec, and
+        stores nothing then. Requests judged from now on are classified
+        with it; rows already stored keep what they were judged as."""
+        host = self._api_spec_host(host)
+        index = api_specs.parse_spec(raw)
+        with self._write_transaction():
+            at = self._receive_time()
+            self._db.execute(
+                "INSERT INTO api_specs (host, sha256, imported_at, index_json) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(host) DO UPDATE SET sha256 = excluded.sha256, imported_at = excluded.imported_at, "
+                "index_json = excluded.index_json",
+                (host, index["sha256"], at, json.dumps(index, ensure_ascii=False, sort_keys=True)),
+            )
+            return {"host": host, "imported_at": at, **api_specs.summary(index)}
+
+    def api_spec_list(self) -> list[dict[str, Any]]:
+        with self._lock:
+            # The parsed indexes judging already keeps, not a parse per poll.
+            specs = self._api_specs_locked()
+            out = []
+            for row in self._db.execute("SELECT host, sha256, imported_at FROM api_specs ORDER BY host"):
+                index = specs.get(row["host"])
+                if index is None:
+                    # One an older RailDash wrote, read once for its counts.
+                    stored = self._db.execute(
+                        "SELECT index_json FROM api_specs WHERE host = ?", (row["host"],)).fetchone()
+                    try:
+                        index = json.loads(stored[0])
+                    except (TypeError, ValueError):
+                        index = None
+                    index = index if isinstance(index, dict) else {"sha256": row["sha256"]}
+                out.append({"host": row["host"], "imported_at": row["imported_at"],
+                            "current": row["host"] in specs, **api_specs.summary(index)})
+            return out
+
+    def remove_api_spec(self, host: str) -> dict[str, Any]:
+        with self._write_transaction():
+            found = self._db.execute("DELETE FROM api_specs WHERE host = ?", (host,)).rowcount
+            if not found:
+                raise KeyError(f"no API spec for {host}")
+            return {"host": host, "removed": True}
 
     def import_openshell_policy(self, ref: str, raw: bytes) -> dict[str, Any]:
         """**Import OpenShell policy** (DR-248): store an uploaded policy as
@@ -2112,3 +2225,4 @@ from . import body_kinds as _bk  # noqa: E402
 from . import guardrail as g  # noqa: E402
 from . import data_actions_store as das  # noqa: E402
 from . import openshell_policy as osp  # noqa: E402
+from . import api_specs  # noqa: E402

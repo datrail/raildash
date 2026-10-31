@@ -52,6 +52,7 @@ SOURCE_TRAFFIC = "traffic"  # a model or MCP request: not classified (§4)
 SOURCE_HARD = "hard"
 SOURCE_USER = "user"
 SOURCE_SHAPE = "shape"
+SOURCE_SPEC = "spec"
 
 # The step that decided a body (§4, "Re-checking stored rows"): an override
 # clears only a row decided by steps 3-5, and none decided by step 1 or by
@@ -521,6 +522,7 @@ def classify(
     exact: Any = None,
     size_known: bool = True,
     overrides: Iterable[Mapping[str, Any]] = (),
+    spec: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One request that carries a body: its kind, the source and step that
     decided it, reasons, path template and size (§3 steps 1-5).
@@ -532,6 +534,8 @@ def classify(
     `size_known=False` says it
     recorded none and no `Content-Length` was sent either, so the kept body
     alone can't show the request was small, and it isn't parameters.
+    `spec` is the host's imported spec index (`api_specs.parse_spec`), if
+    any: step 3, which can only make a body an upload.
     """
     method = str(method or "").upper()
     template = path_template(path)
@@ -584,8 +588,32 @@ def classify(
     if kind is not None:
         return _result(kind, SOURCE_USER, STEP_OVERRIDE, [f"you marked this {kind}"], template, size)
 
-    # Step 3 (an imported spec) is M3. Steps 4 and 5: the body's shape, read
-    # only when the capture shows all of it, as sent.
+    # Step 3: an imported spec, which can only tighten. A matched operation
+    # whose request body carries files or content makes this an upload;
+    # one without leaves the shape to decide, and is named among the
+    # reasons only (the vendor wrote it).
+    named = None
+    if spec:
+        from . import api_specs
+
+        operation = api_specs.match(spec, method, path)
+        if operation is not None:
+            marks = api_specs.upload_reasons(operation, mtypes)
+            if marks:
+                return _result(UPLOAD, SOURCE_SPEC, STEP_SPEC, marks, template, size)
+            named = f"spec operation {api_specs.operation_name(operation)}"
+    result = _shape_steps(body, headers, mtypes, mtype, value, parsed, unparsed, exact, size_known,
+                          size, template)
+    if named is not None:
+        result["reasons"] = (list(result["reasons"]) + [named])[:MAX_REASONS]
+    return result
+
+
+def _shape_steps(body: Any, headers: Any, mtypes: list[str], mtype: str | None, value: Any,
+                 parsed: bool, unparsed: str | None, exact: Any, size_known: bool, size: int,
+                 template: str) -> dict[str, Any]:
+    """Steps 4 and 5: the body's shape, read only when the capture shows
+    all of it, as sent."""
     encoding = (_header(headers, "content-encoding") or "").strip().lower()
     if encoding not in ("", "identity"):
         return _result(UNKNOWN, SOURCE_SHAPE, STEP_OTHER, [f"{encoding}-encoded body"], template, size)
@@ -608,6 +636,7 @@ def classify_exchange(
     *,
     host: str | None,
     overrides: Iterable[Mapping[str, Any]] = (),
+    spec: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """`classify` over one captured legacy exchange's request, its path
     read as ingest reads it (`path`, `uri` or `:path`, origin-form)."""
@@ -619,7 +648,7 @@ def classify_exchange(
         headers=request.get("headers"), body=request.get("body"), framed=framed,
         exact=request.get("content_length"),
         size_known=framed is not None or _header(request.get("headers"), "content-length") is not None,
-        overrides=overrides,
+        overrides=overrides, spec=spec,
     )
 
 

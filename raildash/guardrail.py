@@ -669,7 +669,8 @@ def upload_hosts(uploads: Mapping[str, Any]) -> list[str]:
 
 
 def request_body_kind(
-    interaction: Mapping[str, Any], overrides: Iterable[Mapping[str, Any]] = ()
+    interaction: Mapping[str, Any], overrides: Iterable[Mapping[str, Any]] = (),
+    spec: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """One stored request's body kind (REST uploads design §3), as a row
     keeps it: kind, source, step, method, path template, bytes and reasons.
@@ -685,7 +686,7 @@ def request_body_kind(
     result: dict[str, Any] | None = None
     if exchange is not None:
         try:
-            result = _bk.classify_exchange(exchange, host=host, overrides=overrides)
+            result = _bk.classify_exchange(exchange, host=host, overrides=overrides, spec=spec)
         except Exception:  # noqa: BLE001 - fail closed: the body stays an upload
             result = None
         request = exchange.get("request")
@@ -1951,14 +1952,18 @@ OPENSHELL_DNS_ENTRIES: tuple[dict[str, Any], ...] = (
 def window_body_kinds(
     requests: Sequence[Mapping[str, Any]], *, call_hosts: Iterable[str],
     budget: _bk.ParametersBudget, overrides: Iterable[Mapping[str, Any]] = (),
+    specs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any] | None]:
     """Each stored request's body kind over a window (None with no body),
     with the drip check run in capture-time order against `budget`, keyed
     by the `out_of_spec_calls` hosts `call_hosts` (§3). The proposal and the
-    *narrow uploads* offer judge a window this way."""
+    *narrow uploads* offer judge a window this way. `specs` are the
+    imported spec indexes by host (step 3)."""
     overrides = list(overrides)
     call_hosts = set(call_hosts)
-    kinds = [request_body_kind(request, overrides) for request in requests]
+    specs = specs or {}
+    kinds = [request_body_kind(request, overrides, specs.get(normalize_host(request.get("host")) or ""))
+             for request in requests]
     stamps = [stamp.timestamp() for stamp in (_instant(r.get("timestamp")) for r in requests) if stamp is not None]
     latest = max(stamps, default=0.0)
     order = sorted(range(len(requests)), key=lambda i: (_instant(requests[i].get("timestamp")) is None,
@@ -1977,7 +1982,7 @@ def window_body_kinds(
 
 def narrow_uploads_hosts(
     guardrail: Mapping[str, Any], requests: Sequence[Mapping[str, Any]],
-    rows: Iterable[Mapping[str, Any]],
+    rows: Iterable[Mapping[str, Any]], specs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """REST uploads §4's *narrow uploads* offer: the `uploads.allowed_hosts`
     entries a version could move to `parameters_only_hosts` without making
@@ -2002,7 +2007,7 @@ def narrow_uploads_hosts(
     kinds = window_body_kinds(
         requests, call_hosts=rules["out_of_spec_calls"]["allowed_hosts"],
         budget=_bk.ParametersBudget(entry_budgets=entries, agent_budget=agent_budget),
-        overrides=uploads.get("body_kind_overrides", ()),
+        overrides=uploads.get("body_kind_overrides", ()), specs=specs,
     )
     # Only what doesn't count now is re-checked: a body or row that already
     # counts (an upload elsewhere, a body with no host) says nothing about
@@ -2057,6 +2062,7 @@ def propose_guardrail(
     version: str,
     created_at: str,
     openshell_policy: Mapping[str, Any] | None = None,
+    specs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """The §4.4 first guardrail from a locked baseline.
 
@@ -2124,7 +2130,7 @@ def propose_guardrail(
     # listed as a would-be violation instead.
     if body_kinds_on():
         call_hosts = set(_declared_lists(attributes)[0] or ()) | set(seed["hosts"] if seed is not None else ())
-        kinds = window_body_kinds(requests, call_hosts=call_hosts, budget=_bk.ParametersBudget())
+        kinds = window_body_kinds(requests, call_hosts=call_hosts, budget=_bk.ParametersBudget(), specs=specs)
     else:
         kinds = [None] * len(requests)
     dripped = [kind is not None and kind.get("step") == _bk.STEP_DRIP for kind in kinds]
@@ -2245,7 +2251,11 @@ def propose_guardrail(
             continue
         host = normalize_host(request.get("host"))
         if seed is not None and host in seed["withheld_upload_hosts"]:
-            for found in evaluate_request(guardrail, request)["uploads"]:
+            # The kind already judged above (with the host's spec), not a
+            # fresh classification without it.
+            judged = evaluate_request(guardrail, request, body_kind=kind) if body_kinds_on() else \
+                evaluate_request(guardrail, request)
+            for found in judged["uploads"]:
                 if found["detail"].get("kind") == "host" and ("uploads", found["item"]) not in {
                     (v["rule"], v["item"]) for v in would_be
                 }:
