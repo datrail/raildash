@@ -10,9 +10,9 @@ section numbers below are its. Later versions add optional rules: v2
 `data_actions` (DR-205) and v3 `egress_containment` (DR-207,
 `design/2026-10-11-egress-containment`); v4 gives `uploads` three optional
 members that body kinds read (REST uploads, `design/2026-10-30-rest-uploads`,
-M2): with body kinds on, only a body `raildash.body_kinds` can't show to be
-`parameters` is judged against the upload hosts. They are off by default
-until the drip check is wired (`RAILDASH_BODY_KINDS=on` turns them on).
+M2): only a body `raildash.body_kinds` can't show to be `parameters` is
+judged against the upload hosts, and parameters past the day's drip budget
+count as uploads (`RAILDASH_BODY_KINDS=off` is the back-out switch).
 
 Like `raildash.asp`, this module has no database, HTTP or UI dependency and
 never reads the clock: every time it needs is an argument. Storage and the
@@ -639,10 +639,10 @@ def carries_body(interaction: Mapping[str, Any]) -> bool:
 # REST uploads design §6 "Back-out": `off` restores "any body is an upload"
 # for the rule and the proposal, and reads `parameters_only_hosts` as upload
 # hosts, so a version proposed with the narrow seed doesn't turn Violated
-# on its own queries. Off by default until the drip check (§3, G6) is wired
-# in the store: without it a parameters-sized drip would go unbounded.
+# on its own queries. On by default: the store applies the drip check
+# (§3, G6) that bounds parameters-sized bodies.
 BODY_KINDS_ENV = "RAILDASH_BODY_KINDS"
-BODY_KINDS_DEFAULT = False
+BODY_KINDS_DEFAULT = True
 _OFF_VALUES = frozenset({"off", "0", "false", "no", "disabled"})
 _ON_VALUES = frozenset({"on", "1", "true", "yes", "enabled"})
 # A stored `uploads` host row keeps each distinct body it was hit by, up to
@@ -651,7 +651,7 @@ MAX_ROW_BODIES = 16
 # Steps an override can answer (§4 "Re-checking stored rows"): not step 1's
 # hard signals, not traffic, not the drip check. Step 2 is the override.
 _OVERRIDABLE_STEPS = (_bk.STEP_OVERRIDE, _bk.STEP_SPEC, _bk.STEP_SHAPE, _bk.STEP_OTHER)
-_ROW_BODY_KEYS = ("kind", "source", "step", "method", "path_template", "bytes", "reasons")
+_ROW_BODY_KEYS = ("kind", "source", "step", "method", "path_template", "bytes", "reasons", "drip")
 
 
 def body_kinds_on() -> bool:
@@ -705,10 +705,44 @@ def request_body_kind(
             "reasons": ["capture not readable"], "path_template": _bk.path_template(interaction.get("path")),
             "bytes": interaction.get("request_size") if type(interaction.get("request_size")) is int else None,
         }
-    body = {key: result.get(key) for key in _ROW_BODY_KEYS}
+    body = {key: result[key] for key in _ROW_BODY_KEYS if key in result}
     body["method"] = str(method or "").upper()[:16]
     body["reasons"] = [str(reason) for reason in body.get("reasons") or []][: _bk.MAX_REASONS]
     return body
+
+
+def drip_keys(host: str, out_of_spec_hosts: Iterable[str]) -> list[str]:
+    """The drip check's budgets one host counts against (§3): each
+    `out_of_spec_calls.allowed_hosts` entry it matches, so the hosts under
+    `*.workers.dev` share one, or the host itself when it matches none."""
+    return sorted(pattern for pattern in out_of_spec_hosts if host_matches(host, pattern)) or [host]
+
+
+def drip_budgets(uploads: Mapping[str, Any]) -> tuple[dict[str, int], int]:
+    """A version's per-entry budgets and the agent's (`parameters_budget`,
+    else the design's 256 KiB and 1 MiB a day)."""
+    budget = uploads.get("parameters_budget") or {}
+    return dict(budget.get("entries") or {}), budget.get("agent", _bk.AGENT_BUDGET_BYTES)
+
+
+def _drip_fits(drip: Any, uploads: Mapping[str, Any]) -> bool:
+    """Whether a body the drip check made an upload fits a version's
+    budgets after all: its stored sums plus its bytes, per entry and for
+    the agent (§4: a version raising `parameters_budget` clears the row)."""
+    if not isinstance(drip, Mapping):
+        return False
+    # `over` is every byte the check made an upload on this row's repeats
+    # (`merge_row_bodies`), so a budget must fit all of them, not just one.
+    size, agent, entries = drip.get("over", drip.get("bytes")), drip.get("agent"), drip.get("entries")
+    if type(size) is not int or type(agent) is not int or not isinstance(entries, Mapping):
+        return False
+    budgets, agent_budget = drip_budgets(uploads)
+    if agent + size > agent_budget:
+        return False
+    return all(
+        type(total) is int and total + size <= budgets.get(key, _bk.ENTRY_BUDGET_BYTES)
+        for key, total in entries.items()
+    )
 
 
 def body_counts(body: Mapping[str, Any], host: str | None, uploads: Mapping[str, Any]) -> bool:
@@ -717,10 +751,13 @@ def body_counts(body: Mapping[str, Any], host: str | None, uploads: Mapping[str,
     version's own override is applied to a body steps 2-5 decided, so
     **This is parameters** clears it; one an earlier version's override
     decided, with no override for it now, reads as `unknown`. Step 1, model
-    and MCP traffic and the drip check keep what they decided."""
+    and MCP traffic keep what they decided; a body the drip check made an
+    upload stops counting only under budgets its stored sums fit."""
     if not body_kinds_on():
         return True
     kind = body.get("kind")
+    if body.get("step") == _bk.STEP_DRIP:
+        return not _drip_fits(body.get("drip"), uploads)
     if body.get("step") in _OVERRIDABLE_STEPS:
         method = str(body.get("method") or "").upper()
         template = body.get("path_template")
@@ -752,7 +789,7 @@ def merge_row_bodies(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str
     if any(not isinstance(found, list) for found in lists):
         return {}
     merged: list[Any] = []
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     overflow = bool(old.get("bodies_overflow") or new.get("bodies_overflow"))
     for body in (*lists[0], *lists[1]):
         key = json.dumps(
@@ -761,16 +798,40 @@ def merge_row_bodies(old: Mapping[str, Any], new: Mapping[str, Any]) -> dict[str
             sort_keys=True, default=str,
         )
         if key in seen:
+            index = seen[key]
+            if isinstance(body, Mapping) and body.get("step") == _bk.STEP_DRIP:
+                merged[index] = {**merged[index], "drip": _merged_drip(merged[index].get("drip"), body.get("drip"))}
             continue
-        seen.add(key)
         if len(merged) >= MAX_ROW_BODIES:
             overflow = True
             break
+        seen[key] = len(merged)
         merged.append(body)
+    if not merged and not overflow:
+        return {}
     result: dict[str, Any] = {"bodies": merged}
     if overflow:
         result["bodies_overflow"] = True
     return result
+
+
+def _merged_drip(old: Any, new: Any) -> dict[str, Any] | None:
+    """Two drip hits on one row's body, as one: the largest sums each was
+    judged on, and every byte both made an upload (`over`), so the row
+    clears only under budgets all of it fits. Sums that can't be read
+    leave none, which never clears."""
+    def readable(drip: Any) -> bool:
+        return (isinstance(drip, Mapping) and type(drip.get("agent")) is int and type(drip.get("bytes")) is int
+                and type(drip.get("over", drip["bytes"])) is int and isinstance(drip.get("entries"), Mapping)
+                and all(type(v) is int for v in drip["entries"].values()))
+    if not (readable(old) and readable(new)):
+        return None
+    entries = dict(old["entries"])
+    for key, total in new["entries"].items():
+        entries[key] = max(entries.get(key, 0), total)
+    over = old.get("over", old["bytes"]) + new.get("over", new["bytes"])
+    return {"entries": entries, "agent": max(old["agent"], new["agent"]),
+            "bytes": max(old["bytes"], new["bytes"]), "over": over}
 
 
 def _stored_raw(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -1118,8 +1179,11 @@ def _size_cap(host: str, caps: Mapping[str, int]) -> int | None:
     return min(matching) if matching else None
 
 
+_CLASSIFY = object()
+
+
 def evaluate_request(
-    guardrail: Mapping[str, Any], interaction: Mapping[str, Any]
+    guardrail: Mapping[str, Any], interaction: Mapping[str, Any], *, body_kind: Any = _CLASSIFY
 ) -> dict[str, Any]:
     """`uploads` and `out_of_spec_calls` against one captured request.
 
@@ -1141,6 +1205,10 @@ def evaluate_request(
     the rules are verified at all is `request_rules_status`'s answer, since
     one request never makes a rule Held. One request yields at most one
     violation per (rule, item); its `detail.reasons` lists why.
+
+    `body_kind` is the request's body kind as the caller already judged it
+    (the store applies the drip check, which needs history); by default it
+    is classified here, without the drip check.
     """
     rules = guardrail["rules"]
     uploads, out_of_spec = rules["uploads"], rules["out_of_spec_calls"]
@@ -1155,7 +1223,12 @@ def evaluate_request(
     # REST uploads §3: only an `upload` or `unknown` body is judged against
     # the upload hosts; every body still meets the size cap. A body with no
     # host stays an upload: nothing can key an answer to it.
-    kind = request_body_kind(interaction, uploads.get("body_kind_overrides", ())) if body and body_kinds_on() else None
+    if not (body and body_kinds_on()):
+        kind = None
+    elif body_kind is _CLASSIFY:
+        kind = request_body_kind(interaction, uploads.get("body_kind_overrides", ()))
+    else:
+        kind = body_kind
     if body and (kind is None or host is None or body_counts(kind, host, uploads)):
         if not host_allowed(host, upload_hosts(uploads)):
             upload_reasons.append("body_to_unlisted_host")
@@ -1944,17 +2017,39 @@ def propose_guardrail(
     # REST uploads §3 (G5): only an `upload` or `unknown` body seeds its
     # host; one that only passed parameters doesn't. Model and MCP traffic
     # is always an upload, so the provider is still seeded.
+    # The drip check runs over the window too, in capture-time order, with
+    # the budgets the proposal will have (the defaults) keyed by the hosts
+    # it will allow calls to; a body it makes an upload seeds nothing and is
+    # listed as a would-be violation instead.
     on = body_kinds_on()
-    uploading = []
-    for request in requests:
-        found = request_body_kind(request) if on else None
-        uploading.append(carries_body(request) and (
+    kinds: list[dict[str, Any] | None] = [request_body_kind(request) if on else None for request in requests]
+    if on:
+        call_hosts = set(_declared_lists(attributes)[0] or ()) | set(seed["hosts"] if seed is not None else ())
+        budget = _bk.ParametersBudget()
+        stamps = [stamp.timestamp() for stamp in (_instant(r.get("timestamp")) for r in requests) if stamp is not None]
+        latest = max(stamps, default=0.0)
+        order = sorted(range(len(requests)), key=lambda i: (_instant(requests[i].get("timestamp")) is None,
+                                                          _instant(requests[i].get("timestamp")) or 0, i))
+        for i in order:
+            host = normalize_host(requests[i].get("host"))
+            when = _instant(requests[i].get("timestamp"))
+            if kinds[i] is None or host is None:
+                continue
+            # One with no capture time is sorted last and counted at the
+            # latest time any request has, so it still counts.
+            at = when.timestamp() if when is not None else latest
+            kinds[i] = budget.observe(kinds[i], drip_keys(host, call_hosts), at)
+    dripped = [kind is not None and kind.get("step") == _bk.STEP_DRIP for kind in kinds]
+    uploading = [
+        carries_body(request) and not drip and (
             found is None or normalize_host(request.get("host")) is None or found["kind"] != _bk.PARAMETERS
-        ))
+        )
+        for request, found, drip in zip(requests, kinds, dripped)
+    ]
     parameters_hosts: set[str] = set()
-    for request, sends in zip(requests, uploading):
+    for request, sends, drip in zip(requests, uploading, dripped):
         host = normalize_host(request.get("host"))
-        if host is None or not _is_host_pattern(host):
+        if host is None or not _is_host_pattern(host) or drip:
             continue
         if not sends:
             if carries_body(request):
@@ -2042,11 +2137,22 @@ def propose_guardrail(
     # What the agent called before the lock that nothing declared: not
     # seeded, since surfacing it is what the rule is for.
     seen: set[str] = set()
-    for request, sends in zip(requests, uploading):
+    for request, sends, drip, kind in zip(requests, uploading, dripped, kinds):
         for found in evaluate_request(guardrail, request)["out_of_spec_calls"]:
             if found["item"] not in seen:
                 seen.add(found["item"])
                 would_be.append(found)
+        if drip:
+            host = normalize_host(request.get("host"))
+            if not host_allowed(host, guardrail["rules"]["uploads"]["allowed_hosts"]) and (
+                ("uploads", host) not in {(v["rule"], v["item"]) for v in would_be}
+            ):
+                would_be.append(_violation(
+                    "uploads", host, OBSERVED, _interaction_source(request), kind="host",
+                    reasons=["body_to_unlisted_host"], request_size=request.get("request_size"),
+                    max_request_bytes=None, carries_body=True, bodies=[kind],
+                ))
+            continue
         if not sends:
             continue
         host = normalize_host(request.get("host"))

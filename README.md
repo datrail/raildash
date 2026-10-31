@@ -326,6 +326,35 @@ token, including both reads:
 | `GET /api/guardrails/{agent_ref}/openshell-policy/export` | Download as OpenShell policy: the guardrail version in force as an OpenShell policy file (YAML, every endpoint `audit`); 409 with no version in force |
 | `POST /api/guardrails/{agent_ref}/openshell-policy` (the file as saved) | Import OpenShell policy: store the output of `openshell sandbox get <name> --policy-only` (or a `-o json` view) as the agent's policy; 422 says what was wrong with a file that isn't one |
 
+**Uploads and body kinds.** A request body counts as an upload unless it
+only passes parameters. RailDash reads each REST body and calls it
+`upload`, `parameters` or `unknown`.
+- **Upload:** a file media type (multipart, octet-stream, image, audio,
+  video, PDF, zip), anything over 16 KiB, or any string over 1 KiB.
+- **Parameters:** a JSON object or form of at most 4 KiB with short scalar
+  values (at most 256 characters, 4 deep, 64 values), or a GraphQL body
+  that only queries.
+- **Unknown:** everything else, a body it couldn't read included. Unknown
+  counts as an upload.
+
+Model and MCP traffic always counts as an upload. Only an upload or an
+unknown body is judged against **Uploads to**. Every body still meets a
+host's size cap, and a parameters body to a host outside the hosts the
+agent may call is still an out-of-spec call. The proposal allows uploads
+only to hosts the agent uploaded to. Hosts it only queried are kept apart
+as `parameters_only_hosts`, and an upload there is flagged.
+**Allow this** on such a row moves the host to **Uploads to**. A version's
+`body_kind_overrides` answer one host, method and path template (a long
+opaque, numeric or UUID segment written `*`) as `parameters` or `upload`,
+but never a step-1 upload or model traffic. Parameters bytes are capped
+too: past 256 KiB a day to one entry of the hosts the agent may call, or
+1 MiB a day for the agent, further parameters bodies count as uploads.
+`parameters_budget` raises or lowers either bound. A version with any of
+these three is contract v4. The exported OpenShell policy makes a
+queried-only host `read-write`, since OpenShell can't tell a query from an
+upload. `RAILDASH_BODY_KINDS=off` turns body kinds off: every body is then
+an upload again, and the hosts it only queried count as upload hosts.
+
 The proposal allows each written path of the baseline exactly, plus one
 glob it always shows: `**/__pycache__/*.pyc`, Python's bytecode caches.
 Any Python process writes those for the modules it imports, so without it
@@ -480,7 +509,8 @@ Data Guardrail, including `data_actions` (contract v2) and
 `egress_containment` (contract v3); `0.1.0` has no guardrail and ignores
 it. A source build from between the two may know contract v1 only: before
 running one on the same database, switch each agent to a version without
-those rules, or **Turn off**.
+those rules, or **Turn off**. The same goes for an older RailDash and a
+contract v4 version (body kinds).
 
 `RAILDASH_GUARDRAIL_MAX_OPEN_ROWS` (default 1000) caps the unacknowledged
 rows per agent before further items count in one overflow row, and

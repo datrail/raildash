@@ -67,10 +67,10 @@ def body_kinds_on(monkeypatch):
 
 
 @pytest.mark.parametrize("value, on", [
-    (None, False), ("", False), ("on", True), ("ON", True), ("1", True), ("true", True),
-    ("off", False), ("0", False), ("false", False), ("no", False), ("maybe", False),
+    (None, True), ("", True), ("on", True), ("ON", True), ("1", True), ("true", True),
+    ("off", False), ("0", False), ("false", False), ("no", False), ("maybe", True),
 ])
-def test_body_kinds_are_off_until_the_drip_check_is_wired(monkeypatch, value, on):
+def test_body_kinds_are_on_unless_switched_off(monkeypatch, value, on):
     if value is None:
         monkeypatch.delenv(g.BODY_KINDS_ENV)
     else:
@@ -350,5 +350,162 @@ def test_a_queried_host_is_exported_read_write_with_a_gap_line():
     access = {endpoint["host"]: endpoint["access"]
               for policy in out["policy"]["network_policies"].values() for endpoint in policy["endpoints"]}
     assert access == {"api.github.com": "read-only", SEARCH: "read-write"}
-    assert any(SEARCH in gap and "judged by RailDash only" in gap for gap in out["gaps"])
+    assert any(SEARCH in gap and "only RailDash tells an upload" in gap for gap in out["gaps"])
     assert osp is not None
+
+
+# -------------------------------------------------------------- drip check
+
+
+def test_a_drip_row_clears_only_under_budgets_its_sums_fit():
+    body = {"kind": bk.UPLOAD, "step": bk.STEP_DRIP, "method": "POST", "path_template": "/v1/query",
+            "drip": {"entries": {SEARCH: 256 * 1024 - 10}, "agent": 300 * 1024, "bytes": 100}}
+    row = {"rule": "uploads", "item": SEARCH,
+           "detail": {"kind": "host", "carries_body": True, "reasons": ["body_to_unlisted_host"], "bodies": [body]}}
+    assert not g.item_allowed(guardrail(), row)
+    # An override never answers the drip check.
+    assert not g.item_allowed(with_uploads(body_kind_overrides=[override("parameters")]), row)
+    assert not g.item_allowed(with_uploads(parameters_budget={"entries": {SEARCH: 256 * 1024 + 50}}), row)
+    assert g.item_allowed(with_uploads(parameters_budget={"entries": {SEARCH: 256 * 1024 + 90}}), row)
+    # The agent's bound too.
+    assert not g.item_allowed(with_uploads(parameters_budget={"entries": {SEARCH: 512 * 1024}, "agent": 300 * 1024}),
+                              row)
+    # Sums that can't be read never clear it.
+    body["drip"] = {"entries": {SEARCH: "x"}, "agent": 0, "bytes": 1}
+    assert not g.item_allowed(with_uploads(parameters_budget={"entries": {SEARCH: 10 ** 9}}), row)
+
+
+def test_drip_keys_share_a_wildcard_entry_or_fall_back_to_the_host():
+    assert g.drip_keys("a.workers.dev", ["*.workers.dev", "api.github.com"]) == ["*.workers.dev"]
+    assert g.drip_keys("a.example", ["*.workers.dev"]) == ["a.example"]
+
+
+def _queries(host: str, n: int, start: str = "2026-10-31T00:00:00Z", size: int = 3000) -> list[dict]:
+    from datetime import datetime, timedelta
+    base = datetime.fromisoformat(start.replace("Z", "+00:00"))
+    body = {"q": "x" * 200, **{f"k{i}": "y" * 200 for i in range(size // 210)}}
+    return [rest(host, body, when=(base + timedelta(minutes=i)).isoformat().replace("+00:00", "Z"))
+            for i in range(n)]
+
+
+def test_the_store_counts_parameters_bytes_and_makes_the_overflow_an_upload(store):  # noqa: F811
+    alignment, ref = baseline(store)
+    live(store)
+    rules = store.propose_guardrail(alignment["alignment_version_id"])["guardrail"]["rules"]
+    rules["uploads"]["parameters_only_hosts"] = [SEARCH]
+    rules["out_of_spec_calls"]["allowed_hosts"] = [*rules["out_of_spec_calls"]["allowed_hosts"], SEARCH]
+    active = store.adopt_guardrail(alignment["alignment_version_id"], rules)
+    # About 3 KiB each: 256 KiB a day for the entry is 80-odd of them.
+    requests = _queries(SEARCH, 100, start=_now())
+    size = json.loads(requests[0]["raw"])["request"]["headers"]["content-length"]
+    send(store, *requests)
+    found = rows(store, ref)
+    assert ("out_of_spec_calls", SEARCH) not in found
+    row = found[("uploads", SEARCH)]
+    assert row["counts"]
+    [body] = row["detail"]["bodies"][:1]
+    assert body["step"] == bk.STEP_DRIP and body["reasons"][0] == f"parameters volume over 256 KiB a day to {SEARCH}"
+    counted = store._db.execute(  # noqa: SLF001
+        "SELECT sum(bytes) FROM guardrail_parameters_bytes WHERE budget_key = ?", (SEARCH,)).fetchone()[0]
+    assert counted <= 256 * 1024 and counted > 256 * 1024 - 2 * int(size)
+    # Raising the entry's budget past every stored sum clears the row.
+    rules = json.loads(json.dumps(active["guardrail"]["rules"]))
+    rules["uploads"]["parameters_budget"] = {"entries": {SEARCH: 1024 * 1024}}
+    store.edit_guardrail(active["guardrail"]["guardrail_version_id"], rules)
+    assert not rows(store, ref)[("uploads", SEARCH)]["counts"]
+
+
+def test_the_agents_budget_spans_hosts(store):  # noqa: F811
+    alignment, ref = baseline(store)
+    live(store)
+    rules = store.propose_guardrail(alignment["alignment_version_id"])["guardrail"]["rules"]
+    hosts_ = [f"h{i}.search.example" for i in range(6)]
+    rules["out_of_spec_calls"]["allowed_hosts"] = [*rules["out_of_spec_calls"]["allowed_hosts"], *hosts_]
+    rules["uploads"]["parameters_budget"] = {"agent": 200 * 1024}
+    store.adopt_guardrail(alignment["alignment_version_id"], rules)
+    send(store, *[request for host in hosts_ for request in _queries(host, 15, start=_now())])
+    found = rows(store, ref)
+    over = [key for key in found if key[0] == "uploads"]
+    assert over, found
+    reasons = {r for key in over for b in found[key]["detail"]["bodies"] for r in b["reasons"]}
+    assert "parameters volume over 200 KiB a day for the agent" in reasons
+
+
+def test_the_proposal_runs_the_drip_check_over_the_window(store):  # noqa: F811
+    alignment, bundle = _lock(store, __import__("test_guardrail").v1_bundle(**DECLARED))
+    proposal = _propose(alignment, bundle, _queries(SEARCH, 100, start="2026-08-15T00:00:00Z"))
+    uploads = proposal["guardrail"]["rules"]["uploads"]
+    # The queries that fit make it a queried-only host; the overflow seeds
+    # no upload host and is listed for the user instead.
+    assert SEARCH not in uploads["allowed_hosts"]
+    assert uploads.get("parameters_only_hosts") == [SEARCH]
+    [row] = [v for v in proposal["would_be_violations"] if v["rule"] == "uploads"]
+    assert row["item"] == SEARCH and row["detail"]["bodies"][0]["step"] == bk.STEP_DRIP
+
+
+def _drip_agent(store):  # noqa: F811
+    alignment, ref = baseline(store)
+    live(store)
+    rules = store.propose_guardrail(alignment["alignment_version_id"])["guardrail"]["rules"]
+    rules["out_of_spec_calls"]["allowed_hosts"] = [*rules["out_of_spec_calls"]["allowed_hosts"], SEARCH]
+    active = store.adopt_guardrail(alignment["alignment_version_id"], rules)
+    return ref, active
+
+
+def _counted(store) -> int:  # noqa: F811
+    return store._db.execute(  # noqa: SLF001
+        "SELECT coalesce(sum(bytes), 0) FROM guardrail_parameters_bytes WHERE budget_key = ?", (SEARCH,)).fetchone()[0]
+
+
+@pytest.mark.parametrize("arrange", ["reversed", "future", "no_time", "naive_time", "days_old"])
+def test_no_capture_time_gets_parameters_past_the_budget(store, arrange):  # noqa: F811
+    """Late, future-stamped and unstamped bodies are all still bounded."""
+    from datetime import datetime, timedelta, timezone
+    ref, _ = _drip_agent(store)
+    if arrange == "days_old":
+        # A guardrail active for ten days: older captures are judged.
+        store._db.execute("UPDATE guardrail_bindings SET activated_at = ?",  # noqa: SLF001
+                          (store._receive_time(datetime.now(timezone.utc) - timedelta(days=10)),))  # noqa: SLF001
+    requests = _queries(SEARCH, 120, start=_now())
+    if arrange == "reversed":
+        requests.reverse()
+    for i, request in enumerate(requests):
+        if arrange == "future":
+            request["timestamp"] = (datetime.now(timezone.utc) + timedelta(days=30 + i)).isoformat()
+        elif arrange == "no_time":
+            request["timestamp"] = None
+        elif arrange == "naive_time":
+            request["timestamp"] = datetime.now().isoformat()
+        elif arrange == "days_old":
+            request["timestamp"] = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
+    send(store, *requests)
+    assert _counted(store) <= 256 * 1024
+    assert rows(store, ref)[("uploads", SEARCH)]["counts"]
+
+
+def test_a_drip_row_needs_a_budget_that_fits_every_byte_it_made_an_upload(store):  # noqa: F811
+    ref, active = _drip_agent(store)
+    send(store, *_queries(SEARCH, 300, start=_now()))
+    row = rows(store, ref)[("uploads", SEARCH)]
+    [drip] = [b["drip"] for b in row["detail"]["bodies"] if b["step"] == bk.STEP_DRIP]
+    assert drip["over"] > 400 * 1024  # some 200 bodies past the budget, all on one entry
+    rules = json.loads(json.dumps(active["guardrail"]["rules"]))
+    rules["uploads"]["parameters_budget"] = {"entries": {SEARCH: 262 * 1024}}
+    store.edit_guardrail(active["guardrail"]["guardrail_version_id"], rules)
+    assert rows(store, ref)[("uploads", SEARCH)]["counts"]
+
+
+def test_merged_drip_keeps_the_largest_sums_and_adds_the_bytes():
+    one = {"entries": {SEARCH: 100}, "agent": 200, "bytes": 10}
+    two = {"entries": {SEARCH: 90, "x": 5}, "agent": 300, "bytes": 20, "over": 50}
+    assert g._merged_drip(one, two) == {"entries": {SEARCH: 100, "x": 5}, "agent": 300, "bytes": 20, "over": 60}
+    assert g._merged_drip(one, {"entries": {SEARCH: "1"}, "agent": 1, "bytes": 1}) is None
+
+
+def test_the_proposal_counts_unstamped_bodies_too(store):  # noqa: F811
+    alignment, bundle = _lock(store, __import__("test_guardrail").v1_bundle(**DECLARED))
+    requests = _queries(SEARCH, 100, start="2026-08-15T00:00:00Z")
+    for request in requests:
+        request["timestamp"] = None
+    proposal = _propose(alignment, bundle, requests)
+    assert [v["item"] for v in proposal["would_be_violations"] if v["rule"] == "uploads"] == [SEARCH]

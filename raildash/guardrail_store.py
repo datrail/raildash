@@ -188,6 +188,22 @@ CREATE TABLE IF NOT EXISTS guardrail_rows (
 CREATE INDEX IF NOT EXISTS guardrail_rows_open
     ON guardrail_rows(identity_kind, identity_value, acknowledged_at);
 
+-- REST uploads M2b: the drip check's history (design §3). One row per
+-- budget a counted `parameters` body went against: each out_of_spec_calls
+-- entry its host matched (or the host), and '' for the agent. `at` is the
+-- capture time, as `_receive_time` writes it, so a text range is a window.
+CREATE TABLE IF NOT EXISTS guardrail_parameters_bytes (
+    identity_kind  TEXT NOT NULL,
+    identity_value TEXT NOT NULL,
+    budget_key     TEXT NOT NULL,
+    at             TEXT NOT NULL,
+    bytes          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS guardrail_parameters_bytes_window
+    ON guardrail_parameters_bytes(identity_kind, identity_value, budget_key, at);
+CREATE INDEX IF NOT EXISTS guardrail_parameters_bytes_age
+    ON guardrail_parameters_bytes(identity_kind, identity_value, at);
+
 CREATE TABLE IF NOT EXISTS guardrail_marks (
     identity_kind  TEXT NOT NULL,
     identity_value TEXT NOT NULL,
@@ -736,7 +752,12 @@ class GuardrailCustody:
         contract = json.loads(version["contract_json"])
         if g.DATA_ACTIONS in contract["rules"]:
             self._queue_not_offered_locked(kind, value, interaction, calls, now)
-        result = g.evaluate_request(contract, interaction)
+        body_kind = None
+        if g.body_kinds_on() and g.carries_body(interaction):
+            uploads = contract["rules"]["uploads"]
+            body_kind = g.request_body_kind(interaction, uploads.get("body_kind_overrides", ()))
+            body_kind = self._drip_check_locked(kind, value, contract, interaction, body_kind, now)
+        result = g.evaluate_request(contract, interaction, body_kind=body_kind)
         if not result["tool_calls"]["readable"]:
             self._mark(kind, value, MARK_TOOL_CALLS_UNREADABLE, now)
         self._record_violations(
@@ -744,6 +765,70 @@ class GuardrailCustody:
             [*result["uploads"], *result["out_of_spec_calls"],
              *g.evaluate_data_actions(contract, calls, interaction)], now,
         )
+
+    def _drip_check_locked(
+        self, kind: str, value: str, contract: Mapping[str, Any], interaction: Mapping[str, Any],
+        body: dict[str, Any] | None, now: str,
+    ) -> dict[str, Any] | None:
+        """REST uploads §3's drip check on one classified body: a
+        `parameters` body that would take any budget it counts against past
+        its day's bound (`parameters_budget`, else 256 KiB per entry and 1 MiB
+        for the agent) is an upload instead, with the sums it was judged on,
+        and adds nothing; one that fits is counted.
+
+        The window is the 24 h before the body's capture time, and everything
+        counted after it: a body judged late (its response came first, or
+        OpenShell held it) can't slip under bodies already counted with
+        later times. A capture time ahead of the server's clock, or none,
+        reads as now, and one more than a day behind it as a day ago, so no
+        stamp moves the window off what is still kept: rows are pruned by
+        the server's clock, two days back. A body with no host
+        stays as classified: the rule already reads it as an upload."""
+        if body is None or body.get("kind") != _bk.PARAMETERS:
+            return body
+        host = g.normalize_host(interaction.get("host"))
+        if host is None:
+            return body
+        clock = _instant(now)
+        when = g._instant(interaction.get("timestamp"))
+        when = clock if when is None or when > clock else max(when, clock - timedelta(seconds=_bk.DAY_SECONDS))
+        uploads = contract["rules"]["uploads"]
+        keys = g.drip_keys(host, contract["rules"]["out_of_spec_calls"]["allowed_hosts"])
+        budgets, agent_budget = g.drip_budgets(uploads)
+        start, at = self._receive_time(when - timedelta(seconds=_bk.DAY_SECONDS)), self._receive_time(when)
+        self._db.execute(
+            "DELETE FROM guardrail_parameters_bytes WHERE identity_kind = ? AND identity_value = ? AND at < ?",
+            (kind, value, self._receive_time(clock - timedelta(seconds=2 * _bk.DAY_SECONDS))),
+        )
+
+        def total(key: str) -> int:
+            return self._db.execute(
+                "SELECT coalesce(sum(bytes), 0) FROM guardrail_parameters_bytes "
+                "WHERE identity_kind = ? AND identity_value = ? AND budget_key = ? AND at > ?",
+                (kind, value, key, start),
+            ).fetchone()[0]
+
+        size = int(body.get("bytes") or 0)
+        sums = {key: total(key) for key in keys}
+        agent = total("")
+        over = [
+            f"parameters volume over {_bk._bytes_text(budgets.get(key, _bk.ENTRY_BUDGET_BYTES))} a day to {key}"
+            for key in keys if sums[key] + size > budgets.get(key, _bk.ENTRY_BUDGET_BYTES)
+        ]
+        if agent + size > agent_budget:
+            over.append(f"parameters volume over {_bk._bytes_text(agent_budget)} a day for the agent")
+        if over:
+            return {
+                **body, "kind": _bk.UPLOAD, "step": _bk.STEP_DRIP,
+                "reasons": (over + list(body.get("reasons") or []))[: _bk.MAX_REASONS],
+                "drip": {"entries": sums, "agent": agent, "bytes": size},
+            }
+        self._db.executemany(
+            "INSERT INTO guardrail_parameters_bytes (identity_kind, identity_value, budget_key, at, bytes) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [(kind, value, key, at, size) for key in ("", *keys)],
+        )
+        return body
 
     # ----------------------------------------------- blocked by OpenShell
 
@@ -1885,6 +1970,7 @@ class GuardrailCustody:
 # module, and the store imports this one while it loads. By the time any
 # method above runs, all three modules are complete, whichever was imported
 # first.
+from . import body_kinds as _bk  # noqa: E402
 from . import guardrail as g  # noqa: E402
 from . import data_actions_store as das  # noqa: E402
 from . import openshell_policy as osp  # noqa: E402
