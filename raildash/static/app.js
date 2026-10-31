@@ -1938,25 +1938,43 @@ function bodyKindOverridden(uploads, host, body) {
     entry.host === host && entry.method === body.method && entry.path === body.path_template);
 }
 
+// Whether **This is parameters** could make a version the server accepts
+// and that could clear the row: a real host that was flagged as not an
+// upload host (not only a size cap), and a method and path template the
+// contract can key (raildash.guardrail._body_kind_problems).
+function bodyKindAnswerable(row, body) {
+  const reasons = Array.isArray(row.detail.reasons) ? row.detail.reasons : [];
+  return row.item !== "(unknown host)" && reasons.includes("body_to_unlisted_host")
+    && typeof body.method === "string" && /^[A-Z]{1,16}$/.test(body.method)
+    && typeof body.path_template === "string" && body.path_template.startsWith("/")
+    && body.path_template.length <= 1024;
+}
+
 function renderBodyKinds(row, active, refresh) {
   const bodies = Array.isArray(row.detail.bodies) ? row.detail.bodies : [];
   if (!bodies.length) return null;
   const list = el("ul", "guardrail-bodies");
   const uploads = active ? active.guardrail.rules.uploads : null;
+  let offered = 0;
   bodies.forEach((body) => {
     if (!body || typeof body !== "object") return;
     const li = el("li");
-    const step = BODY_KIND_STEP_LABELS[body.step];
-    const what = `${body.kind}${step && body.kind !== step ? ` (${step})` : ""} · ${body.method || "?"} ${body.path_template || ""}` +
+    const answered = uploads ? bodyKindOverridden(uploads, row.item, body) : undefined;
+    // An earlier version's answer the version in force doesn't carry reads
+    // as unknown, as the server reads it (raildash.guardrail.body_counts).
+    const lost = body.step === 2 && uploads && !answered;
+    const kind = lost ? "unknown" : body.kind;
+    const step = lost ? "earlier answer not in this version" : BODY_KIND_STEP_LABELS[body.step];
+    const what = `${kind}${step && kind !== step ? ` (${step})` : ""} · ${body.method || "?"} ${body.path_template || ""}` +
       `${typeof body.bytes === "number" ? ` · ${fmtBytes(body.bytes)}` : ""}`;
     li.append(el("span", null, what));
     const reasons = Array.isArray(body.reasons) ? body.reasons.filter((r) => typeof r === "string") : [];
     if (reasons.length) li.append(el("span", "muted", ` — ${reasons.join("; ")}`));
-    const answered = uploads ? bodyKindOverridden(uploads, row.item, body) : undefined;
     if (answered) {
       li.append(el("span", "muted", ` · you marked it ${answered.kind}`));
-    } else if (uploads && !row.acknowledged && !row.allowed_by && body.kind !== "parameters"
-               && BODY_KIND_OVERRIDABLE_STEPS.includes(body.step) && body.method && body.path_template) {
+    } else if (uploads && !row.acknowledged && !row.allowed_by && kind !== "parameters"
+               && BODY_KIND_OVERRIDABLE_STEPS.includes(body.step) && bodyKindAnswerable(row, body)) {
+      offered += 1;
       li.append(guardrailButton("This is parameters", async () => {
         const rules = JSON.parse(JSON.stringify(active.guardrail.rules));
         const answers = (rules.uploads.body_kind_overrides || []).filter((entry) =>
@@ -1972,6 +1990,8 @@ function renderBodyKinds(row, active, refresh) {
   });
   if (row.detail.bodies_overflow) {
     list.append(el("li", "muted", "More bodies than are kept: an answer can't clear this row."));
+  } else if (offered && bodies.length > 1) {
+    list.append(el("li", "muted", "The row stops counting once no body on it reads as an upload."));
   }
   return list;
 }

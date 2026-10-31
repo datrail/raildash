@@ -856,6 +856,9 @@ def test_an_upload_rows_bodies_say_why_and_this_is_parameters_clears_it(tmp_path
         item["request"]["body"] = body
         item["request"]["headers"].update({"host": host, "content-type": content_type,
                                            "content-length": str(len(text))})
+        if host is None:
+            del item["request"]["headers"]["host"]
+            item["interaction_id"] = f"nohost{path}"
         _post(url, "/webhook/http-interactions", token,
               json.dumps({"session_id": "browser", "interactions": [item]}).encode())
 
@@ -873,6 +876,7 @@ def test_an_upload_rows_bodies_say_why_and_this_is_parameters_clears_it(tmp_path
         rest_capture(url, token, "api.search.example", "/v1/search/12345",
                      {"filter": {"a": {"b": {"c": {"d": 1}}}}})
         rest_capture(url, token, "files.example", "/v1/files", "x" * 20000, "application/octet-stream")
+        rest_capture(url, token, None, "/v1/deep", {"filter": {"a": {"b": {"c": {"d": 1}}}}})
         with sync_playwright() as playwright:
             browser = playwright.chromium.launch(headless=True)
             page = browser.new_page()
@@ -888,6 +892,11 @@ def test_an_upload_rows_bodies_say_why_and_this_is_parameters_clears_it(tmp_path
                 has=page.locator(".guardrail-bodies"))
             expect(files).to_contain_text("application/octet-stream body")
             expect(files.get_by_role("button", name="This is parameters")).to_have_count(0)
+            # No host: nothing can key an answer, so none is offered.
+            nohost = card.locator("tr", has=page.locator("code", has_text="(unknown host)")).filter(
+                has=page.locator(".guardrail-bodies"))
+            expect(nohost).to_contain_text("unknown · POST /v1/deep")
+            expect(nohost.get_by_role("button", name="This is parameters")).to_have_count(0)
             if os.environ.get("RAILDASH_SHOT_DIR"):
                 card.locator(".guardrail-rows").screenshot(
                     path=os.path.join(os.environ["RAILDASH_SHOT_DIR"], "body-kinds-rows.png"))
