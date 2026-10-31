@@ -174,6 +174,54 @@ def test_media_types_are_hard_uploads():
         assert kind({"q": "x"}, {"content-type": mtype})["step"] == bk.STEP_HARD, mtype
 
 
+def test_a_coalesced_content_type_with_a_file_type_is_a_hard_upload():
+    result = kind({"q": "x"}, {"content-type": "application/json, multipart/form-data; boundary=b"})
+    assert (result["kind"], result["step"]) == (bk.UPLOAD, bk.STEP_HARD)
+    assert kind({"q": "x"}, {"content-type": "application/json, text/plain"})["reasons"] == [
+        "two content types"]
+
+
+def test_an_encoded_body_is_unknown():
+    assert kind({"q": "x"}, {**JSON, "content-encoding": "gzip"})["reasons"] == ["gzip-encoded body"]
+    assert kind({"q": "x"}, {**JSON, "content-encoding": "identity"})["kind"] == bk.PARAMETERS
+
+
+def exchange(body, headers=JSON, **extra):
+    return {"request": {"method": "POST", "path": "/v1/q", "headers": headers, "body": body,
+                        **extra.pop("request", {})}, **extra}
+
+
+def test_the_exchanges_own_size_counts_when_the_kept_body_is_smaller():
+    # `{"q": "<100 KB>", "q": "x"}` sent chunked: the parser kept the last key.
+    sent = exchange({"q": "x"}, request={"first_line": "POST /v1/q HTTP/1.1"}, request_size=100_200)
+    result = bk.classify_exchange(sent, host="h")
+    assert (result["kind"], result["step"]) == (bk.UPLOAD, bk.STEP_HARD)
+    # The parser's own content_length counts too.
+    assert bk.classify_exchange(exchange({"q": "x"}, request={"content_length": 20_000}),
+                                host="h")["step"] == bk.STEP_HARD
+    # A small request's head is not counted as body.
+    small = exchange({"q": "x"}, request={"first_line": "POST /v1/q HTTP/1.1"}, request_size=80)
+    assert bk.classify_exchange(small, host="h")["kind"] == bk.PARAMETERS
+    assert bk.body_bytes({"a": 1}, {}, 20000.0) == 20000
+    assert bk.body_bytes({"a": 1}, {"Content-Length": 99999}) == 99999
+
+
+def test_with_no_recorded_size_a_body_isnt_parameters():
+    assert bk.classify_exchange(exchange({"q": "x"}), host="h")["reasons"] == [
+        "body size not recorded"]
+    assert bk.classify_exchange(exchange({"q": "x"}, {**JSON, "content-length": "9"}),
+                                host="h")["kind"] == bk.PARAMETERS
+
+
+def test_the_exchanges_path_is_read_as_ingest_reads_it():
+    for request in ({"path": None, ":path": "/v1/files/7"},
+                    {"path": None, "uri": "/v1/files/7"},
+                    {"path": "https://api.example/v1/files/7?x=1"}):
+        result = bk.classify_exchange(exchange({"q": "x"}, {**JSON, "content-length": "9"},
+                                               request=request), host="h")
+        assert result["path_template"] == "/v1/files/*"
+
+
 # ---------------------------------------------------------------- GraphQL
 
 
@@ -181,11 +229,26 @@ def gql(query, **extra):
     return kind({"query": query, **extra})
 
 
-def test_graphql_query_text_is_exempt_from_the_1_kib_string_but_bounded_at_4_kib():
+def test_graphql_query_text_is_exempt_from_the_1_kib_string_up_to_4_kib():
     fields = " ".join(f"field{i}" for i in range(150))  # about 1.4 KiB
     assert gql("{ viewer { " + fields + " } }")["kind"] == bk.PARAMETERS
+    # Past 4 KiB, or not a query-only document, the text is one more long
+    # string: a hard upload that no override can clear.
     big = " ".join(f"field{i}" for i in range(500))
-    assert gql("{ viewer { " + big + " } }")["reasons"] == ["GraphQL query over 4 KiB"]
+    assert gql("{ viewer { " + big + " } }")["step"] == bk.STEP_HARD
+    overrides = [{"host": "api.example", "method": "POST", "path": "/v1/x", "kind": "parameters"}]
+    for query in ("{ a }#" + "Z" * 1500, 'mutation { a(s: "' + "Z" * 1500 + '") }'):
+        result = kind({"query": query}, overrides=overrides)
+        assert (result["kind"], result["step"]) == (bk.UPLOAD, bk.STEP_HARD)
+
+
+def test_comments_before_a_graphql_document_are_read_in_linear_time():
+    import time
+    start = time.monotonic()
+    for text in ("#" * 5000, "# \n" * 2000 + "x", "#    \n" * 2000 + "x"):
+        assert gql(text)["kind"] != bk.PARAMETERS
+    assert time.monotonic() - start < 1
+    assert bk.looks_like_graphql({"query": "# c\r\n  # d\n query { a }"})
 
 
 def test_graphql_operations_other_than_queries_are_unknown():
@@ -232,7 +295,10 @@ def test_model_and_mcp_bodies_are_never_classified():
     ("/v1/files/123", "/v1/files/*"),
     ("/v1/files/123?x=1", "/v1/files/*"),
     ("/v1/items/0b4f6e2e-1f0a-4c55-9d1b-6a8c3d2e1f00/tags", "/v1/items/*/tags"),
-    ("/v1/doc/AbCdEfGhIjKlMnOpQrStUv", "/v1/doc/*"),
+    ("/v1/doc/AbCdEfGh1jKlMnOpQrStUv", "/v1/doc/*"),
+    # A long name with no digit is a name: an override on one isn't on the other.
+    ("/api/searchDocumentsQuickly", "/api/searchDocumentsQuickly"),
+    ("/api/uploadDocumentContents", "/api/uploadDocumentContents"),
     ("/v1/doc/a1b2c3d4e5f6a7b8c9d0e1", "/v1/doc/*"),
     ("/v1/conversations-and-messages-search", "/v1/conversations-and-messages-search"),
     ("/v1/search", "/v1/search"),

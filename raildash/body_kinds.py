@@ -39,6 +39,7 @@ from collections import deque
 from typing import Any, Iterable, Mapping
 from urllib.parse import parse_qsl
 
+from .ingest import _split_host_path
 from .json_safety import JSONStructureTooComplex, check_json_structure
 
 UPLOAD = "upload"
@@ -89,7 +90,7 @@ FORM_MEDIA_TYPE = "application/x-www-form-urlencoded"
 GRAPHQL_KEYS = frozenset(("query", "variables", "operationName"))
 
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
-_OPAQUE = re.compile(r"[A-Za-z0-9_\-.~=%]{20,}")
+_OPAQUE = re.compile(r"[A-Za-z0-9_\-.~=%]*[0-9][A-Za-z0-9_\-.~=%]*")
 
 
 # ----------------------------------------------------------------- inputs
@@ -100,16 +101,23 @@ def _header(headers: Any, name: str) -> str | None:
         return None
     for key, value in headers.items():
         if isinstance(key, str) and key.lower() == name:
-            return value if isinstance(value, str) else None
+            return value if isinstance(value, str) else None if value is None else str(value)
     return None
 
 
-def media_type(headers: Any) -> str | None:
-    """The request's `Content-Type` without parameters, lower-cased."""
+def media_types(headers: Any) -> list[str]:
+    """Every media type the request's `Content-Type` names, without
+    parameters, lower-cased. RailMon joins a repeated header with `, `, so
+    `application/json, multipart/form-data` names two."""
     value = _header(headers, "content-type")
     if value is None:
-        return None
-    return value.split(";", 1)[0].strip().lower() or None
+        return []
+    found = []
+    for part in value.split(","):
+        mtype = part.split(";", 1)[0].strip().lower()
+        if "/" in mtype:
+            found.append(mtype)
+    return found
 
 
 def _raw_text(body: Any) -> str | None:
@@ -121,12 +129,23 @@ def _raw_text(body: Any) -> str | None:
     return None
 
 
+def _as_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value) if isinstance(value, (int, float)) else int(str(value).strip())
+    except (ValueError, OverflowError):
+        return None
+
+
 def body_bytes(body: Any, headers: Any = None, framed: Any = None) -> int:
     """The body's size: the larger of what was kept and what was framed.
 
-    RailMon keeps a JSON object parsed and anything else as `{"raw": text}`;
-    a body cut short by the capture is still as big as its `Content-Length`
-    (or the exchange's own `content_length`) says, so the larger counts.
+    RailMon keeps a JSON object parsed and anything else as `{"raw": text}`.
+    The kept object can be smaller than what was sent (a body the capture
+    cut, or a repeated JSON key of which the parser kept the last), so a
+    larger `Content-Length` or `framed` (the exchange's own size, see
+    `framed_bytes`) counts instead.
     """
     text = _raw_text(body)
     if text is not None:
@@ -138,11 +157,32 @@ def body_bytes(body: Any, headers: Any = None, framed: Any = None) -> int:
                    .encode("utf-8", "surrogatepass"))
     sizes = [kept]
     for value in (_header(headers, "content-length"), framed):
-        try:
-            sizes.append(int(str(value).strip()) if value is not None else 0)
-        except ValueError:
-            pass
+        size = _as_int(value)
+        if size is not None:
+            sizes.append(size)
     return max(sizes)
+
+
+def framed_bytes(exchange: Mapping[str, Any]) -> int | None:
+    """What the capture says the request's body was, or `None` when it says
+    nothing: the parser's own `content_length`, else the exchange's
+    `request_size` less its request line and the headers that were kept.
+
+    Headers RailMon removed (credentials) are still in `request_size`, so
+    this can only overstate the body, which errs towards an upload.
+    """
+    request = exchange.get("request")
+    request = request if isinstance(request, dict) else {}
+    sizes = [_as_int(request.get("content_length"))]
+    total = _as_int(exchange.get("request_size"))
+    if total is not None:
+        head = len(str(request.get("first_line") or "")) + 4
+        headers = request.get("headers")
+        if isinstance(headers, Mapping):
+            head += sum(len(str(k)) + len(str(v)) + 4 for k, v in headers.items())
+        sizes.append(max(total - head, 0))
+    known = [size for size in sizes if size is not None]
+    return max(known) if known else None
 
 
 def _json_value(body: Any) -> tuple[Any, bool]:
@@ -172,7 +212,8 @@ def is_jsonrpc(body: Any) -> bool:
 def path_template(path: Any) -> str:
     """§3 step 2's key without a spec: the literal path, query string
     dropped, with each all-digit, UUID or opaque segment (20 or more
-    characters with a digit in them, or with no word separator) as `*`."""
+    characters, a digit among them) as `*`. A long name of letters only
+    (`searchDocumentsQuickly`) is a name, not an id, so it stays."""
     if not isinstance(path, str) or not path:
         return "/"
     path = path.split("?", 1)[0].split("#", 1)[0] or "/"
@@ -181,8 +222,7 @@ def path_template(path: Any) -> str:
         if segment and (
             segment.isdigit()
             or _UUID.fullmatch(segment)
-            or (_OPAQUE.fullmatch(segment)
-                and (any(c.isdigit() for c in segment) or not re.search(r"[-_.]", segment)))
+            or (len(segment) >= 20 and _OPAQUE.fullmatch(segment))
         ):
             out.append("*")
         else:
@@ -248,7 +288,24 @@ _GRAPHQL_TOKEN = re.compile(
     ''',
     re.X,
 )
-_GRAPHQL_START = re.compile(r"\s*(?:\#[^\n\r]*\s*)*(?:\{|query\b|mutation\b|subscription\b|fragment\b)")
+_GRAPHQL_START = re.compile(r"\{|(?:query|mutation|subscription|fragment)\b")
+
+
+def _graphql_start(text: str) -> bool:
+    """Whether a document's first token, after whitespace and `#` comments,
+    begins a definition. A loop, not one regex: two patterns that can match
+    the same characters backtrack exponentially on a failed match, as
+    DR-239 (#100) found in `guardrail.py`."""
+    pos = 0
+    while True:
+        while pos < len(text) and text[pos] in " \t\n\r,\ufeff":
+            pos += 1
+        if pos < len(text) and text[pos] == "#":
+            end = min((i for i in (text.find("\n", pos), text.find("\r", pos)) if i >= 0),
+                      default=len(text))
+            pos = end
+            continue
+        return bool(_GRAPHQL_START.match(text, pos))
 
 
 def looks_like_graphql(body: Any) -> bool:
@@ -258,14 +315,15 @@ def looks_like_graphql(body: Any) -> bool:
         isinstance(body, dict)
         and isinstance(body.get("query"), str)
         and set(body) <= GRAPHQL_KEYS
-        and bool(_GRAPHQL_START.match(body["query"]))
+        and _graphql_start(body["query"])
     )
 
 
 def graphql_queries_only(text: str) -> str | None:
     """Why a GraphQL document isn't only query operations and fragments, or
     `None` when it is. A lexer plus the top-level structure: each definition
-    is an anonymous `{…}`, `query …{…}` or `fragment …{…}`, brackets balance."""
+    is an anonymous `{…}`, `query …{…}` or `fragment …{…}`, brackets balance,
+    and no comment, string or run of space is over 1 KiB."""
     tokens: list[tuple[str, str]] = []
     pos = 0
     while pos < len(text):
@@ -273,6 +331,9 @@ def graphql_queries_only(text: str) -> str | None:
         if match is None:
             return "not a GraphQL document"
         pos = match.end()
+        if len(match.group()) > MAX_STRING_CHARS:
+            # A comment or string literal is room for data, not a query.
+            return f"a GraphQL comment or string over {MAX_STRING_CHARS // 1024} KiB"
         if match.lastgroup != "skip":
             tokens.append((match.lastgroup or "", match.group()))
     if not tokens:
@@ -408,13 +469,16 @@ def classify(
     headers: Any,
     body: Any,
     framed: Any = None,
+    size_known: bool = True,
     overrides: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     """One request that carries a body: its kind, the source and step that
     decided it, reasons, path template and size (§3 steps 1-5).
 
-    `host` is compared as the caller normalized it; `framed` is the
-    exchange's own `content_length`, if it kept one.
+    `host` is compared as the caller normalized it. `framed` is the size
+    the capture recorded (`framed_bytes`); `size_known=False` says it
+    recorded none and no `Content-Length` was sent either, so the kept body
+    alone can't show the request was small, and it isn't parameters.
     """
     method = str(method or "").upper()
     template = path_template(path)
@@ -427,14 +491,22 @@ def classify(
                        template, size)
 
     # Step 1: hard upload signals.
-    mtype = media_type(headers)
-    hard = []
-    if mtype is not None and (mtype in FILE_MEDIA_TYPES or mtype.startswith(FILE_MEDIA_FAMILIES)):
-        hard.append(f"{mtype} body")
+    mtypes = media_types(headers)
+    # A repeated Content-Type names two kinds: the body is neither for sure.
+    mtype = mtypes[0] if len(mtypes) == 1 else None
+    hard = [f"{t} body" for t in mtypes if t in FILE_MEDIA_TYPES or t.startswith(FILE_MEDIA_FAMILIES)]
     if size > MAX_BODY_BYTES:
         hard.append(f"body over {MAX_BODY_BYTES // 1024} KiB")
     if parsed:
-        skip = (id(value), "query") if looks_like_graphql(value) else None
+        # A GraphQL query's text is bounded by step 4 instead, but only a
+        # query-only document within that bound: anything else in `query`
+        # is one more string here, so an override can't clear it.
+        skip = None
+        if looks_like_graphql(value):
+            query = value["query"]
+            if (len(query.encode("utf-8", "surrogatepass")) <= MAX_GRAPHQL_QUERY_BYTES
+                    and graphql_queries_only(query) is None):
+                skip = (id(value), "query")
         strings: Iterable[str] = _strings(value, skip)
     elif isinstance(value, str) and mtype == FORM_MEDIA_TYPE and size <= MAX_BODY_BYTES:
         strings = [s for pair in parse_qsl(value, keep_blank_values=True) for s in pair]
@@ -451,7 +523,15 @@ def classify(
     if kind is not None:
         return _result(kind, SOURCE_USER, STEP_OVERRIDE, [f"you marked this {kind}"], template, size)
 
-    # Step 3 (an imported spec) is M3. Steps 4 and 5: the body's shape.
+    # Step 3 (an imported spec) is M3. Steps 4 and 5: the body's shape, read
+    # only when the capture shows all of it, as sent.
+    encoding = (_header(headers, "content-encoding") or "").strip().lower()
+    if encoding not in ("", "identity"):
+        return _result(UNKNOWN, SOURCE_SHAPE, STEP_OTHER, [f"{encoding}-encoded body"], template, size)
+    if not size_known:
+        return _result(UNKNOWN, SOURCE_SHAPE, STEP_OTHER, ["body size not recorded"], template, size)
+    if len(mtypes) > 1:
+        return _result(UNKNOWN, SOURCE_SHAPE, STEP_OTHER, ["two content types"], template, size)
     kind, reasons = _shape(value, parsed, mtype, size)
     step = STEP_SHAPE if kind == PARAMETERS else STEP_OTHER
     return _result(kind, SOURCE_SHAPE, step, reasons, template, size)
@@ -463,13 +543,16 @@ def classify_exchange(
     host: str | None,
     overrides: Iterable[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
-    """`classify` over one captured legacy exchange's request."""
+    """`classify` over one captured legacy exchange's request, its path
+    read as ingest reads it (`path`, `uri` or `:path`, origin-form)."""
     request = exchange.get("request")
     request = request if isinstance(request, dict) else {}
+    framed = framed_bytes(exchange)
     return classify(
-        method=request.get("method"), host=host, path=request.get("path"),
-        headers=request.get("headers"), body=request.get("body"),
-        framed=request.get("content_length"), overrides=overrides,
+        method=request.get("method"), host=host, path=_split_host_path(request)[1],
+        headers=request.get("headers"), body=request.get("body"), framed=framed,
+        size_known=framed is not None or _header(request.get("headers"), "content-length") is not None,
+        overrides=overrides,
     )
 
 
