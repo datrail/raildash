@@ -1317,7 +1317,7 @@ function renderGuardrailPolicy(rules, openshell = false) {
   // REST uploads (a v4 version only): hosts it only queried, the user's
   // body-kind answers, and the drip check's raised bounds.
   const queried = rules.uploads.parameters_only_hosts || [];
-  if (queried.length) add("Queried only (an upload there is flagged)", queried.join(", "));
+  if (queried.length) add("Hosts it only queried", queried.join(", "));
   const kinds = rules.uploads.body_kind_overrides || [];
   if (kinds.length) {
     add("Body kinds you set", kinds.map((entry) => `${entry.method} ${entry.host}${entry.path}: ${entry.kind}`).join("; "));

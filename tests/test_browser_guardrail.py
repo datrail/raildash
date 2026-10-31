@@ -818,7 +818,7 @@ def test_a_v4_versions_body_kind_members_read_in_words(tmp_path):
             card = page.locator("#guardrail-body .guardrail-card")
             card.locator(".guardrail-active-policy > summary").click(timeout=TIMEOUT)
             policy = card.locator(".guardrail-active-policy")
-            expect(policy).to_contain_text("Queried only (an upload there is flagged)api.search.example")
+            expect(policy).to_contain_text("Hosts it only queriedapi.search.example")
             expect(policy).to_contain_text("POST api.search.example/v1/query/*: parameters")
             expect(policy).to_contain_text("the agent 2.0 MB")
             if os.environ.get("RAILDASH_SHOT_DIR"):

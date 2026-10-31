@@ -822,7 +822,7 @@ def export_policy(
                     "check how your OpenShell version matches `*.` and use `**.` if it is one label only.")
     if queried:
         gaps.append("OpenShell can't tell a query POST from an upload, so these hosts the agent only "
-                    "queried are read-write, and uploads to them are judged by RailDash only: "
+                    "queried are read-write, and only RailDash tells an upload to them from a query: "
                     + ", ".join(sorted(set(queried))) + ".")
     only_uploads = sorted(h for h in uploads["allowed_hosts"]
                           if not pattern_covered(h, out_of_spec["allowed_hosts"]) and not _loopback(h))
