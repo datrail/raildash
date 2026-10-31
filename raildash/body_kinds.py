@@ -183,16 +183,14 @@ def framed_bytes(exchange: Mapping[str, Any]) -> int | None:
     exact = _as_int(request.get("content_length"))
     if exact is not None:
         return exact
-    sizes = []
     total = _as_int(exchange.get("request_size"))
-    if total is not None:
-        head = len(str(request.get("first_line") or "")) + 4
-        headers = request.get("headers")
-        if isinstance(headers, Mapping):
-            head += sum(len(str(k)) + len(str(v)) + 4 for k, v in headers.items())
-        sizes.append(max(total - head, 0))
-    known = [size for size in sizes if size is not None]
-    return max(known) if known else None
+    if total is None:
+        return None
+    head = len(str(request.get("first_line") or "")) + 4
+    headers = request.get("headers")
+    if isinstance(headers, Mapping):
+        head += sum(len(str(k)) + len(str(v)) + 4 for k, v in headers.items())
+    return max(total - head, 0)
 
 
 class _RepeatedKey(ValueError):
@@ -537,10 +535,14 @@ def classify(
     method = str(method or "").upper()
     template = path_template(path)
     size = max(body_bytes(body, headers, framed), body_bytes(None, None, exact))
-    if size > MAX_BODY_BYTES and _raw_text(body) is not None:
-        # Not parsed first: whatever it is, it is an upload.
-        return _result(UPLOAD, SOURCE_HARD, STEP_HARD, [f"body over {MAX_BODY_BYTES // 1024} KiB"],
-                       template, size)
+    mtypes = media_types(headers)
+    text = _raw_text(body)
+    if size > MAX_BODY_BYTES and text is not None and text.lstrip()[:1] not in ("[", "{"):
+        # Not JSON, so not model or MCP traffic either: an upload, unparsed.
+        hard = [f"{t} body" for t in mtypes
+                if t in FILE_MEDIA_TYPES or t.startswith(FILE_MEDIA_FAMILIES)]
+        return _result(UPLOAD, SOURCE_HARD, STEP_HARD,
+                       hard + [f"body over {MAX_BODY_BYTES // 1024} KiB"], template, size)
     value, parsed, unparsed = _json_value(body)
 
     if is_model_request(value) or is_jsonrpc(value):
@@ -549,7 +551,6 @@ def classify(
                        template, size)
 
     # Step 1: hard upload signals.
-    mtypes = media_types(headers)
     # A repeated Content-Type names two kinds: the body is neither for sure.
     mtype = mtypes[0] if len(mtypes) == 1 else None
     hard = [f"{t} body" for t in mtypes if t in FILE_MEDIA_TYPES or t.startswith(FILE_MEDIA_FAMILIES)]

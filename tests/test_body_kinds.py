@@ -321,6 +321,16 @@ def test_model_and_mcp_bodies_are_never_classified():
         assert (result["kind"], result["source"]) == (bk.UPLOAD, bk.SOURCE_TRAFFIC)
 
 
+def test_a_large_mcp_batch_is_still_mcp_traffic_and_large_text_isnt_parsed():
+    batch = json.dumps([{"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                         "params": {"name": "t", "arguments": {"x": "y" * 100}}} for i in range(200)])
+    result = kind({"raw": batch})
+    assert (result["kind"], result["source"], result["reasons"]) == (
+        bk.UPLOAD, bk.SOURCE_TRAFFIC, ["MCP message"])
+    result = kind({"raw": "--b\r\n" + "x" * 20_000}, {"content-type": "multipart/form-data; boundary=b"})
+    assert result["reasons"] == ["multipart/form-data body", "body over 16 KiB"]
+
+
 @pytest.mark.parametrize("path,template", [
     ("/v1/files/123", "/v1/files/*"),
     ("/v1/files/123?x=1", "/v1/files/*"),
