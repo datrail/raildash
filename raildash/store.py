@@ -323,7 +323,8 @@ CONTENT_COLUMNS = ("request_media_type", "content_kinds")
 # classifier reads it with no user answer (`upload`, `parameters`,
 # `unknown`, or `traffic` for model and MCP requests) and `""` with no
 # body. NULL is a row the one-time pass didn't reach (older than its
-# window) or that an older RailDash wrote: shown as not classified. The guardrail never reads it: it classifies a
+# window, or with no readable capture time) or that an older RailDash
+# wrote: shown as not classified. The guardrail never reads it: it classifies a
 # request when it judges it, with the version's own answers.
 BODY_KIND_COLUMN = "body_kind"
 BODY_KIND_UNCLASSIFIED = "unclassified"

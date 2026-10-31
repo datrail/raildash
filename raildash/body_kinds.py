@@ -39,6 +39,7 @@ from collections import deque
 from typing import Any, Iterable, Mapping
 from urllib.parse import parse_qsl
 
+from .ingest import _header as _ingest_header
 from .ingest import _split_host_path
 from .json_safety import JSONStructureTooComplex, check_json_structure
 
@@ -628,7 +629,9 @@ def request_carries_body(request: Mapping[str, Any]) -> bool:
     was framed)."""
     if request.get("body") not in (None, ""):
         return True
-    length = _header(request.get("headers"), "content-length")
+    # Read as the guardrail always has (`ingest._header`, which makes any
+    # value a string), so a null or list Content-Length still says a body.
+    length = _ingest_header(request.get("headers"), "content-length")
     try:
         return length is not None and int(length.strip()) > 0
     except ValueError:

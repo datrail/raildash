@@ -84,7 +84,7 @@ def test_bytes_sent_per_host_are_split_by_kind(store):
     assert list(host["by_kind"]) == ["upload", "parameters", "no_body"]  # the order shown
 
 
-def test_the_one_time_pass_classifies_the_last_day_and_marks_older_rows(tmp_path):
+def test_the_one_time_pass_classifies_the_last_day_and_leaves_older_rows(tmp_path):
     path = tmp_path / "old.db"
     old_schema = SCHEMA.replace("    body_kind      TEXT,\n", "")
     db = sqlite3.connect(path)
@@ -142,6 +142,16 @@ def test_normalise_classifies_so_ingest_doesnt_parse_the_capture_again(store, mo
     store.upsert_session("s")
     store.add_interactions("s", [row])
     assert _kinds(store) == {"/files": "upload"}
+
+
+@pytest.mark.parametrize("length", [None, ["0"], "abc", "5"])
+def test_carries_body_reads_content_length_as_the_guardrail_always_has(length):
+    from raildash import body_kinds as bk
+    from raildash import guardrail as g
+    request = {"method": "POST", "headers": {"host": "h.example", "content-length": length}, "body": None}
+    # Anything but a readable zero or no header says a body was framed.
+    assert bk.request_carries_body(request) is True
+    assert g.carries_body({"raw": json.dumps({"request": request, "response": {}})}) is True
 
 
 def test_a_row_without_a_kind_is_classified_from_its_raw(store):
