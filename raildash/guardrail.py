@@ -624,14 +624,7 @@ def carries_body(interaction: Mapping[str, Any]) -> bool:
     request = exchange.get("request")
     if not isinstance(request, dict):
         return False
-    if request.get("body") not in (None, ""):
-        return True
-    length = _header(request.get("headers"), "content-length")
-    try:
-        return length is not None and int(length.strip()) > 0
-    except ValueError:
-        # A Content-Length that isn't a number still says a body was framed.
-        return True
+    return _bk.request_carries_body(request)
 
 
 # ------------------------------------------------------------- body kinds

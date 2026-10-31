@@ -109,11 +109,45 @@ def test_the_one_time_pass_classifies_the_last_day_and_marks_older_rows(tmp_path
 
     store = Store(path)
     try:
-        assert _kinds(store) == {"/q": "parameters", "/files": "upload", "/old": "unclassified",
-                                 "/none": "unclassified"}
+        # Older rows (and one with no readable time) aren't rewritten: NULL
+        # is shown as not classified.
+        assert _kinds(store) == {"/q": "parameters", "/files": "upload", "/old": None, "/none": None}
         by_host = {h["value"]: h["by_kind"] for h in store.observed_profile("old")["observed"]["upload_bytes"]}
         assert set(by_host["api.search.example"]) == {"parameters", "unclassified"}
         assert set(by_host["files.example"]) == {"upload"}
         assert not store._needs_upgrade()  # noqa: SLF001
     finally:
         store.close()
+    # Done once: a later open doesn't take the upgrade path again, even with
+    # NULL rows still stored, or rows an older RailDash wrote since.
+    db = sqlite3.connect(path)
+    db.execute("INSERT INTO interactions (session_id, interaction_id, timestamp, raw) VALUES "
+               "('old', 'older-writer', ?, '{}')", (_iso(datetime.now(timezone.utc)),))
+    db.commit()
+    db.close()
+    store = Store(path)
+    try:
+        assert not store._needs_upgrade()  # noqa: SLF001
+        assert _kinds(store)["/old"] is None
+    finally:
+        store.close()
+
+
+def test_normalise_classifies_so_ingest_doesnt_parse_the_capture_again(store, monkeypatch):
+    from raildash import store as store_module
+    from raildash.ingest import normalise
+    row = normalise(_request("files.example", FILE, path="/files"))
+    assert row["body_kind"] == "upload"
+    monkeypatch.setattr(store_module, "body_kind_value", lambda row: pytest.fail("parsed again"))
+    store.upsert_session("s")
+    store.add_interactions("s", [row])
+    assert _kinds(store) == {"/files": "upload"}
+
+
+def test_a_row_without_a_kind_is_classified_from_its_raw(store):
+    from raildash.ingest import normalise
+    row = normalise(_request("api.search.example", QUERY, path="/q"))
+    del row["body_kind"]
+    store.upsert_session("s")
+    store.add_interactions("s", [row])
+    assert _kinds(store) == {"/q": "parameters"}

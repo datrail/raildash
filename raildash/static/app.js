@@ -2759,7 +2759,7 @@ function bodyKindSplit(item) {
   const split = item.by_kind && typeof item.by_kind === "object" ? item.by_kind : null;
   if (!split) return "";
   return Object.entries(split)
-    .filter(([kind, bytes]) => BODY_KIND_SPLIT_LABELS[kind] && typeof bytes === "number" && bytes > 0)
+    .filter(([kind, bytes]) => Object.hasOwn(BODY_KIND_SPLIT_LABELS, kind) && typeof bytes === "number" && bytes > 0)
     .map(([kind, bytes]) => `${BODY_KIND_SPLIT_LABELS[kind]} ${fmtBytes(bytes)}`)
     .join(" · ");
 }

@@ -622,6 +622,42 @@ def classify_exchange(
     )
 
 
+def request_carries_body(request: Mapping[str, Any]) -> bool:
+    """DR-184 §4.3: a request's `body` is present and not empty, or it has a
+    `Content-Length` above zero (one that isn't a number still says a body
+    was framed)."""
+    if request.get("body") not in (None, ""):
+        return True
+    length = _header(request.get("headers"), "content-length")
+    try:
+        return length is not None and int(length.strip()) > 0
+    except ValueError:
+        return True
+
+
+# What `stored_kind` gives a model or MCP request, which is never classified.
+STORED_TRAFFIC = "traffic"
+
+
+def stored_kind(exchange: Any) -> str:
+    """The body kind an interaction row keeps (REST uploads §4 "What's
+    stored"): the classifier's kind with no user answer, `traffic` for a
+    model or MCP request, `""` with no body. An exchange that can't be read
+    (None), or that the classifier can't finish, is `unknown`."""
+    if not isinstance(exchange, Mapping):
+        return UNKNOWN
+    request = exchange.get("request")
+    if not isinstance(request, Mapping):
+        return ""
+    if not request_carries_body(request):
+        return ""
+    try:
+        found = classify_exchange(exchange, host=None)
+    except Exception:  # noqa: BLE001 - fail closed, never stop ingest
+        return UNKNOWN
+    return STORED_TRAFFIC if found["source"] == SOURCE_TRAFFIC else str(found["kind"])
+
+
 # ------------------------------------------------------------- drip check
 
 

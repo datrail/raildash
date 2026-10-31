@@ -321,13 +321,14 @@ MULTI_AGENT_COLUMNS = (
 CONTENT_COLUMNS = ("request_media_type", "content_kinds")
 # REST uploads §4 "What's stored": each request's body kind as the
 # classifier reads it with no user answer (`upload`, `parameters`,
-# `unknown`, or `traffic` for model and MCP requests), `""` with no body,
-# and `unclassified` for a row older than the one-time pass reaches. NULL
-# means not yet derived. The guardrail never reads it: it classifies a
+# `unknown`, or `traffic` for model and MCP requests) and `""` with no
+# body. NULL is a row the one-time pass didn't reach (older than its
+# window) or that an older RailDash wrote: shown as not classified. The guardrail never reads it: it classifies a
 # request when it judges it, with the version's own answers.
 BODY_KIND_COLUMN = "body_kind"
 BODY_KIND_UNCLASSIFIED = "unclassified"
-BODY_KIND_TRAFFIC = "traffic"
+# Recorded in `settings` once the one-time pass has finished.
+BODY_KIND_PASS_SETTING = "body_kind_pass_done"
 # *Bytes sent per host*'s split, in the order it is shown: `no_body` is a
 # request with no body (its headers still count), from `""`.
 BODY_KIND_SPLIT = ("upload", "unknown", "traffic", "parameters", "no_body", "unclassified")
@@ -464,8 +465,10 @@ class Store(GuardrailCustody, DataActionsStore):
         self._ensure_multi_agent_columns()
         self._ensure_content_columns()
         self._ensure_authenticated_columns()
-        self._ensure_body_kind_column()
         self._migrate()
+        # After `_migrate`: its pass rewrites pre-DR-20 rows with
+        # secure_delete on, so this one never copies a credential it removes.
+        self._ensure_body_kind_column()
         self._backfill_data_actions()
         self._db.commit()
         if upgrading:
@@ -496,9 +499,11 @@ class Store(GuardrailCustody, DataActionsStore):
             for table in CAPTURE_TABLES
         ):
             return True
+        if not self._body_kind_pass_done():
+            return True
         return (
             self._db.execute(
-                "SELECT 1 FROM interactions WHERE content_kinds IS NULL OR body_kind IS NULL LIMIT 1"
+                "SELECT 1 FROM interactions WHERE content_kinds IS NULL LIMIT 1"
             ).fetchone()
             is not None
         )
@@ -598,19 +603,19 @@ class Store(GuardrailCustody, DataActionsStore):
     def _ensure_body_kind_column(self) -> None:
         """REST uploads §4: add `body_kind`, and the design's one-time pass.
 
-        Rows captured in the `BODY_KIND_BACKFILL_WINDOW` before the pass are
-        classified from their kept capture; older ones are marked
-        `unclassified`, which *Bytes sent per host* shows as such. New rows
-        are always written with a value, so NULL means "not yet derived":
-        an interrupted pass resumes on the next open, in bounded pages like
-        `_ensure_content_columns`. The window is read from the capture's
-        own clock (`timestamp`), against this host's clock now.
+        The pass classifies the rows captured in the
+        `BODY_KIND_BACKFILL_WINDOW` before it runs, from their kept capture,
+        read from the capture's own clock (`timestamp`) against this host's.
+        Older rows, and any written later by an older RailDash, keep NULL,
+        which *Bytes sent per host* shows as not classified: rewriting them
+        only to say so would copy every stored capture once more. It goes in
+        bounded pages like `_ensure_content_columns`, and is recorded as done
+        (`BODY_KIND_PASS_SETTING`) only once it finishes, so an interrupted
+        pass starts again on the next open.
         """
         self._add_interaction_columns((BODY_KIND_COLUMN,))
-        self._db.execute(
-            "CREATE INDEX IF NOT EXISTS interactions_body_kind_pending "
-            "ON interactions(id) WHERE body_kind IS NULL"
-        )
+        if self._body_kind_pass_done():
+            return
         since = (datetime.now(timezone.utc) - BODY_KIND_BACKFILL_WINDOW).timestamp()
         last_id = 0
         while True:
@@ -624,13 +629,12 @@ class Store(GuardrailCustody, DataActionsStore):
                 break
             for candidate in rows:
                 if candidate["epoch"] is None or candidate["epoch"] < since:
-                    kind = BODY_KIND_UNCLASSIFIED
-                elif int(candidate["size"] or 0) > MAX_SAFE_JSON_BYTES:
+                    continue
+                if int(candidate["size"] or 0) > MAX_SAFE_JSON_BYTES:
                     kind = _bk.UNKNOWN
                 else:
                     stored = self._db.execute(
-                        "SELECT host, path, method, request_size, raw FROM interactions WHERE id = ?",
-                        (candidate["id"],),
+                        "SELECT raw FROM interactions WHERE id = ?", (candidate["id"],)
                     ).fetchone()
                     kind = body_kind_value(dict(stored))
                 self._db.execute(
@@ -638,6 +642,15 @@ class Store(GuardrailCustody, DataActionsStore):
                 )
             last_id = rows[-1]["id"]
             self._db.commit()
+        self._db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (BODY_KIND_PASS_SETTING, datetime.now(timezone.utc).isoformat()),
+        )
+
+    def _body_kind_pass_done(self) -> bool:
+        return self._db.execute(
+            "SELECT 1 FROM settings WHERE key = ?", (BODY_KIND_PASS_SETTING,)
+        ).fetchone() is not None
 
     @staticmethod
     def _prepare_private_database_path(path: Path) -> None:
@@ -1748,7 +1761,12 @@ class Store(GuardrailCustody, DataActionsStore):
                         "request_media_type": None,
                         "content_kinds": "",
                         **row,
-                        BODY_KIND_COLUMN: body_kind_value(row),
+                        # `normalise` classifies it; a row built another way
+                        # is classified from its `raw` here.
+                        BODY_KIND_COLUMN: (
+                            row[BODY_KIND_COLUMN] if isinstance(row.get(BODY_KIND_COLUMN), str)
+                            else body_kind_value(row)
+                        ),
                         "session_id": session_id,
                         "authenticated": 1 if authenticated else 0,
                     },
@@ -2324,7 +2342,7 @@ class Store(GuardrailCustody, DataActionsStore):
         if any(row["value_truncated"] for row in upload_rows):
             mark_truncated("upload_bytes")
         # REST uploads §4: each host's bytes split by body kind, from the
-        # same rows (`body_kind`; NULL reads as not yet classified).
+        # same rows (`body_kind`; NULL is shown as not classified).
         by_kind: dict[str, dict[str, int]] = {row["value"]: {} for row in upload_rows}
         if by_kind:
             for row in self._db.execute(
@@ -2838,18 +2856,12 @@ class Store(GuardrailCustody, DataActionsStore):
 
 def body_kind_value(row: dict[str, Any]) -> str:
     """The `body_kind` column's value for one interaction row (`raw` the
-    stored JSON text): the kind the classifier gives it with no user
-    answer, `traffic` for a model or MCP request, `""` with no body. A row
-    whose capture can't be read is `unknown` (`guardrail.request_body_kind`)."""
+    stored JSON text), read once: see `body_kinds.stored_kind`. A row whose
+    capture can't be read is `unknown`."""
     try:
-        found = _g.request_body_kind(row)
+        return _bk.stored_kind(_g._exchange(row))
     except Exception:  # noqa: BLE001 - one row must not stop ingest or startup
         return _bk.UNKNOWN
-    if found is None:
-        return ""
-    if found.get("source") == _bk.SOURCE_TRAFFIC:
-        return BODY_KIND_TRAFFIC
-    return str(found.get("kind") or _bk.UNKNOWN)
 
 
 # Last, and only as module references: `raildash.guardrail` reads this
