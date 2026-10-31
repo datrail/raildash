@@ -2251,7 +2251,11 @@ def propose_guardrail(
             continue
         host = normalize_host(request.get("host"))
         if seed is not None and host in seed["withheld_upload_hosts"]:
-            for found in evaluate_request(guardrail, request)["uploads"]:
+            # The kind already judged above (with the host's spec), not a
+            # fresh classification without it.
+            judged = evaluate_request(guardrail, request, body_kind=kind) if body_kinds_on() else \
+                evaluate_request(guardrail, request)
+            for found in judged["uploads"]:
                 if found["detail"].get("kind") == "host" and ("uploads", found["item"]) not in {
                     (v["rule"], v["item"]) for v in would_be
                 }:

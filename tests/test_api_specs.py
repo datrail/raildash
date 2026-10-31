@@ -307,3 +307,64 @@ def test_routes_refuse_a_bad_file_or_host_with_422(client):
     assert bad.status_code == 422 and "Swagger 2.0" in bad.json()["detail"]
     assert client.post("/api/api-specs?host=*.github.com", content=GITHUB, headers=auth()).status_code == 422
     assert client.post("/api/api-specs", content=GITHUB, headers=auth()).status_code == 422
+
+
+# ------------------------------------------------ review of 3544233
+
+
+def test_a_propertys_format_is_found_through_refs_and_combinators():
+    components = {"schemas": {"A": {"$ref": "#/components/schemas/B"}, "B": {"type": "string", "format": "binary"}}}
+    raw = spec({
+        "/all": body_op({"application/json": {"schema": {"properties": {"doc": {"allOf": [{"format": "binary"}]}}}}}),
+        "/any": body_op({"application/json": {"schema": {"properties": {"doc": {"anyOf": [{"format": "byte"}, {"type": "null"}]}}}}}),
+        "/chain": body_op({"application/json": {"schema": {"properties": {"doc": {"$ref": "#/components/schemas/A"}}}}}),
+        "/map": body_op({"application/json": {"schema": {"additionalProperties": {"format": "binary"}}}}),
+    }, components=components)
+    ops = {op["path"]: op["media"]["application/json"] for op in a.parse_spec(raw)["operations"]}
+    assert ops == {"/all": ['property "doc" is format binary'], "/any": ['property "doc" is format byte'],
+                   "/chain": ['property "doc" is format binary'], "/map": ["a map value is format binary"]}
+
+
+@pytest.mark.parametrize("ref", ["https://example.com/bodies.yaml#/Upload", "./bodies.yaml#/Upload",
+                                 "#/components/requestBodies/Missing"])
+def test_a_request_body_that_cant_be_read_marks_the_operation(ref):
+    [op] = a.parse_spec(spec({"/up": {"post": {"operationId": "up", "requestBody": {"$ref": ref}}}}))["operations"]
+    assert op["media"] == {"*/*": [a.UNREADABLE_BODY]}
+    assert a.upload_reasons(op, ["application/json"]) == [f"spec up: {a.UNREADABLE_BODY}"]
+
+
+def test_a_shared_request_body_is_read_through_its_ref():
+    raw = spec({"/up": {"post": {"operationId": "up", "requestBody": {"$ref": "#/components/requestBodies/F"}}}},
+               components={"requestBodies": {"F": {"content": {"image/png": {}}}}})
+    [op] = a.parse_spec(raw)["operations"]
+    assert op["media"] == {"image/png": ["takes image/png"]}
+
+
+@pytest.mark.parametrize("template, value, fits", [
+    ("{a}.{b}.json", "x.y.json", True),
+    ("{a}.{b}.json", "x..json", False),
+    ("{a}.{b}.json", "a.b.c.json", True),
+    ("v{n}", "v2", True),
+    ("v{n}", "v", False),
+    ("{a}{b}", "x", False),
+    ("{a}{b}", "xy", True),
+    ("pre{a}mid{b}", "premidmid", False),
+    ("pre{a}mid{b}", "prexmidy", True),
+    ("{id}", "anything", True),
+])
+def test_segments_match_without_a_regex(template, value, fits):
+    assert a._segment_matches(a._segment_tokens(template), value) is fits  # noqa: SLF001
+
+
+def test_matching_a_crafted_path_stays_linear():
+    import time
+    index = a.parse_spec(spec({"/f/{a}.{b}.{c}.{d}.json": {"post": {}}}))
+    start = time.monotonic()
+    assert a.match(index, "POST", "/f/" + "a." * 50_000) is None
+    assert time.monotonic() - start < 1.0
+
+
+def test_between_equal_matches_a_marked_operation_wins():
+    raw = spec({"/v1/{x}": {"post": {"operationId": "plain", "requestBody": {"content": {"application/json": {}}}}},
+                "/v1/{y}/": {"post": {"operationId": "marked", "requestBody": {"content": {"application/zip": {}}}}}})
+    assert a.match(a.parse_spec(raw), "POST", "/v1/7")["operation_id"] == "marked"

@@ -130,9 +130,10 @@ class _Walk:
             self.reasons.append(reason)
 
     def walk(self, schema: Any, depth: int = 0, refs: tuple[str, ...] = (), via: str = "body") -> None:
-        """`via` is how the walk reached this schema: the request body
-        itself, a property (whose name check already reported its own
-        format), or an array's items."""
+        """`via` names what this schema describes, for the reason a format
+        mark gives: `body` (the request body itself), `property "<name>"`,
+        `an array item` or `a map value`. It carries through `$ref`s and
+        `allOf`/`anyOf`/`oneOf`, which describe the same value."""
         if not isinstance(schema, Mapping) or self.cut:
             return
         self.nodes += 1
@@ -145,26 +146,25 @@ class _Walk:
                 return
             self.walk(self._resolve(ref), depth + 1, (*refs, ref), via)
             return
-        if via != "property":
-            what = "body" if via == "body" else "an array item"
-            if schema.get("format") in ("binary", "byte"):
-                self._add(f"{what} is format {schema['format']}")
-            if schema.get("contentEncoding") or schema.get("contentMediaType"):
-                self._add(f"{what} has a content encoding or media type")
+        if schema.get("format") in ("binary", "byte"):
+            self._add(f"{via} is format {schema['format']}")
+        if schema.get("contentEncoding"):
+            self._add(f"{via} is {schema['contentEncoding']}")
+        if schema.get("contentMediaType"):
+            self._add(f"{via} has media type {schema['contentMediaType']}")
         properties = schema.get("properties")
         if isinstance(properties, Mapping):
             for name, spec in properties.items():
-                resolved = spec
-                if isinstance(spec, Mapping) and isinstance(spec.get("$ref"), str) and spec["$ref"] not in refs:
-                    resolved = self._resolve(spec["$ref"])
-                why = data_carrying(str(name), resolved if isinstance(resolved, Mapping) else {})
+                # The name alone (DR-205's data-carrying names); its format
+                # marks are found by the walk, however deep its `$ref`s go.
+                why = data_carrying(str(name), {})
                 if why is not None:
                     self._add(why.replace("argument", "property"))
-                self.walk(spec, depth + 1, refs, "property")
+                self.walk(spec, depth + 1, refs, f'property "{name}"')
         if isinstance(schema.get("items"), Mapping):
-            self.walk(schema["items"], depth + 1, refs, "items")
+            self.walk(schema["items"], depth + 1, refs, "an array item")
         if isinstance(schema.get("additionalProperties"), Mapping):
-            self.walk(schema["additionalProperties"], depth + 1, refs, "items")
+            self.walk(schema["additionalProperties"], depth + 1, refs, "a map value")
         for key in ("allOf", "anyOf", "oneOf"):
             if isinstance(schema.get(key), list):
                 for part in schema[key]:
@@ -183,35 +183,75 @@ def _media_reasons(document: Mapping[str, Any], media_type: str, entry: Any) -> 
     return walk.reasons[:MAX_REASONS]
 
 
-def _request_body(document: Mapping[str, Any], operation: Mapping[str, Any]) -> Mapping[str, Any] | None:
+# What an operation whose request body can't be read is marked with, for
+# every media type (a spec can only tighten, so it fails closed).
+UNREADABLE_BODY = "request body not readable to the end"
+
+
+def _request_body(document: Mapping[str, Any], operation: Mapping[str, Any]) -> Mapping[str, Any] | None | bool:
+    """The operation's request body object, None when it declares none, or
+    False when it declares one that can't be read: a remote or unresolvable
+    `$ref`, or a chain of them past the bound."""
     body = operation.get("requestBody")
+    if body is None:
+        return None
     for _ in range(MAX_SCHEMA_DEPTH):
         if not (isinstance(body, Mapping) and isinstance(body.get("$ref"), str)):
             break
-        body = _Walk(document)._resolve(body["$ref"])  # noqa: SLF001
-    return body if isinstance(body, Mapping) else None
+        walk = _Walk(document)
+        body = walk._resolve(body["$ref"])  # noqa: SLF001
+        if walk.cut:
+            return False
+    if isinstance(body, Mapping) and "$ref" in body:
+        return False
+    return body if isinstance(body, Mapping) else False
 
 
 def _segments(template: str) -> list[str]:
     return [part for part in template.split("/") if part != ""]
 
 
+_PARAMETER = re.compile(r"\{[^{}/]*\}")
+
+
 @functools.lru_cache(maxsize=16384)
-def _segment_pattern(pattern: str) -> re.Pattern[str]:
-    return re.compile(pattern)
-
-
-def _segment_regex(segment: str) -> str | None:
-    """A template segment as a regex, or None for a plain literal."""
+def _segment_tokens(segment: str) -> tuple[tuple[int, str], ...] | None:
+    """A template segment as (parameters before it, literal) pairs, the last
+    literal possibly empty; None for a plain literal segment. `{a}.{b}.json`
+    is ((1, "."), (1, ".json")); `{id}` is ((1, ""),)."""
     if "{" not in segment:
         return None
-    out, pos = [], 0
-    for found in re.finditer(r"\{[^{}/]*\}", segment):
-        out.append(re.escape(segment[pos:found.start()]))
-        out.append("[^/]+")
+    tokens: list[tuple[int, str]] = []
+    params, pos = 0, 0
+    for found in _PARAMETER.finditer(segment):
+        literal = segment[pos:found.start()]
+        if literal:
+            tokens.append((params, literal))
+            params = 0
+        params += 1
         pos = found.end()
-    out.append(re.escape(segment[pos:]))
-    return "".join(out)
+    tokens.append((params, segment[pos:]))
+    return tuple(tokens)
+
+
+def _segment_matches(tokens: tuple[tuple[int, str], ...], value: str) -> bool:
+    """Whether a path segment fits a template segment, each parameter taking
+    at least one character. Linear in the segment's length per literal, with
+    no backtracking: each literal is taken at its leftmost place that leaves
+    room for the parameters before it, which leaves the most room for the
+    rest, and the last literal must end the segment."""
+    pos = 0
+    for index, (params, literal) in enumerate(tokens):
+        last = index == len(tokens) - 1
+        if last:
+            if not value.endswith(literal):
+                return False
+            return len(value) - len(literal) - pos >= params
+        found = value.find(literal, pos + params)
+        if found < 0 or (params == 0 and found != pos):
+            return False
+        pos = found + len(literal)
+    return True
 
 
 def _base_paths(document: Mapping[str, Any]) -> list[str]:
@@ -256,8 +296,10 @@ def parse_spec(raw: bytes) -> dict[str, Any]:
                 raise SpecImportError(f"more than {MAX_OPERATIONS} operations")
             media: dict[str, list[str]] = {}
             body = _request_body(document, operation)
-            content = body.get("content") if body is not None else None
-            if isinstance(content, Mapping):
+            content = body.get("content") if isinstance(body, Mapping) else None
+            if body is False:
+                media["*/*"] = [UNREADABLE_BODY]
+            elif isinstance(content, Mapping):
                 for media_type, entry in content.items():
                     if isinstance(media_type, str):
                         media[media_type.strip().lower()] = _media_reasons(document, media_type.strip().lower(), entry)
@@ -307,14 +349,14 @@ def _template_match(template: str, segments: list[str]) -> tuple[int, int, int] 
     prefix, literal, in_prefix = 0, 0, True
     last = len(parts) - 1
     for position, (part, value) in enumerate(zip(parts, segments)):
-        pattern = _segment_regex(part)
-        if pattern is None:
+        tokens = _segment_tokens(part)
+        if tokens is None:
             if part != value:
                 return None
             literal += 1
             prefix += 1 if in_prefix else 0
         else:
-            if not _segment_pattern(".+" if greedy and position == last else pattern).fullmatch(value):
+            if not (value if greedy and position == last else _segment_matches(tokens, value)):
                 return None
             in_prefix = False
     return (0 if greedy else 1, prefix, literal)
@@ -331,7 +373,10 @@ def match(index: Mapping[str, Any] | None, method: Any, path: Any) -> dict[str, 
     candidates = [path]
     for base in index.get("base_paths") or ():
         if path == base or path.startswith(base + "/"):
-            candidates.insert(0, path[len(base):] or "/")
+            candidates.append(path[len(base):] or "/")
+    # The best match over the path as sent and with each base path
+    # stripped; between equal matches, one with an upload mark (a spec can
+    # only tighten).
     best: tuple[Any, dict[str, Any]] | None = None
     for candidate in candidates:
         segments = _segments(candidate)
@@ -339,11 +384,12 @@ def match(index: Mapping[str, Any] | None, method: Any, path: Any) -> dict[str, 
             if operation.get("method") != method:
                 continue
             score = _template_match(str(operation.get("path")), segments)
-            if score is not None and (best is None or score > best[0]):
-                best = (score, operation)
-        if best is not None:
-            return best[1]
-    return None
+            if score is None:
+                continue
+            key = (score, any((operation.get("media") or {}).values()))
+            if best is None or key > best[0]:
+                best = (key, operation)
+    return best[1] if best is not None else None
 
 
 def operation_name(operation: Mapping[str, Any]) -> str:

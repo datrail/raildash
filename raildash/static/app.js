@@ -1604,9 +1604,6 @@ function renderOpenshellDenials(denials, held) {
   return section;
 }
 
-// The import: the file `openshell sandbox get <name> --policy-only` prints,
-// sent as it is. A file that isn't a policy is refused with what was wrong,
-// and the policy already held stays.
 // REST uploads M3: OpenAPI specs imported per host. A matched operation
 // whose request body carries files or content makes its requests uploads,
 // however small; any other leaves the body's shape to decide.
@@ -1678,6 +1675,9 @@ function renderApiSpecs(specs, refresh) {
   return section;
 }
 
+// The import: the file `openshell sandbox get <name> --policy-only` prints,
+// sent as it is. A file that isn't a policy is refused with what was wrong,
+// and the policy already held stays.
 function renderOpenshellImport(agentRef, held, refresh) {
   const wrap = el("span", "guardrail-action");
   const input = el("input");
@@ -2405,7 +2405,8 @@ async function loadGuardrails(focusKey = null) {
   let specs = [];
   try {
     const agents = await getJSONWithToken("/api/guardrails");
-    specs = (await getJSONWithToken("/api/api-specs")).specs || [];
+    // The specs list failing doesn't take the agents' cards down with it.
+    specs = await getJSONWithToken("/api/api-specs").then((found) => found.specs || [], () => []);
     // One agent's failure is shown in its card, not as the dashboard down.
     const settled = await Promise.allSettled(agents.map(
       (agent) => getJSONWithToken(`/api/guardrails/${encodeURIComponent(agent.agent_ref)}`)

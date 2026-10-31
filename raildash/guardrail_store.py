@@ -1653,7 +1653,10 @@ class GuardrailCustody:
     # ------------------------------------------------- API specs (M3)
 
     def _api_specs_stamp(self) -> tuple[Any, ...]:
-        return tuple(self._db.execute("SELECT count(*), max(imported_at), group_concat(sha256) FROM api_specs").fetchone())
+        return tuple(self._db.execute(
+            "SELECT count(*), max(imported_at), group_concat(host || ':' || sha256) "
+            "FROM (SELECT host, sha256, imported_at FROM api_specs ORDER BY host)"
+        ).fetchone())
 
     def _api_specs_locked(self) -> dict[str, dict[str, Any]]:
         """Every imported spec's index, by host. Kept parsed until a spec
@@ -1704,16 +1707,13 @@ class GuardrailCustody:
 
     def api_spec_list(self) -> list[dict[str, Any]]:
         with self._lock:
-            out = []
-            for row in self._db.execute("SELECT host, imported_at, index_json FROM api_specs ORDER BY host"):
-                try:
-                    index = json.loads(row["index_json"])
-                except ValueError:
-                    index = {}
-                current = isinstance(index, dict) and index.get("index_version") == api_specs.INDEX_VERSION
-                out.append({"host": row["host"], "imported_at": row["imported_at"], "current": current,
-                            **api_specs.summary(index if isinstance(index, dict) else {})})
-            return out
+            # The parsed indexes judging already keeps, not a parse per poll.
+            specs = self._api_specs_locked()
+            return [
+                {"host": row["host"], "imported_at": row["imported_at"], "current": row["host"] in specs,
+                 **api_specs.summary(specs.get(row["host"], {"sha256": row["sha256"]}))}
+                for row in self._db.execute("SELECT host, sha256, imported_at FROM api_specs ORDER BY host")
+            ]
 
     def remove_api_spec(self, host: str) -> dict[str, Any]:
         with self._write_transaction():
