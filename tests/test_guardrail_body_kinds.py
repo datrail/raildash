@@ -63,7 +63,20 @@ def hosts(found: dict) -> dict:
 
 @pytest.fixture(autouse=True)
 def body_kinds_on(monkeypatch):
-    monkeypatch.delenv(g.BODY_KINDS_ENV, raising=False)
+    monkeypatch.setenv(g.BODY_KINDS_ENV, "on")
+
+
+@pytest.mark.parametrize("value, on", [
+    (None, False), ("", False), ("on", True), ("ON", True), ("1", True), ("true", True),
+    ("off", False), ("0", False), ("false", False), ("no", False), ("maybe", False),
+])
+def test_body_kinds_are_off_until_the_drip_check_is_wired(monkeypatch, value, on):
+    if value is None:
+        monkeypatch.delenv(g.BODY_KINDS_ENV)
+    else:
+        monkeypatch.setenv(g.BODY_KINDS_ENV, value)
+    assert g.body_kinds_on() is on
+    assert bool(hosts(g.evaluate_request(guardrail(), rest(SEARCH, QUERY)))["uploads"]) is not on
 
 
 # ------------------------------------------------------------------ contract
@@ -102,6 +115,11 @@ def test_v4_is_written_exactly_when_uploads_has_a_body_kind_member():
      "does not match"),
     ("body_kind_overrides", [{"host": SEARCH, "method": "POST", "path": "/q", "kind": "read"}],
      "is not one of"),
+    ("body_kind_overrides", [{"host": SEARCH, "method": "POST", "path": "/v1/items/123", "kind": "parameters"}],
+     "did you mean '/v1/items/*'"),
+    ("body_kind_overrides", [{"host": SEARCH, "method": "POST", "path": "/q", "kind": "parameters"},
+                             {"host": SEARCH, "method": "POST", "path": "/q", "kind": "upload"}],
+     "a second answer for"),
     ("parameters_budget", {"agent": 1.5}, "is not of type 'integer'"),
     ("parameters_budget", {"agent": 1024.0}, "must be an integer"),
     ("parameters_budget", {"entries": {SEARCH: -1}}, "less than the minimum"),
@@ -200,6 +218,17 @@ def test_an_override_never_clears_a_hard_upload_or_model_traffic():
                                                        headers={"host": SEARCH, "content-type": "application/json"})))
     [row] = g.evaluate_request(guardrail(), model)["uploads"]
     assert not g.item_allowed(with_uploads(body_kind_overrides=[override("parameters", "/v1/messages")]), row)
+
+
+def test_a_capture_that_cant_be_read_is_never_cleared_by_an_override():
+    """Its hard signals couldn't be checked, so it is decided at step 1."""
+    unreadable = rest(SEARCH, upload_body(5 * 1024 * 1024))
+    unreadable["raw"] = "{" * 300 + "}" * 300
+    marked = with_uploads(body_kind_overrides=[override("parameters")])
+    [row] = g.evaluate_request(marked, unreadable)["uploads"]
+    assert row["detail"]["bodies"][0]["step"] == bk.STEP_HARD
+    assert row["detail"]["bodies"][0]["reasons"] == ["capture not readable"]
+    assert not g.item_allowed(marked, row)
 
 
 def test_a_row_from_before_body_kinds_reads_as_an_upload():

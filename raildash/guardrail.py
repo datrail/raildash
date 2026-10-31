@@ -8,7 +8,11 @@ the alignment contract and every locked baseline stay as they are. The design
 is railxia/docs `design/2026-10-07-data-guardrail/data-guardrail-design.md`;
 section numbers below are its. Later versions add optional rules: v2
 `data_actions` (DR-205) and v3 `egress_containment` (DR-207,
-`design/2026-10-11-egress-containment`).
+`design/2026-10-11-egress-containment`); v4 gives `uploads` three optional
+members that body kinds read (REST uploads, `design/2026-10-30-rest-uploads`,
+M2): with body kinds on, only a body `raildash.body_kinds` can't show to be
+`parameters` is judged against the upload hosts. They are off by default
+until the drip check is wired (`RAILDASH_BODY_KINDS=on` turns them on).
 
 Like `raildash.asp`, this module has no database, HTTP or UI dependency and
 never reads the clock: every time it needs is an argument. Storage and the
@@ -47,7 +51,9 @@ and the pieces they are built from: `validate_guardrail`, `asp_is_stale`,
 `is_multi_agent`, `normalize_host`, `host_matches`, `host_allowed`,
 `glob_matches`, `file_kind`, `kernel_interface_path`, `saved_file_allowed`,
 `listener_allowed`, `listener_item`, `normalize_mcp_server`,
-`tool_call_server`, `mcp_item`, `carries_body` and `requested_tool_calls`.
+`tool_call_server`, `mcp_item`, `carries_body`, `requested_tool_calls`, and
+for body kinds `body_kinds_on`, `upload_hosts`, `request_body_kind`,
+`body_counts` and `merge_row_bodies`.
 
 Every violation is a plain dict: `rule`, `item` (the §4.5 row key: a host,
 `(unknown host)`, a path, `protocol/addr/port`, a tool name, or
@@ -363,10 +369,19 @@ def _body_kind_problems(uploads: Mapping[str, Any]) -> list[str]:
     for host in uploads.get("parameters_only_hosts", []):
         if not _is_host_pattern(host):
             problems.append(f"rules.uploads.parameters_only_hosts: {host!r} is not a normalized host or *.host")
+    keys: set[tuple[str, str, str]] = set()
     for index, entry in enumerate(uploads.get("body_kind_overrides", [])):
         host = entry["host"]
         if host.startswith("*.") or not _is_host_pattern(host):
             problems.append(f"rules.uploads.body_kind_overrides.{index}.host: {host!r} is not a normalized exact host")
+        if _bk.path_template(entry["path"]) != entry["path"]:
+            # A literal path would never match a stored template.
+            problems.append(f"rules.uploads.body_kind_overrides.{index}.path: {entry['path']!r} is not a path "
+                            f"template (did you mean {_bk.path_template(entry['path'])!r}?)")
+        key = (host, entry["method"], entry["path"])
+        if key in keys:
+            problems.append(f"rules.uploads.body_kind_overrides.{index}: a second answer for {' '.join(key)}")
+        keys.add(key)
     budget = uploads.get("parameters_budget") or {}
     if "agent" in budget and type(budget["agent"]) is not int:
         problems.append("rules.uploads.parameters_budget.agent: must be an integer")
@@ -624,8 +639,12 @@ def carries_body(interaction: Mapping[str, Any]) -> bool:
 # REST uploads design §6 "Back-out": `off` restores "any body is an upload"
 # for the rule and the proposal, and reads `parameters_only_hosts` as upload
 # hosts, so a version proposed with the narrow seed doesn't turn Violated
-# on its own queries.
+# on its own queries. Off by default until the drip check (§3, G6) is wired
+# in the store: without it a parameters-sized drip would go unbounded.
 BODY_KINDS_ENV = "RAILDASH_BODY_KINDS"
+BODY_KINDS_DEFAULT = False
+_OFF_VALUES = frozenset({"off", "0", "false", "no", "disabled"})
+_ON_VALUES = frozenset({"on", "1", "true", "yes", "enabled"})
 # A stored `uploads` host row keeps each distinct body it was hit by, up to
 # this many; past it the row can no longer be cleared by an override.
 MAX_ROW_BODIES = 16
@@ -636,9 +655,15 @@ _ROW_BODY_KEYS = ("kind", "source", "step", "method", "path_template", "bytes", 
 
 
 def body_kinds_on() -> bool:
-    """Whether body kinds are read at all (`RAILDASH_BODY_KINDS=off` is
-    the design's back-out switch)."""
-    return os.environ.get(BODY_KINDS_ENV, "").strip().lower() != "off"
+    """Whether body kinds are read at all: `RAILDASH_BODY_KINDS=on` or
+    `off` (the design's back-out switch; `0`/`false`/`no` too), else
+    `BODY_KINDS_DEFAULT`."""
+    value = os.environ.get(BODY_KINDS_ENV, "").strip().lower()
+    if value in _OFF_VALUES:
+        return False
+    if value in _ON_VALUES:
+        return True
+    return BODY_KINDS_DEFAULT
 
 
 def upload_hosts(uploads: Mapping[str, Any]) -> list[str]:
@@ -657,7 +682,9 @@ def request_body_kind(
     keeps it: kind, source, step, method, path template, bytes and reasons.
     None when the request carries no body (`carries_body`). A row whose
     capture can't be read, or that the classifier can't finish, is
-    `unknown`, which the rule reads as an upload (§5 "Fail closed")."""
+    `unknown`, which the rule reads as an upload (§5 "Fail closed"), and is
+    marked as decided at step 1: no hard signal could be checked, so no
+    override may clear it."""
     if not carries_body(interaction):
         return None
     host = normalize_host(interaction.get("host"))
@@ -674,7 +701,7 @@ def request_body_kind(
         method = interaction.get("method")
     if result is None:
         result = {
-            "kind": _bk.UNKNOWN, "source": _bk.SOURCE_SHAPE, "step": _bk.STEP_OTHER,
+            "kind": _bk.UNKNOWN, "source": _bk.SOURCE_HARD, "step": _bk.STEP_HARD,
             "reasons": ["capture not readable"], "path_template": _bk.path_template(interaction.get("path")),
             "bytes": interaction.get("request_size") if type(interaction.get("request_size")) is int else None,
         }
@@ -1883,6 +1910,11 @@ def propose_guardrail(
     agent sent a body to) stays out when every endpoint covering it refuses
     a body; a body the agent sent there is listed as a would-be violation. The answer's `openshell` says what came
     from the policy, with its revision.
+
+    With body kinds on (REST uploads §3, G5), "a body" above means one
+    `request_body_kind` doesn't call `parameters`: a host the agent only
+    queried seeds `uploads.parameters_only_hosts` instead (never one the
+    imported policy refuses a body to), which makes the version a v4.
     """
     if is_multi_agent(bundle):
         return {"guardrail": None, "would_be_violations": [], "empty_because": {}, "reason": MULTI_AGENT}
