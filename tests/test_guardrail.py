@@ -1464,3 +1464,22 @@ def test_an_upload_row_counts_again_when_a_later_version_unlists_its_host():
     # A row stored without the flag reads its reasons as a body: fail closed.
     legacy = {**row, "detail": {k: v for k, v in row["detail"].items() if k != "carries_body"}}
     assert not g.item_allowed(unlisted, legacy)
+
+
+def test_the_parsers_load_without_the_store_or_sqlite():
+    """The guardrail and the parsers built on it have no database dependency
+    (DR-272), so Rail Center can reuse them: importing them must not load
+    `raildash.store` or `sqlite3`. A fresh interpreter, since this one has
+    already loaded both."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys\n"
+        "import raildash.guardrail, raildash.body_kinds, raildash.tool_schemas, raildash.tool_calls\n"
+        "loaded = sorted(m for m in ('raildash.store', 'raildash.guardrail_store',"
+        " 'raildash.data_actions_store', 'sqlite3') if m in sys.modules)\n"
+        "print(','.join(loaded))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.strip() == ""

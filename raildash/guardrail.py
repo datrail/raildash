@@ -150,10 +150,7 @@ from .json_safety import (
     JSONStructureTooComplex,
     check_json_structure,
 )
-# A module reference, read at call time: the store calls this module from
-# its ingest hooks (`raildash.guardrail_store`), so neither can import the
-# other's names while it is still loading.
-from . import store as _store
+from . import capture_rows as _rows
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schemas" / "guardrail-version-v1.schema.json"
 SCHEMA: dict[str, Any] = json.loads(SCHEMA_PATH.read_text())
@@ -479,7 +476,7 @@ def glob_matches(pattern: str, path: str) -> bool:
 
 def file_kind(path: str) -> str:
     """A path's kind, exactly the value `/api/profile`'s `file_types` uses."""
-    return _store.Store._file_type(path)
+    return _rows.file_type(path)
 
 
 def kernel_interface_path(path: str) -> bool:
@@ -608,8 +605,8 @@ def _exchange(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
     stored, or already parsed), or `None` when it can't be read."""
     raw = interaction.get("raw")
     if isinstance(raw, (str, bytes)):
-        raw = _store.Store._safe_raw(raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw)
-    if not isinstance(raw, dict) or raw == _store.UNSAFE_LEGACY_CAPTURE:
+        raw = _rows.safe_raw(raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw)
+    if not isinstance(raw, dict) or raw == _rows.UNSAFE_LEGACY_CAPTURE:
         return None
     exchange = legacy_exchange(raw)
     return exchange if isinstance(exchange, dict) else None
@@ -830,7 +827,7 @@ def _merged_drip(old: Any, new: Any) -> dict[str, Any] | None:
 
 def _stored_raw(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
     """A stored row's whole `raw` event, parsed without the 128-level depth
-    bound `Store._safe_raw` applies to the row as one document.
+    bound `capture_rows.safe_raw` applies to the row as one document.
 
     That bound is right for showing a row, but the request body inside it is
     the agent's own writing: an agent that nests it deeper than 128 levels
@@ -850,7 +847,7 @@ def _stored_raw(interaction: Mapping[str, Any]) -> dict[str, Any] | None:
             raw = json.loads(raw)
         except (JSONStructureTooComplex, ValueError, RecursionError):
             return None
-    if not isinstance(raw, dict) or raw == _store.UNSAFE_LEGACY_CAPTURE:
+    if not isinstance(raw, dict) or raw == _rows.UNSAFE_LEGACY_CAPTURE:
         return None
     return raw
 
@@ -1192,7 +1189,7 @@ def evaluate_request(
     `interaction` is a stored `interactions` row as stored, with `raw` the
     stored JSON text (`raildash.ingest.normalise` output, or the row read
     straight from the table): `host`, `request_size` and `raw` are read. A
-    `raw` already passed through `Store._safe_raw` may have been blanked by
+    `raw` already passed through `capture_rows.safe_raw` may have been blanked by
     a deep request body, which then reads as unreadable tool calls. The
     caller has already decided, with `request_owner`, that it belongs to
     this guardrail.

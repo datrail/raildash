@@ -55,6 +55,7 @@ from .asp import (
     parse_bundle,
     resolve_identity,
 )
+from .capture_rows import UNSAFE_LEGACY_CAPTURE, file_type, safe_raw
 from .guardrail_store import EVERY_AGENT, GUARDRAIL_SCHEMA, MARK_CHECK_FAILED, GuardrailCustody
 from . import tool_schemas as _tool_schemas
 from .data_actions_store import DATA_ACTIONS_SCHEMA, DataActionsStore, capture_ref
@@ -62,10 +63,6 @@ from .data_actions_store import DATA_ACTIONS_SCHEMA, DataActionsStore, capture_r
 CREDENTIAL_REDACTION_SCHEMA_VERSION = 1
 MIGRATION_BATCH_ROWS = 16
 MIGRATION_BATCH_BYTES = 8 * 1024 * 1024
-UNSAFE_LEGACY_CAPTURE = {
-    "redacted": True,
-    "reason": "legacy capture exceeded safe migration limits",
-}
 # Attribution states that name no agent (design doc §4.6): they go to the
 # unattributed queue and never count toward any one agent.
 UNATTRIBUTED_SQL = "('ambiguous', 'unknown', 'conflict')"
@@ -79,7 +76,6 @@ MAX_PROFILE_DIMENSION_VALUES = 100
 MAX_PROFILE_VALUE_CHARS = 256
 MAX_PROFILE_FILE_CALLS = 100_000
 MAX_PROFILE_CALL_ID_CHARS = 64
-MAX_FILE_TYPE_CHARS = 16
 # Tools whose input names a file, what they do to it, and which input keys
 # hold the path(s): Claude Code's built-ins and the MCP reference filesystem
 # server, whose tool names are matched under any MCP server name. A tool not
@@ -853,21 +849,9 @@ class Store(GuardrailCustody, DataActionsStore):
             f"PRAGMA user_version = {CREDENTIAL_REDACTION_SCHEMA_VERSION}"
         )
 
-    @staticmethod
-    def _safe_raw(raw: str, *, raw_event: bool = False) -> Any:
-        """Parse and redact one stored row without letting it break an API."""
-        try:
-            check_json_structure(raw)
-            parsed = json.loads(raw)
-            if not isinstance(parsed, dict):
-                return UNSAFE_LEGACY_CAPTURE
-            return (
-                redact_raw_event(parsed)
-                if raw_event
-                else redact_credential_headers(parsed)
-            )
-        except (JSONStructureTooComplex, ValueError, RecursionError):
-            return UNSAFE_LEGACY_CAPTURE
+    # Kept as Store methods for their callers here; the bodies are in
+    # `raildash.capture_rows`, which the guardrail imports without the store.
+    _safe_raw = staticmethod(safe_raw)
 
     def close(self) -> None:
         with self._lock:
@@ -2737,16 +2721,7 @@ class Store(GuardrailCustody, DataActionsStore):
                         return accesses
         return accesses
 
-    @staticmethod
-    def _file_type(path: str) -> str:
-        """A path's lower-cased extension, `(none)` without one."""
-        base = path.replace("\\", "/").rsplit("/", 1)[-1]
-        stem, dot, extension = base.rpartition(".")
-        if not dot or not stem or not extension:
-            return "(none)"
-        if len(extension) >= MAX_FILE_TYPE_CHARS:
-            return "(other)"
-        return "." + extension.lower()
+    _file_type = staticmethod(file_type)
 
     def _interaction_summary(self, row: sqlite3.Row) -> dict[str, Any]:
         summary = dict(row)
