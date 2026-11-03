@@ -2,7 +2,8 @@
 #
 # Publishing is driven by tags: `git tag v0.1.0 && git push --tags` produces
 # ghcr.io/<owner>/<repo>:0.1.0, :0.1, and :latest, multi-arch, with an SBOM and
-# a signed build-provenance attestation.
+# a signed build-provenance attestation, then a GitHub Release for the tag (a
+# pre-release whenever the tag is kept off :latest).
 #
 # Each repository owns its copy of this file: there is no shared workflow repo
 # and nothing here is consumed by `workflow_call` from elsewhere, so a component
@@ -129,6 +130,10 @@ jobs:
   publish:
     needs: [version, ci]
     runs-on: ubuntu-26.04
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
+      digest: ${{ steps.build.outputs.digest }}
+      attested: ${{ steps.attest.outcome == 'success' }}
     steps:
       # Submodules are off by default. GITHUB_TOKEN cannot read another
       # repository, so a recursive checkout fails on any repo that declares a
@@ -192,14 +197,15 @@ jobs:
           cache-to: type=gha,mode=max,scope=image
 
       # Signed, verifiable statement that this digest came from this workflow:
-      # `gh attestation verify oci://ghcr.io/<owner>/<repo>:<tag> --owner <org>`.
+      # `gh attestation verify oci://ghcr.io/<owner>/<repo>@<digest> --repo <owner>/<repo>`.
       #
       # GitHub only offers attestations on public repos or a paid org plan, and
       # every datrail repo is private until DR-25. The image is already pushed by
       # the time this runs, so a hard failure here would mark a successful
       # publish as failed; it warns instead, and starts working on its own once
       # the repos are flipped. Note this swallows every failure of the step, not
-      # only the plan one — the warning is the only signal either way.
+      # only the plan one — the warning, and the verify line missing from the
+      # Release notes, are the only signals either way.
       - id: attest
         continue-on-error: true
         uses: actions/attest-build-provenance@v4
@@ -230,4 +236,70 @@ jobs:
             echo '```'
             echo
             echo "digest: \`$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The Release is the page people read. Its own job: only it holds
+  # `contents: write` (the top-level `contents` stays read, and no third-party
+  # action runs with the write), and a failure once `publish` has succeeded
+  # re-runs just this.
+  release:
+    needs: [version, publish]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # The resolved tag, not `github.ref_name`: under workflow_dispatch the ref is a branch.
+          TAG: ${{ needs.version.outputs.tag }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          TAGS: ${{ needs.publish.outputs.tags }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+          ATTESTED: ${{ needs.publish.outputs.attested }}
+          PRERELEASE: ${{ needs.version.outputs.latest != 'true' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::publish gave no image digest ('$DIGEST'); refusing to write a Release."
+            exit 1
+          fi
+          {
+            echo "## Container image"
+            echo
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+            echo
+            echo "Digest: \`$DIGEST\`"
+            echo
+            echo '```sh'
+            echo "docker pull $IMAGE@$DIGEST"
+            # The attest step warns instead of failing, so a page only names a verification that exists.
+            if [[ "$ATTESTED" == "true" ]]; then
+              echo "gh attestation verify oci://$IMAGE@$DIGEST --repo $GH_REPO"
+            fi
+            echo '```'
+            echo
+            gh api -X POST "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" --jq .body
+          } > notes.md
+          # Pre-release exactly when the tag is kept off :latest; `--verify-tag` never invents a tag.
+          flags=(--title "$TAG" --notes-file notes.md "--prerelease=$PRERELEASE" --verify-tag)
+          if author=$(gh release view "$TAG" --json author --jq .author.login 2> /dev/null); then
+            if [[ "$author" == "github-actions[bot]" ]]; then
+              # Rewrites a Release made with GITHUB_TOKEN; `--draft=false` since a tag deleted and pushed again leaves a draft.
+              url=$(gh release edit "$TAG" --draft=false "${flags[@]}")
+            else
+              # Made by anyone else, a person or another app: left as it is.
+              echo "::notice::Release $TAG was created by $author and is left as it is."
+              url=$(gh release view "$TAG" --json url --jq .url)
+            fi
+          else
+            url=$(gh release create "$TAG" "${flags[@]}")
+          fi
+          {
+            echo "### Release"
+            echo
+            echo "$url"
           } >> "$GITHUB_STEP_SUMMARY"
