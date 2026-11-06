@@ -301,7 +301,7 @@ def test_a_v2_collection_locks_over_http_and_drift_is_scoped_to_one_agent(client
     ).json()
     assert client.get(f"/api/asps/{gone['asp_id']}/state").json()["state"] == "DRIFT_DETECTED"
     redacted = client.get(f"/api/asps/{gone['asp_id']}/drift").json()
-    assert redacted["drift_contract_version"] == 2
+    assert redacted["drift_contract_version"] == 4
     assert {c["agent_key"] for c in redacted["changes"]} == {"executor"}
     explained = client.get(
         f"/api/asps/{gone['asp_id']}/drift/explained", headers=auth()

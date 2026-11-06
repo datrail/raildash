@@ -188,9 +188,9 @@ def test_a_v2_baseline_locks_and_a_vanished_agent_is_drift(tmp_path):
 
     replay = store.load_asp(_v2_variant(bundle_id="bnd-custody-v2-replay", mutate=lambda v: None))
     replay_drift = store.drift_page(replay["asp_id"])
-    _validate_drift(replay_drift, 2)
+    _validate_drift(replay_drift, 4)
     assert store.asp_state(replay["asp_id"])["state"] == "ALIGNED"
-    assert replay_drift["drift_contract_version"] == 2
+    assert replay_drift["drift_contract_version"] == 4
 
     def vanish(value: dict) -> None:
         agent = value["agents"][0]
@@ -200,7 +200,7 @@ def test_a_v2_baseline_locks_and_a_vanished_agent_is_drift(tmp_path):
     gone = store.load_asp(_v2_variant(bundle_id="bnd-custody-v2-gone", mutate=vanish))
     assert store.asp_state(gone["asp_id"])["state"] == "DRIFT_DETECTED"
     drift = store.drift_page(gone["asp_id"])
-    _validate_drift(drift, 2)
+    _validate_drift(drift, 4)
     assert drift["changes"][0] == {
         "agent_key": "executor",
         "type": "AGENT_CHANGED",
@@ -236,7 +236,7 @@ def test_a_v2_drift_names_the_scope_it_happened_in(tmp_path):
         _v2_variant(bundle_id="bnd-custody-v2-scope-2", mutate=add_sibling_and_change_mounts)
     )
     drift = store.drift_page(current["asp_id"])
-    _validate_drift(drift, 2)
+    _validate_drift(drift, 4)
     assert [(c["agent_key"], c["type"], c["name"]) for c in drift["changes"]] == [
         (None, "ATTRIBUTE_CHANGED", "mounts"),
         ("planner", "AGENT_ADDED", "planner"),
@@ -282,7 +282,7 @@ def test_a_v2_bundle_against_a_v1_baseline_is_not_comparable(tmp_path):
     current = store.load_asp(v2_bundle(bundle_id="bnd-custody-v2-mixed"))
     assert current["agent_identity"] == baseline["agent_identity"]
     drift = store.drift_page(current["asp_id"])
-    _validate_drift(drift, 1)  # the baseline's contract decides the version
+    _validate_drift(drift, 3)  # the baseline's contract decides the version
     assert drift["comparable"] is False
     assert drift["reason"] == "CONTRACT_MISMATCH"
     store.close()
