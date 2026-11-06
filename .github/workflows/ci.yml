@@ -51,7 +51,8 @@ jobs:
       # RailDash has not re-vendored is exactly the break to surface here.
       # Sparse, so pytest never sees RailMon's own tests. `tools/scan` is for
       # the composer's WINDOW_LISTS, which v1 comparisons read (DR-217); the
-      # test parses it and never imports it.
+      # test parses it and never imports it. `python/asp_spelling` is the
+      # spelling module RailDash vendors byte for byte (DR-242).
       - uses: actions/checkout@v7
         with:
           repository: datrail/railmon
@@ -59,6 +60,7 @@ jobs:
           sparse-checkout: |
             schemas
             tools/scan
+            python/asp_spelling
           persist-credentials: false
 
       # `make test` builds its own virtualenv and installs requirements-dev,

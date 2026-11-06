@@ -10,6 +10,7 @@ import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 
+from raildash.asp_spelling import SPELLING_VERSION
 from raildash.asp import (
     DEFAULT_DRIFT_PAGE_SIZE,
     DEPLOYMENT_KEYS,
@@ -343,9 +344,10 @@ def test_exact_replay_is_aligned_after_copy_identity_fields_change():
         "sandbox_name": "fixture-agent-2",
     }
     result = compare_alignment(alignment(), BASELINE_RAW, raw(current))
-    validate("drift-result-v1.schema.json", result)
+    validate("drift-result-v3.schema.json", result)
     assert result == {
-        "drift_contract_version": 1,
+        "drift_contract_version": 3,
+        "spelling_version": SPELLING_VERSION,
         "comparable": True,
         "has_drift": False,
         "reason": None,
@@ -498,6 +500,8 @@ def test_alignment_contract_and_output_schemas_are_closed_and_versioned():
         "active-binding-v1.schema.json",
         "alignment-version-v1.schema.json",
         "drift-result-v1.schema.json",
+        "drift-result-v3.schema.json",
+        "drift-result-v4.schema.json",
         "evidence-bundle-v1.schema.json",
     ):
         schema = json.loads((SCHEMAS / name).read_text(encoding="utf-8"))
@@ -525,7 +529,7 @@ def test_result_detail_is_bounded_without_losing_total_count():
     assert result["change_count"] == MAX_DRIFT_CHANGES + 1
     assert len(result["changes"]) == MAX_DRIFT_CHANGES
     assert result["truncated"] is True
-    validate("drift-result-v1.schema.json", result)
+    validate("drift-result-v3.schema.json", result)
 
 
 def test_measured_bundle_headroom_and_request_bound_are_explicit():
@@ -569,7 +573,7 @@ def test_result_has_serialized_byte_bound_and_shared_pagination_limits():
     assert result["truncated"] is True
     assert len(wire) <= MAX_DRIFT_RESULT_BYTES
     assert (DEFAULT_DRIFT_PAGE_SIZE, MAX_DRIFT_PAGE_SIZE) == (100, 500)
-    validate("drift-result-v1.schema.json", result)
+    validate("drift-result-v3.schema.json", result)
 
 
 SANDBOX_ATTRIBUTE_NAMES = ("container_identity", "image_digest", "mounts", "deployment")
@@ -716,8 +720,8 @@ def test_a_v2_alignment_compares_scope_by_scope_under_contract_v2():
     assert active["agent_identity"] == {"kind": "local_agent_keys", "value": ["executor", "planner"]}
 
     same = compare_alignment(active, baseline_raw, baseline_raw)
-    validate("drift-result-v2.schema.json", same)
-    assert same["drift_contract_version"] == 2
+    validate("drift-result-v4.schema.json", same)
+    assert same["drift_contract_version"] == 4
     assert same["has_drift"] is False
 
     current = _keys_only_v2("executor", "planner")
@@ -725,7 +729,7 @@ def test_a_v2_alignment_compares_scope_by_scope_under_contract_v2():
     current["agents"][1]["discovery_status"] = "not_found"
     current["agents"][1]["attributes"].pop("tool_names")
     result = compare_alignment(active, baseline_raw, raw(current))
-    validate("drift-result-v2.schema.json", result)
+    validate("drift-result-v4.schema.json", result)
     assert result["changes"] == [
         {"agent_key": "planner", "type": "AGENT_CHANGED", "name": "planner", "fields": ["discovery_status"]},
         {"agent_key": "planner", "type": "ATTRIBUTE_REMOVED", "name": "tool_names", "fields": []},
@@ -740,14 +744,15 @@ def test_a_changed_agent_key_set_is_a_different_identity_not_drift():
     result = compare_alignment(
         alignment(baseline_raw), baseline_raw, raw(_keys_only_v2("executor"))
     )
-    validate("drift-result-v2.schema.json", result)
+    validate("drift-result-v4.schema.json", result)
     assert result["reason"] == "IDENTITY_MISMATCH"
 
 
-def test_a_v1_comparison_still_emits_contract_v1_exactly():
+def test_a_v1_comparison_emits_contract_v3_with_its_spelling_version():
     result = compare_alignment(alignment(), BASELINE_RAW, BASELINE_RAW)
-    validate("drift-result-v1.schema.json", result)
-    assert result["drift_contract_version"] == 1
+    validate("drift-result-v3.schema.json", result)
+    assert result["drift_contract_version"] == 3
+    assert result["spelling_version"] == SPELLING_VERSION
 
 
 @pytest.mark.parametrize(
@@ -773,9 +778,8 @@ def test_a_v2_alignment_and_its_binding_pass_the_published_schemas(keys):
             "switched_at": "2026-09-24T00:02:00Z",
         },
     )
-    Draft202012Validator.check_schema(
-        json.loads((SCHEMAS / "drift-result-v2.schema.json").read_text(encoding="utf-8"))
-    )
+    for name in ("drift-result-v2.schema.json", "drift-result-v4.schema.json"):
+        Draft202012Validator.check_schema(json.loads((SCHEMAS / name).read_text(encoding="utf-8")))
 
 
 def test_a_v2_agent_key_with_a_trailing_newline_is_refused():
@@ -830,8 +834,8 @@ def _window_drift(baseline: dict, current: dict) -> list:
     current = copy.deepcopy(current)
     current["bundle_id"] = "bnd-fixture-v2-next"
     result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
-    validate("drift-result-v2.schema.json", result)
-    assert result["drift_contract_version"] == 2
+    validate("drift-result-v4.schema.json", result)
+    assert result["drift_contract_version"] == 4
     assert result["comparable"] is True, result["reason"]
     return [(change["agent_key"], change["type"], change["name"], change["fields"])
             for change in result["changes"]]
@@ -1099,7 +1103,7 @@ def _v1_window_drift(baseline: dict, current: dict) -> list:
     current = copy.deepcopy(current)
     current["bundle_id"] = "bnd-fixture-next"
     result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
-    validate("drift-result-v1.schema.json", result)
+    validate("drift-result-v3.schema.json", result)
     assert result["comparable"] is True, result["reason"]
     return [(change["type"], change["name"], change["fields"]) for change in result["changes"]]
 
@@ -1232,3 +1236,158 @@ def test_a_v2_dynamic_value_is_never_drift_and_a_static_one_still_is():
     assert _window_drift(baseline, current) == [
         ("executor", "ATTRIBUTE_CHANGED", "tool_names", ["value"]),
     ]
+
+
+# ── DR-242: values are compared in their one spelling ─────────────────────────
+
+
+def _answered(value: object) -> dict:
+    return {
+        "authored_by": "platform",
+        "method": "docker inspect",
+        "note": "a spelled value",
+        "status": "ANSWERED",
+        "tier": "declared",
+        "value": value,
+    }
+
+
+_MOUNTS = [
+    {"source": "/data/exports", "target": "/data", "mode": "ro"},
+    {"source": "/srv/cache", "target": "/cache", "mode": "rw"},
+]
+
+# One reading spelled two ways, and in two orders: the baseline as RailMon
+# might send it once, then as another runtime or a re-scan writes it.
+_ONE_READING = {
+    "user": ("root", "0"),
+    "mounts": (
+        _MOUNTS,
+        [
+            {"source": "/srv/cache/", "target": "/cache", "mode": "read-write"},
+            {"source": "/data//exports", "target": "/data/", "mode": "read-only"},
+        ],
+    ),
+    "inference_endpoint": ("https://api.example.com/v1", "HTTPS://API.example.com:443/v1"),
+    "permissions": (
+        {"privileged": False, "cap_add": ["CAP_NET_ADMIN", "CAP_SYS_PTRACE"]},
+        {"privileged": False, "cap_add": ["sys_ptrace", "NET_ADMIN"]},
+    ),
+    "framework_identity": ({"node": "24.20.0"}, {"node": "v24.20.0"}),
+}
+
+
+def _spelled(side: int) -> dict:
+    value = bundle()
+    for name, readings in _ONE_READING.items():
+        value["attributes"][name] = _answered(readings[side])
+    return value
+
+
+def test_a_bundle_that_differs_only_in_spelling_and_order_is_not_drift():
+    """The design's acceptance: a locked baseline, and a bundle whose every
+    difference is a spelling or an order, report no change."""
+    baseline_raw = raw(_spelled(0))
+    current = _spelled(1)
+    assert all(
+        current["attributes"][name] != parse_bundle(baseline_raw)["attributes"][name]
+        for name in _ONE_READING
+    ), "every case must differ as sent"
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
+    validate("drift-result-v3.schema.json", result)
+    assert (result["has_drift"], result["changes"]) == (False, [])
+
+
+def test_a_v2_scope_that_differs_only_in_spelling_and_order_is_not_drift():
+    def v2(side: int) -> dict:
+        value = _v2_bundle()
+        for name, readings in _ONE_READING.items():
+            value["agents"][0]["attributes"][name] = _answered(readings[side])
+        return value
+
+    baseline_raw = raw(v2(0))
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(v2(1)))
+    validate("drift-result-v4.schema.json", result)
+    assert result["spelling_version"] == SPELLING_VERSION
+    assert (result["has_drift"], result["changes"]) == (False, [])
+
+
+@pytest.mark.parametrize(
+    ("name", "one", "other"),
+    [
+        ("user", "root", "ROOT"),  # Linux reads ROOT as an account of its own
+        ("user", "root", "0:0"),  # only one names its group
+        ("inference_endpoint", "https://api.example.com/v1", "https://api.example.com/v1/"),
+        ("mounts", _MOUNTS[:1], [{**_MOUNTS[0], "mode": "rw"}]),
+    ],
+)
+def test_two_values_that_are_only_alike_are_still_drift(name, one, other):
+    baseline = bundle()
+    baseline["attributes"][name] = _answered(one)
+    current = bundle()
+    current["attributes"][name] = _answered(other)
+    baseline_raw = raw(baseline)
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
+    assert result["changes"] == [{"type": "ATTRIBUTE_CHANGED", "name": name, "fields": ["value"]}]
+
+
+def test_a_value_that_is_not_a_reading_is_compared_as_sent():
+    """Only an ANSWERED or PARTIAL value is respelled: a TEMPLATED one is not
+    yet the value it will be."""
+    def templated(value: str) -> dict:
+        changed = bundle()
+        changed["attributes"]["user"] = {**_answered(value), "status": "TEMPLATED", "authored_by": "none"}
+        return changed
+
+    baseline_raw = raw(templated("root"))
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(templated("0")))
+    assert result["changes"] == [{"type": "ATTRIBUTE_CHANGED", "name": "user", "fields": ["value"]}]
+
+
+def test_values_are_compared_as_canonical_json_not_python_equality():
+    """`1 == True` in Python; as JSON they are two readings."""
+    baseline = bundle()
+    baseline["attributes"]["system_prompt_present"] = _answered(1)
+    current = bundle()
+    current["attributes"]["system_prompt_present"] = _answered(True)
+    assert bundle_problems(baseline) == [] and bundle_problems(current) == []
+    baseline_raw = raw(baseline)
+    result = compare_alignment(alignment(baseline_raw), baseline_raw, raw(current))
+    assert result["changes"] == [
+        {"type": "ATTRIBUTE_CHANGED", "name": "system_prompt_present", "fields": ["value"]}
+    ]
+
+
+def test_the_bundle_keeps_the_spelling_it_was_sent_in():
+    """Respelling is the comparison's: the stored evidence is what RailMon sent."""
+    sent = _spelled(1)
+    assert parse_bundle(raw(sent))["attributes"]["user"]["value"] == "0"
+
+
+def _railmon_spelling() -> Path | None:
+    """RailMon's `python/asp_spelling/asp_spelling.py`, found as its schemas are."""
+    schemas_dir = os.environ.get("RAILMON_SCHEMAS_DIR")
+    if schemas_dir:
+        path = Path(schemas_dir).parent / "python" / "asp_spelling" / "asp_spelling.py"
+        return path if path.is_file() else None
+    schema = _railmon_schema("evidence-bundle-v1.schema.json")
+    if schema is None:
+        return None
+    path = schema.parents[1] / "python" / "asp_spelling" / "asp_spelling.py"
+    return path if path.is_file() else None
+
+
+def test_vendored_spelling_is_byte_for_byte_identical_to_railmon():
+    """Rail Center installs the same file from RailMon, so a copy that drifted
+    would read one agent two ways."""
+    railmon_copy = _railmon_spelling()
+    if railmon_copy is None:
+        message = "no RailMon python/asp_spelling/asp_spelling.py found -- can't check it for drift"
+        if _running_in_ci():
+            pytest.fail(message + "; CI must check RailMon's python/asp_spelling out")
+        pytest.skip(message)
+    vendored = Path(__file__).parents[1] / "raildash" / "asp_spelling.py"
+    assert vendored.read_bytes() == railmon_copy.read_bytes(), (
+        f"raildash/asp_spelling.py has drifted from RailMon's copy ({railmon_copy}) -- "
+        "re-vendor it byte-for-byte"
+    )

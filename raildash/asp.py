@@ -17,6 +17,7 @@ from typing import Any, Iterable
 
 from jsonschema import Draft202012Validator, FormatChecker
 
+from .asp_spelling import SPELLING_VERSION, canonical, respelled, sorted_lists
 from .json_safety import check_json_structure
 
 # The published v1 and v2 schemas, vendored byte-for-byte from the pinned
@@ -72,6 +73,17 @@ DRIFT_CONTRACT_VERSION = 1
 # change carries (null for the shared sandbox scope) and the AGENT_* changes.
 # DR-169's window lists change when `value` counts as changed, not the shape.
 DRIFT_CONTRACT_VERSION_V2 = 2
+# DR-242: values are compared in their one spelling (`asp_spelling`, vendored
+# byte-for-byte from RailMon, the module Rail Center reads ASP values with
+# too), with every list in one order and by canonical JSON. A result computed
+# that way names the spelling it used, so v3 is v1 and v4 is v2, each with
+# `spelling_version`. Comparisons now emit v3 or v4; stored v1 and v2 results
+# stay readable as they are.
+DRIFT_CONTRACT_VERSION_V3 = 3
+DRIFT_CONTRACT_VERSION_V4 = 4
+# The statuses whose value is a reading, and so respelled (`asp_spelling`):
+# a TEMPLATED value is not yet the value it will be.
+SPELLED_STATUSES = frozenset({"ANSWERED", "PARTIAL"})
 # The shipped redacted RailMon sample is about 5 KiB.  The contract suite's
 # valid 1,000-attribute high-cardinality bundle is about 432 KiB, so 1 MiB gives
 # it more than 2x headroom while avoiding the webhook's much larger interaction
@@ -532,7 +544,7 @@ def compare_alignment(
     if problems:
         raise ValueError("invalid alignment version: " + "; ".join(problems[:5]))
     is_v2 = alignment["contract"]["bundle_version"] == BUNDLE_VERSION_V2
-    contract_version = DRIFT_CONTRACT_VERSION_V2 if is_v2 else DRIFT_CONTRACT_VERSION
+    contract_version = DRIFT_CONTRACT_VERSION_V4 if is_v2 else DRIFT_CONTRACT_VERSION_V3
 
     def not_comparable(reason: str) -> dict[str, Any]:
         return _not_comparable(reason, contract_version)
@@ -577,6 +589,7 @@ def compare_alignment(
     total = len(changes)
     result = {
         "drift_contract_version": contract_version,
+        "spelling_version": SPELLING_VERSION,
         "comparable": True,
         "has_drift": bool(changes),
         "reason": None,
@@ -605,6 +618,7 @@ def _not_comparable(reason: str, contract_version: int) -> dict[str, Any]:
         raise ValueError(f"unknown non-comparable reason: {reason}")
     return {
         "drift_contract_version": contract_version,
+        "spelling_version": SPELLING_VERSION,
         "comparable": False,
         "has_drift": None,
         "reason": reason,
@@ -735,10 +749,30 @@ V1_WINDOW_LISTS: dict[str, dict[str, list[str]]] = {
 }
 
 
+def _spelled_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
+    """Each attribute with its value in its one spelling and its lists in
+    one order (DR-242): `root` and `0` are one user, and the same mounts
+    listed in another order are the same mounts.
+
+    Only an ANSWERED or PARTIAL value is respelled; every value is sorted,
+    as Rail Center does. A copy: the bundle keeps the spelling it was sent
+    in, which is the evidence drift-explained shows.
+    """
+    spelled: dict[str, Any] = {}
+    for name, attribute in attributes.items():
+        if isinstance(attribute, dict) and "value" in attribute:
+            value = attribute["value"]
+            if attribute.get("status") in SPELLED_STATUSES:
+                value = respelled(name, value)
+            attribute = {**attribute, "value": sorted_lists(value)}
+        spelled[name] = attribute
+    return spelled
+
+
 def _comparison_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     # A copy-specific value is never drift; its evidence qualifiers still are
     # (DR-118), so a probe that stops answering is reported.
-    projected = dict(attributes)
+    projected = _spelled_attributes(attributes)
     for name in ("container_identity", *sorted(DYNAMIC_ATTRIBUTES)):
         attribute = projected.get(name)
         if isinstance(attribute, dict):
@@ -959,7 +993,7 @@ def _window_value_drift(before: Any, after: Any, window: dict[str, Any]) -> bool
     before = [] if before is None else before
     after = [] if after is None else after
     if not isinstance(before, list) or not isinstance(after, list):
-        return before != after
+        return canonical(before) != canonical(after)
     ignore = set(window.get("ignore", ()))
     union = set(window.get("union", ()))
 
@@ -1000,12 +1034,14 @@ def _map_changes(
     for name in sorted(baseline_names & current_names):
         before = baseline[name]
         after = current[name]
-        if before == after:
+        # By canonical JSON, not `==`, which reads `1` and `true` as one value.
+        if canonical(before) == canonical(after):
             continue
         fields = [
             field
             for field in field_order
-            if field not in ignored_fields and before.get(field) != after.get(field)
+            if field not in ignored_fields
+            and canonical(before.get(field)) != canonical(after.get(field))
         ]
         changes.append({"type": f"{prefix}_CHANGED", "name": name, "fields": fields})
     return changes

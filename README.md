@@ -561,7 +561,7 @@ acknowledged row is kept after its last hit.
 RailMon run with `--target-manifest` delivers one evidence-bundle v2
 collection per scan: a shared sandbox scope plus one scope per declared
 agent. It locks, switches and drifts exactly like a v1 bundle. Its drift
-results use `drift_contract_version: 2`, where every change carries an
+results use `drift_contract_version: 4`, where every change carries an
 `agent_key`: `null` for the sandbox scope and attestations, otherwise the
 agent the change happened in. Three change types are new:
 
@@ -583,7 +583,7 @@ reading's declaration is used, else the baseline's, so a baseline locked
 before RailMon emitted it compares the same way. Status and the other
 qualifiers are still compared exactly, and a v2 reading without a window on
 either side is compared exactly as before. The emitted shape is unchanged,
-so this stays `drift_contract_version: 2`.
+so this needs no contract version of its own.
 
 A v1 bundle cannot declare a `window`, but a single RailMon scan writes v1
 with the same window lists. So a v1 comparison reads the six lists RailMon
@@ -618,9 +618,31 @@ RailMon a key (`RAIL_AGENT_KEY` or `--agent-key`), and lock a new baseline
 from the keyed ASPs.
 
 A v1 bundle compared with a v2 baseline (or the reverse) is
-`CONTRACT_MISMATCH`. v1 comparisons still emit contract v1 unchanged.
-Schemas: `raildash/schemas/drift-result-v1.schema.json` and
-`drift-result-v2.schema.json`.
+`CONTRACT_MISMATCH`.
+
+### One spelling per value
+
+Two bundles are compared value by value in each value's one spelling, the
+same one Rail Center reads ASPs in: `root` and `0` are one user,
+`HTTPS://API.example.com:443/v1` and `https://api.example.com/v1` are one
+endpoint, `NET_ADMIN` and `CAP_NET_ADMIN` are one capability, and the same
+items in another order are the same list. So a re-scan, or another runtime,
+that writes an unchanged agent's values differently is not drift. Two values
+that only look alike are still two: `ROOT` is its own account, and a URL
+path keeps its case and trailing slash. Only `ANSWERED` and `PARTIAL` values
+are respelled. Every value's lists are sorted, and values are compared as
+canonical JSON, so `1` and `true` are two values.
+
+The spellings are RailMon's `asp_spelling` module, vendored byte for byte
+as `raildash/asp_spelling.py` (CI checks it against RailMon's copy). The
+stored bundle keeps every value as RailMon sent it, and drift-explained
+shows those values.
+
+A drift result names the spelling it was computed with: comparisons emit
+`drift_contract_version: 3` for a v1 bundle and `4` for a v2 collection.
+These are contracts v1 and v2 with `spelling_version` added. Results stored
+before that keep contract v1 or v2 and stay readable. Schemas:
+`raildash/schemas/drift-result-v{1,2,3,4}.schema.json`.
 
 The existing capture and `/api/profile` paths are unchanged. The pure
 validator/comparator and versioned JSON Schemas live under `raildash.asp`

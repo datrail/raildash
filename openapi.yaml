@@ -1216,7 +1216,8 @@ components:
       type: object
       required: [drift_contract_version, comparable, has_drift, reason, change_count, changes, truncated]
       properties:
-        drift_contract_version: {type: integer, enum: [1, 2]}
+        drift_contract_version: {type: integer, enum: [1, 2, 3, 4]}
+        spelling_version: {type: integer, minimum: 1, description: "asp_spelling's SPELLING_VERSION the values were compared in; absent from stored v1 and v2 results."}
         comparable: {type: boolean}
         has_drift: {type: [boolean, 'null']}
         reason:
