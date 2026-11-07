@@ -17,7 +17,8 @@ from typing import Any, Iterable
 
 from jsonschema import Draft202012Validator, FormatChecker
 
-from .asp_spelling import SPELLING_VERSION, canonical, respelled, sorted_lists
+from .asp_normalize import ScopeConflict, normalized, normalized_attribute
+from .asp_spelling import SPELLING_VERSION, canonical
 from .json_safety import check_json_structure
 
 # The published v1 and v2 schemas, vendored byte-for-byte from the pinned
@@ -81,9 +82,6 @@ DRIFT_CONTRACT_VERSION_V2 = 2
 # stay readable as they are.
 DRIFT_CONTRACT_VERSION_V3 = 3
 DRIFT_CONTRACT_VERSION_V4 = 4
-# The statuses whose value is a reading, and so respelled (`asp_spelling`):
-# a TEMPLATED value is not yet the value it will be.
-SPELLED_STATUSES = frozenset({"ANSWERED", "PARTIAL"})
 # The shipped redacted RailMon sample is about 5 KiB.  The contract suite's
 # valid 1,000-attribute high-cardinality bundle is about 432 KiB, so 1 MiB gives
 # it more than 2x headroom while avoiding the webhook's much larger interaction
@@ -221,11 +219,28 @@ def bundle_problems(bundle: Any) -> list[str]:
     if version == BUNDLE_VERSION:
         return _schema_problems(_VALIDATOR, bundle) + _semantic_problems(bundle)
     if version == BUNDLE_VERSION_V2:
-        return _schema_problems(_VALIDATOR_V2, bundle) + _semantic_problems_v2(bundle)
+        problems = _schema_problems(_VALIDATOR_V2, bundle) + _semantic_problems_v2(bundle)
+        return problems or _scope_conflict_problems(bundle)
     return [
         f"bundle_version: this RailDash only accepts evidence bundle v{BUNDLE_VERSION} "
         f"or v{BUNDLE_VERSION_V2}, got {version!r}"
     ]
+
+
+def _scope_conflict_problems(bundle: dict[str, Any]) -> list[str]:
+    """A v2 bundle whose sandbox scope and an agent scope give different
+    readings of one attribute (DR-225, `asp_normalize`), as Rail Center
+    refuses it. RailMon gives each attribute to one scope, so this is a
+    producer bug, and no rule for picking one reading is safe. Run only on a
+    bundle the schema and the other rules already admit."""
+    try:
+        normalized(bundle)
+    except ScopeConflict as conflict:
+        return [
+            f"agents.{agent_key}.attributes.{name}: the sandbox scope gives a different reading"
+            for agent_key, name in conflict.conflicts
+        ]
+    return []
 
 
 def _schema_problems(validator: Draft202012Validator, bundle: Any) -> list[str]:
@@ -754,19 +769,18 @@ def _spelled_attributes(attributes: dict[str, Any]) -> dict[str, Any]:
     one order (DR-242): `root` and `0` are one user, and the same mounts
     listed in another order are the same mounts.
 
-    Only an ANSWERED or PARTIAL value is respelled; every value is sorted,
-    as Rail Center does. A copy: the bundle keeps the spelling it was sent
-    in, which is the evidence drift-explained shows.
+    Each attribute as `asp_normalize.normalized_attribute` makes it, the
+    function Rail Center normalizes with (DR-225): only an ANSWERED or
+    PARTIAL value is respelled, every value is sorted, and a window's keys
+    are sorted. A copy: the bundle keeps the spelling it was sent in, which
+    is the evidence drift-explained shows.
     """
-    spelled: dict[str, Any] = {}
-    for name, attribute in attributes.items():
-        if isinstance(attribute, dict) and "value" in attribute:
-            value = attribute["value"]
-            if attribute.get("status") in SPELLED_STATUSES:
-                value = respelled(name, value)
-            attribute = {**attribute, "value": sorted_lists(value)}
-        spelled[name] = attribute
-    return spelled
+    return {
+        name: normalized_attribute(name, attribute)
+        if isinstance(attribute, dict) and "value" in attribute
+        else attribute
+        for name, attribute in attributes.items()
+    }
 
 
 def _comparison_attributes(attributes: dict[str, Any]) -> dict[str, Any]:

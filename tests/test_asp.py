@@ -1302,6 +1302,9 @@ def test_a_v2_scope_that_differs_only_in_spelling_and_order_is_not_drift():
     def v2(side: int) -> dict:
         value = _v2_bundle()
         for name, readings in _ONE_READING.items():
+            # RailMon gives each attribute to one scope, so the agent's reading
+            # replaces the sandbox's rather than standing beside it.
+            value["sandbox"]["attributes"].pop(name, None)
             value["agents"][0]["attributes"][name] = _answered(readings[side])
         return value
 
@@ -1358,36 +1361,57 @@ def test_values_are_compared_as_canonical_json_not_python_equality():
     ]
 
 
+def test_a_v2_bundle_whose_scopes_disagree_is_refused_as_rail_center_refuses_it():
+    """DR-225: RailMon gives each attribute to one scope, so two readings of it
+    are a producer bug, and no rule for picking one is safe."""
+    value = _v2_bundle()
+    value["sandbox"]["attributes"]["user"] = _answered("root")
+    value["agents"][0]["attributes"]["user"] = _answered("app")
+    assert bundle_problems(value) == [
+        "agents.executor.attributes.user: the sandbox scope gives a different reading"
+    ]
+    with pytest.raises(BundleValidationError):
+        parse_bundle(raw(value))
+
+
+def test_two_scopes_spelling_one_reading_two_ways_are_accepted():
+    value = _v2_bundle()
+    value["sandbox"]["attributes"]["user"] = _answered("root")
+    value["agents"][0]["attributes"]["user"] = _answered("0")
+    assert bundle_problems(value) == []
+
+
 def test_the_bundle_keeps_the_spelling_it_was_sent_in():
     """Respelling is the comparison's: the stored evidence is what RailMon sent."""
     sent = _spelled(1)
     assert parse_bundle(raw(sent))["attributes"]["user"]["value"] == "0"
 
 
-def _railmon_spelling() -> Path | None:
-    """RailMon's `python/asp_spelling/asp_spelling.py`, found as its schemas are."""
+def _railmon_spelling(module: str = "asp_spelling.py") -> Path | None:
+    """RailMon's `python/asp_spelling/<module>`, found as its schemas are."""
     schemas_dir = os.environ.get("RAILMON_SCHEMAS_DIR")
     if schemas_dir:
-        path = Path(schemas_dir).parent / "python" / "asp_spelling" / "asp_spelling.py"
+        path = Path(schemas_dir).parent / "python" / "asp_spelling" / module
         return path if path.is_file() else None
     schema = _railmon_schema("evidence-bundle-v1.schema.json")
     if schema is None:
         return None
-    path = schema.parents[1] / "python" / "asp_spelling" / "asp_spelling.py"
+    path = schema.parents[1] / "python" / "asp_spelling" / module
     return path if path.is_file() else None
 
 
-def test_vendored_spelling_is_byte_for_byte_identical_to_railmon():
-    """Rail Center installs the same file from RailMon, so a copy that drifted
+@pytest.mark.parametrize("module", ["asp_spelling.py", "asp_normalize.py"])
+def test_vendored_spelling_is_byte_for_byte_identical_to_railmon(module):
+    """Rail Center installs the same files from RailMon, so a copy that drifted
     would read one agent two ways."""
-    railmon_copy = _railmon_spelling()
+    railmon_copy = _railmon_spelling(module)
     if railmon_copy is None:
-        message = "no RailMon python/asp_spelling/asp_spelling.py found -- can't check it for drift"
+        message = f"no RailMon python/asp_spelling/{module} found -- can't check it for drift"
         if _running_in_ci():
             pytest.fail(message + "; CI must check RailMon's python/asp_spelling out")
         pytest.skip(message)
-    vendored = Path(__file__).parents[1] / "raildash" / "asp_spelling.py"
+    vendored = Path(__file__).parents[1] / "raildash" / module
     assert vendored.read_bytes() == railmon_copy.read_bytes(), (
-        f"raildash/asp_spelling.py has drifted from RailMon's copy ({railmon_copy}) -- "
+        f"raildash/{module} has drifted from RailMon's copy ({railmon_copy}) -- "
         "re-vendor it byte-for-byte"
     )
