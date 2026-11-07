@@ -633,10 +633,17 @@ path keeps its case and trailing slash. Only `ANSWERED` and `PARTIAL` values
 are respelled. Every value's lists are sorted, and values are compared as
 canonical JSON, so `1` and `true` are two values.
 
-The spellings are RailMon's `asp_spelling` module, vendored byte for byte
-as `raildash/asp_spelling.py` (CI checks it against RailMon's copy). The
-stored bundle keeps every value as RailMon sent it, and drift-explained
-shows those values.
+The spellings are RailMon's `asp_spelling` module, and each attribute is
+read through RailMon's `asp_normalize`, the normalization Rail Center reads
+bundles with too (which also sorts a `window`'s keys). Both are vendored byte
+for byte as `raildash/asp_spelling.py` and `raildash/asp_normalize.py`, and CI
+checks them against RailMon's copies. The stored bundle keeps every value as
+RailMon sent it, and drift-explained shows those values.
+
+A v2 bundle whose sandbox scope and an agent scope give different readings
+of one attribute is refused at intake, as Rail Center refuses it. RailMon
+gives each attribute to one scope, so such a bundle comes from a broken
+producer. Two scopes spelling one reading two ways are accepted.
 
 A drift result names the spelling it was computed with: comparisons emit
 `drift_contract_version: 3` for a v1 bundle and `4` for a v2 collection.
