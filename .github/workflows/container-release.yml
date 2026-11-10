@@ -3,7 +3,8 @@
 # Publishing is driven by tags: `git tag v0.1.0 && git push --tags` produces
 # ghcr.io/<owner>/<repo>:0.1.0, :0.1, and :latest, multi-arch, with an SBOM and
 # a signed build-provenance attestation, then a GitHub Release for the tag (a
-# pre-release whenever the tag is kept off :latest).
+# pre-release whenever the tag is kept off :latest) whose notes open with the
+# annotated tag's message.
 #
 # Each repository owns its copy of this file: there is no shared workflow repo
 # and nothing here is consumed by `workflow_call` from elsewhere, so a component
@@ -265,7 +266,21 @@ jobs:
             echo "::error::publish gave no image digest ('$DIGEST'); refusing to write a Release."
             exit 1
           fi
+          # The annotated tag's message says what the version changes; it opens the
+          # notes, before the image, since it is the paragraph a reader wants first.
+          # A lightweight tag has no message and the notes start at the image. A
+          # signature block, should a tag be signed, is not part of the message.
+          summary=""
+          ref=$(gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '"\(.object.type) \(.object.sha)"')
+          if [[ "$ref" == "tag "* ]]; then
+            summary=$(gh api "repos/$GH_REPO/git/tags/${ref#tag }" --jq .message \
+              | sed '/^-----BEGIN [A-Z ]*SIGNATURE-----$/,$d')
+          fi
           {
+            if [[ -n "${summary//[[:space:]]/}" ]]; then
+              printf '%s\n' "$summary"
+              echo
+            fi
             echo "## Container image"
             echo
             echo '```'
