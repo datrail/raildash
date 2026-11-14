@@ -966,6 +966,13 @@ def test_a_file_rewritten_under_a_new_uuid_is_not_newly_written():
     ("/var/log/app/logs-202610/a.log", None),
     ("/h/.cache-Ab12cd/x", None),                       # .cache itself doesn't fold
     ("/var/tmp/etilqs_abc\n", None),                    # Python's $ would take it
+    # A date in the file name (DR-299: OpenClaw's daily log), not in a directory.
+    ("/tmp/openclaw/openclaw-2026-11-14.log", "/tmp/openclaw/openclaw-*.log"),
+    ("/var/log/app/2026-11-14/a.log", None),
+    (f"/s/run-2026-11-14{_uuid(1)}.json", "/s/run-*.json"),   # one `*`, never `**`
+    ("/s/build-12026-11-14.log", None),                       # inside a longer number
+    ("/s/report-2026-13-01.txt", None),                       # no month 13
+    ("/s/v2026-11-145.txt", None),
 ])
 def test_generated_name_template(path, template):
     assert generated_name_template(path) == template
@@ -986,6 +993,21 @@ def test_a_real_agents_fresh_sqlite_and_mkdtemp_names_are_not_newly_written():
     for path in (f"{cache}/openclaw-sqlite-readonly-v2-QOnshQ/other.sqlite",
                  f"{cache}/elsewhere-QOnshQ/owner.sqlite",
                  "/var/tmp/exfil.tar"):
+        assert _window_drift(baseline, _windowed_v2([], [_file(path, write=True)])) == [
+            (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
+        ], path
+
+
+def test_a_daily_log_rolling_over_at_midnight_is_not_newly_written():
+    """DR-299 (datrail-project run 43530782675): OpenClaw writes
+    `/tmp/openclaw/openclaw-<date>.log`; a run crossing midnight UTC opened
+    the next day's file and read as DRIFT_DETECTED."""
+    baseline = _windowed_v2([], [_file("/tmp/openclaw/openclaw-2026-11-13.log", write=True)])
+    current = _windowed_v2([], [_file("/tmp/openclaw/openclaw-2026-11-13.log", write=True),
+                                _file("/tmp/openclaw/openclaw-2026-11-14.log", write=True)])
+    assert _window_drift(baseline, current) == []
+    # Another file next to it is still new.
+    for path in ("/tmp/openclaw/exfil-2026-11-14.tar", "/tmp/openclaw/notes.txt"):
         assert _window_drift(baseline, _windowed_v2([], [_file(path, write=True)])) == [
             (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
         ], path

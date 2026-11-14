@@ -504,9 +504,9 @@ def saved_file_allowed(path: str, entries: Iterable[Mapping[str, Any]]) -> bool:
 def saved_file_entry(path: str) -> dict[str, Any]:
     """The entry a proposal or **Allow this** makes for one written path:
     the path exactly, or, when it holds a name a run mints afresh, the path
-    with that part as `*` (`generated_name_template`: a uuid or a SQLite
-    temp file's random part in its file name, DR-229, or a mkdtemp
-    directory's suffix). An agent that writes `sessions.json.1.<uuid>.tmp`
+    with that part as `*` (`generated_name_template`: a uuid, an ISO date
+    (DR-299) or a SQLite temp file's random part in its file name, DR-229,
+    or a mkdtemp directory's suffix). An agent that writes `sessions.json.1.<uuid>.tmp`
     on every turn mints a new path each time, so an exact entry would be
     violated again on the next turn. A file name with fewer than three
     letters or digits before its first `*` stays exact: `<dir>/*`,

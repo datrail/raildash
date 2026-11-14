@@ -854,6 +854,14 @@ _UUIDS = re.compile(r"(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 #   `logs-202610` is a name someone chose. A chosen name of that shape
 #   below them (`~/.cache/pip-Wheel1`) folds too.
 # Both fold to `*` like a uuid, at the same price.
+# DR-299 (datrail-project run 43530782675): a calendar date in a file name,
+# as in OpenClaw's daily log `/tmp/openclaw/openclaw-2026-11-14.log`. At
+# midnight the agent writes a new name, so an unchanged agent read as
+# newly writing a file. An ISO date (`YYYY-MM-DD`, not inside a longer run
+# of digits) in the file name folds to `*` like a uuid, at the same price:
+# a new file named like one in the baseline but for its date is aligned. A
+# date in a directory name still counts.
+_DATES = re.compile(r"(?<![0-9])(?:19|20)[0-9]{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])(?![0-9])")
 _SQLITE_TEMP = re.compile(r"(?<=^etilqs_)[A-Za-z0-9]{1,16}\Z")
 _MKDTEMP = re.compile(r"(?P<prefix>[^/]*[._-])(?P<random>[A-Za-z0-9]{6})")
 _MKDTEMP_RANDOM = re.compile(r"[A-Z0-9]")
@@ -923,8 +931,8 @@ def mkdtemp_families(paths: Iterable[str]) -> frozenset[str]:
 
 
 def generated_name_template(path: str, families: frozenset[str] = frozenset()) -> str | None:
-    """`path` with the parts a run mints afresh made `*`: each run of uuids
-    and a SQLite temp file's random part in its file name, and a mkdtemp
+    """`path` with the parts a run mints afresh made `*`: each run of uuids,
+    each ISO date and a SQLite temp file's random part in its file name, and a mkdtemp
     directory's random suffix in its directories below a temp or cache
     directory (all lower case too, for a prefix in `families`,
     `mkdtemp_families`). None when there is none,
@@ -934,6 +942,8 @@ def generated_name_template(path: str, families: frozenset[str] = frozenset()) -
         return None
     directory, slash, name = path.rpartition("/")
     templated = _SQLITE_TEMP.sub("*", _UUIDS.sub("*", name))
+    # A date next to a uuid is still one `*`, never a `**` (above).
+    templated = re.sub(r"\*{2,}", "*", _DATES.sub("*", templated))
     if slash:
         parts = directory.split("/")
         in_temp = path.startswith(_MKDTEMP_ROOTS)

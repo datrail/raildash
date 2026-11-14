@@ -1018,13 +1018,16 @@ def test_allow_this_takes_a_sqlite_temp_file_and_a_mkdtemp_directory_as_globs():
         # A name ending in a uuid keeps DR-229's bare glob.
         ("/root/sessions.json.0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d", {"path": "/root/sessions.json.*"}),
         ("/root/abc-0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d", {"path": "/root/abc-*"}),
+        # A daily log (DR-299): tomorrow's file is the same entry.
+        ("/tmp/openclaw/openclaw-2026-11-13.log", {"path": "/tmp/openclaw/openclaw-*.log"}),
     ):
         row = {"rule": "saved_files", "item": path, "detail": {}}
         assert g.with_item_allowed(rules, row)["saved_files"]["allowed"][-1] == entry, path
         if "literal" not in entry:
             assert g.saved_file_allowed(path.replace("jRu2h7", "QOnshQ")
                                         .replace("155d7cc864b75a27", "e41fab04de771bb7")
-                                        .replace("0b1c2d3e", "11111111"), [entry]), path
+                                        .replace("0b1c2d3e", "11111111")
+                                        .replace("2026-11-13", "2026-11-14"), [entry]), path
     assert not g.saved_file_allowed("/var/tmp/etilqs_secrets.tar.gz",
                                     [{"path": "/var/tmp/etilqs_*", "kinds": ["(none)"]}])
     allowed = [{"path": f"{cache}/openclaw-sqlite-readonly-v2-*/owner.sqlite"}]
