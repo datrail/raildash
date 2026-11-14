@@ -8,7 +8,10 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
-Nothing yet.
+### Changed
+
+- An ISO date in a file name folds to `*` like a uuid, so a daily log rolling over at midnight (OpenClaw's `openclaw-<date>.log`) is not drift; a date in a directory name still counts, and the guardrail's saved-file entries fold the same way ([#129](https://github.com/datrail/raildash/pull/129)).
+- Vendors RailMon's rule-pack-15 v1 schema, which closes an MCP skill's `reachability`, `schema_omitted` and `tools_truncated`. A baseline locked on pack 14 reads `CONTRACT_MISMATCH` until it is re-locked ([#131](https://github.com/datrail/raildash/pull/131)).
 
 ## [v0.2.0-rc.17] - 2026-11-10
 
