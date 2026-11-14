@@ -26,7 +26,7 @@ Nothing yet.
 
 ### Changed
 
-- The README covers This is parameters, Narrow uploads and bytes by body kind ([#118](https://github.com/datrail/raildash/pull/118)).
+- The README covers the **This is** parameters, **Narrow uploads** and bytes by body kind ([#118](https://github.com/datrail/raildash/pull/118)).
 - The body-kind docstring says step 3 reads the imported spec ([#120](https://github.com/datrail/raildash/pull/120)).
 - The body-kind table test includes real OpenClaw captures ([#121](https://github.com/datrail/raildash/pull/121)).
 - The container release workflow creates the tag's GitHub Release ([#123](https://github.com/datrail/raildash/pull/123)).
