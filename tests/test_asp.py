@@ -973,6 +973,14 @@ def test_a_file_rewritten_under_a_new_uuid_is_not_newly_written():
     ("/s/build-12026-11-14.log", None),                       # inside a longer number
     ("/s/report-2026-13-01.txt", None),                       # no month 13
     ("/s/v2026-11-145.txt", None),
+    # An O_TMPFILE (DR-304: OpenClaw on Node 26): `#<inode> (deleted)`.
+    ("/var/tmp/#8083505 (deleted)", "/var/tmp/#* (deleted)"),
+    ("/home/node/work/#12 (deleted)", "/home/node/work/#* (deleted)"),
+    ("/var/tmp/notes.txt (deleted)", None),                   # a named file, deleted
+    ("/var/tmp/#8083505", None),
+    ("/var/tmp/#80a3505 (deleted)", None),
+    ("/var/tmp/x#8083505 (deleted)", None),
+    ("/var/tmp/#8083505 (deleted)\n", None),
 ])
 def test_generated_name_template(path, template):
     assert generated_name_template(path) == template
@@ -993,6 +1001,21 @@ def test_a_real_agents_fresh_sqlite_and_mkdtemp_names_are_not_newly_written():
     for path in (f"{cache}/openclaw-sqlite-readonly-v2-QOnshQ/other.sqlite",
                  f"{cache}/elsewhere-QOnshQ/owner.sqlite",
                  "/var/tmp/exfil.tar"):
+        assert _window_drift(baseline, _windowed_v2([], [_file(path, write=True)])) == [
+            (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
+        ], path
+
+
+def test_an_o_tmpfile_is_not_newly_written_under_a_new_inode():
+    """DR-304 (datrail-project run 43633933388): on Node 26, OpenClaw writes
+    anonymous temp files, which the kernel names `/var/tmp/#<inode>
+    (deleted)`, new inodes every run."""
+    baseline = _windowed_v2([], [_file("/var/tmp/#8083494 (deleted)", write=True)])
+    current = _windowed_v2([], [_file("/var/tmp/#8083505 (deleted)", write=True),
+                                _file("/var/tmp/#8083514 (deleted)", write=True)])
+    assert _window_drift(baseline, current) == []
+    # One in another directory, or a named file, is still new.
+    for path in ("/home/node/#8083505 (deleted)", "/var/tmp/exfil.tar (deleted)"):
         assert _window_drift(baseline, _windowed_v2([], [_file(path, write=True)])) == [
             (None, "ATTRIBUTE_CHANGED", "observed_file_access", ["value"]),
         ], path
