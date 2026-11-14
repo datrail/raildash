@@ -150,6 +150,32 @@
               }
             }
           ]
+        },
+        "skills_inventory": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/attribute"
+            },
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ANSWERED",
+                      "PARTIAL"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "$ref": "#/$defs/skills_inventory_value"
+                  }
+                }
+              }
+            }
+          ]
         }
       },
       "additionalProperties": {
@@ -562,6 +588,34 @@
         }
       },
       "$comment": "DR-207. Whether the agent can open a connection to any outside host itself, read from Docker's view of the container (egress_containment). contained is true exactly for the first three levels. allow_list is null unless the level is allow_list_enforced and railmon openshell's copy of the sandbox's policy was current (DR-266): null is an enforced allow-list whose contents were not read, not an empty one. ANSWERED and PARTIAL carry this object; PARTIAL is always level open. RailMon writes null for ABSENT, BLIND and FAILED."
+    },
+    "skills_inventory_value": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "reachability": {
+            "enum": [
+              "reached",
+              "auth_refused",
+              "unreachable",
+              "declares_none",
+              "not_probed_stdio"
+            ]
+          },
+          "tools_truncated": {
+            "const": true
+          },
+          "schema_omitted": {
+            "enum": [
+              "per_tool_budget",
+              "bundle_budget",
+              "unrepresentable"
+            ]
+          }
+        }
+      },
+      "$comment": "DR-264, DR-293. The skills the agent is configured with (skills_inventory): an MCP config's entries (source_type mcp_config) and a skills file's (skills_config). An MCP entry names its server and is a tool the server declared (entry tool) or a server whose tools were not listed (entry server). reachability is how the server answered RailMon's probe: a tool is reached; a server entry is auth_refused (HTTP 401 or 403), unreachable (no answer, an error status or a body that is not MCP), declares_none (reached, no tools) or not_probed_stdio (a command server, never started). A tool whose server's tools/list was cut at RailMon's page or tool bound carries tools_truncated true. A tool whose inputSchema was left out carries schema_omitted: past the per-tool budget, past the bundle's budget for all schemas, or not representable (too deep, or not a JSON object). PARTIAL when some server was unreachable or refused, or a list was truncated. This def closes those three fields' values (from rule pack 15); the rest of an item is described in tools/scan/README.md and not constrained here."
     },
     "non_runtime_source": {
       "allOf": [
