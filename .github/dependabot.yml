@@ -1,0 +1,30 @@
+# Weekly dependency updates (DR-298). Minor and patch bumps are grouped per
+# ecosystem so each repo gets at most one PR per ecosystem a week; majors and
+# security updates come as their own PRs. Every PR still goes through CI and
+# rail-review like any other.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      pip:
+        update-types: ["minor", "patch"]
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      docker:
+        update-types: ["minor", "patch"]
