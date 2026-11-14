@@ -514,13 +514,14 @@ function isWindowed(change) {
 // (raildash.asp._comparable_file_access), so a real change isn't buried
 // under the noise that comparison ignores. A name a run mints afresh reads
 // as `*` (raildash.asp.generated_name_template): a run of uuids, an ISO date
-// (DR-299) or a SQLite temp file's random part in a file name, and a mkdtemp directory's random
+// (DR-299), a SQLite temp file's random part or an O_TMPFILE's inode number (DR-304) in a file name, and a mkdtemp directory's random
 // suffix below a temp or cache directory. And when the baseline's list says reads were left out at
 // RailMon's cap, a read it doesn't list that sorts after its last listed
 // read is left out: whether the baseline saw it is unknown.
 const UUID_RUN = /(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})+/g;
 const SQLITE_TEMP = /^(etilqs_)[A-Za-z0-9]{1,16}$/;
 const ISO_DATE = /(?<![0-9])(?:19|20)[0-9]{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])(?![0-9])/g;
+const TMPFILE = /^#[0-9]+ \(deleted\)$/;  // DR-304: an O_TMPFILE, `#<inode> (deleted)`
 const MKDTEMP = /^([^/]*[._-])([A-Za-z0-9]{6})$/;
 const MKDTEMP_ROOTS = ["/tmp/", "/var/tmp/", "/dev/shm/"];
 const READS_LEFT_OUT = "more distinct files than the cap (reads are left out first)";
@@ -559,7 +560,7 @@ function generatedNameTemplate(path, families = new Set()) {
   if (path.includes("*")) return path;
   const cut = path.lastIndexOf("/") + 1;
   const name = path.slice(cut).replace(UUID_RUN, "*").replace(SQLITE_TEMP, "$1*")
-    .replace(ISO_DATE, "*").replace(/\*{2,}/g, "*");
+    .replace(TMPFILE, "#* (deleted)").replace(ISO_DATE, "*").replace(/\*{2,}/g, "*");
   const inTemp = MKDTEMP_ROOTS.some((root) => path.startsWith(root));
   const parts = cut ? path.slice(0, cut - 1).split("/") : [];
   const directory = cut ? parts.map((part, index) =>
