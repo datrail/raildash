@@ -8,11 +8,15 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
+## [v0.2.0-rc.18] - 2026-11-16
+
 ### Changed
 
+- A file the kernel names `/var/tmp/#<inode> (deleted)` (an O_TMPFILE, which OpenClaw on Node 26 writes) folds to `#* (deleted)`, so an unchanged agent no longer reads as writing new files ([#134](https://github.com/datrail/raildash/pull/134)).
 - An ISO date in a file name folds to `*` like a uuid, so a daily log rolling over at midnight (OpenClaw's `openclaw-<date>.log`) is not drift; a date in a directory name still counts, and the guardrail's saved-file entries fold the same way ([#129](https://github.com/datrail/raildash/pull/129)).
-- Re-vendors RailMon's `asp_normalize` with `unreached_server` (railmon#138), which Rail Center's alignment uses to skip an unreached MCP server's placeholder. RailDash's own drift is unchanged: an outage still shows as `skills_inventory` moving to `PARTIAL`.
+- Re-vendors RailMon's `asp_normalize` with `unreached_server` (railmon#138), which Rail Center's alignment uses to skip an unreached MCP server's placeholder. RailDash's own drift is unchanged: an outage still shows as `skills_inventory` moving to `PARTIAL` ([#135](https://github.com/datrail/raildash/pull/135)).
 - Vendors RailMon's rule-pack-15 v1 schema, which closes an MCP skill's `reachability`, `schema_omitted` and `tools_truncated`. A baseline locked on pack 14 reads `CONTRACT_MISMATCH` until it is re-locked ([#131](https://github.com/datrail/raildash/pull/131)).
+- Dependency updates: fastapi 0.162, uvicorn 0.54, jsonschema and the rest of the pip group ([#132](https://github.com/datrail/raildash/pull/132)).
 
 ## [v0.2.0-rc.17] - 2026-11-10
 
@@ -198,6 +202,7 @@ into that one commit.
 
 - `INSTALL.md`, the canonical install guide, linked from the README ([#16](https://github.com/datrail/raildash/pull/16)).
 
+[v0.2.0-rc.18]: https://github.com/datrail/raildash/compare/v0.2.0-rc.17...v0.2.0-rc.18
 [v0.2.0-rc.17]: https://github.com/datrail/raildash/compare/v0.2.0-rc.16...v0.2.0-rc.17
 [v0.2.0-rc.16]: https://github.com/datrail/raildash/compare/v0.2.0-rc.15...v0.2.0-rc.16
 [v0.2.0-rc.15]: https://github.com/datrail/raildash/compare/v0.2.0-rc.14...v0.2.0-rc.15
