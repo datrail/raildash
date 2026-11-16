@@ -1020,6 +1020,8 @@ def test_allow_this_takes_a_sqlite_temp_file_and_a_mkdtemp_directory_as_globs():
         ("/root/abc-0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d", {"path": "/root/abc-*"}),
         # A daily log (DR-299): tomorrow's file is the same entry.
         ("/tmp/openclaw/openclaw-2026-11-13.log", {"path": "/tmp/openclaw/openclaw-*.log"}),
+        # An O_TMPFILE (DR-304): the next run's inode is the same entry.
+        ("/var/tmp/#8083505 (deleted)", {"path": "/var/tmp/#* (deleted)", "kinds": ["(none)"]}),
     ):
         row = {"rule": "saved_files", "item": path, "detail": {}}
         assert g.with_item_allowed(rules, row)["saved_files"]["allowed"][-1] == entry, path
@@ -1027,9 +1029,13 @@ def test_allow_this_takes_a_sqlite_temp_file_and_a_mkdtemp_directory_as_globs():
             assert g.saved_file_allowed(path.replace("jRu2h7", "QOnshQ")
                                         .replace("155d7cc864b75a27", "e41fab04de771bb7")
                                         .replace("0b1c2d3e", "11111111")
-                                        .replace("2026-11-13", "2026-11-14"), [entry]), path
+                                        .replace("2026-11-13", "2026-11-14")
+                                        .replace("#8083505", "#8083999"), [entry]), path
     assert not g.saved_file_allowed("/var/tmp/etilqs_secrets.tar.gz",
                                     [{"path": "/var/tmp/etilqs_*", "kinds": ["(none)"]}])
+    tmpfile = [{"path": "/var/tmp/#* (deleted)", "kinds": ["(none)"]}]
+    for path in ("/var/tmp/#1 (deleted).tar.gz", "/var/tmp/sub/#1 (deleted)", "/home/#1 (deleted)"):
+        assert not g.saved_file_allowed(path, tmpfile), path
     allowed = [{"path": f"{cache}/openclaw-sqlite-readonly-v2-*/owner.sqlite"}]
     for path in (f"{cache}/openclaw-sqlite-readonly-v2-QOnshQ/other.sqlite",
                  f"{cache}/openclaw-sqlite-readonly-v2-QOnshQ/sub/owner.sqlite",

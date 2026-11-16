@@ -505,7 +505,8 @@ def saved_file_entry(path: str) -> dict[str, Any]:
     """The entry a proposal or **Allow this** makes for one written path:
     the path exactly, or, when it holds a name a run mints afresh, the path
     with that part as `*` (`generated_name_template`: a uuid, an ISO date
-    (DR-299) or a SQLite temp file's random part in its file name, DR-229,
+    (DR-299), a SQLite temp file's random part or an O_TMPFILE's inode
+    number (DR-304) in its file name, DR-229,
     or a mkdtemp directory's suffix). An agent that writes `sessions.json.1.<uuid>.tmp`
     on every turn mints a new path each time, so an exact entry would be
     violated again on the next turn. A file name with fewer than three
@@ -514,11 +515,15 @@ def saved_file_entry(path: str) -> dict[str, Any]:
     or every hidden file in that directory. A folded directory already
     keeps three before its `*`. A SQLite temp file's glob, `etilqs_*`,
     is for files without an extension, as SQLite names them, so it doesn't
-    also allow `etilqs_secrets.tar.gz`."""
+    also allow `etilqs_secrets.tar.gz`. An O_TMPFILE's, `#* (deleted)`, is
+    the kernel's own shape for a file with no name (DR-304), held to no
+    extension the same way; it keeps its directory."""
     template = generated_name_template(path)
     if template is None:
         return {"path": path, "literal": True}
     name = template.rpartition("/")[2]
+    if name == "#* (deleted)":
+        return {"path": template, "kinds": ["(none)"]}
     if "*" in name and sum(character.isalnum() for character in name.partition("*")[0]) < 3:
         return {"path": path, "literal": True}
     if name == "etilqs_*":
