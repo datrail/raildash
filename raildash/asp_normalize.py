@@ -17,6 +17,12 @@ scope's attributes merged into each. In every map:
 Everything else about an attribute is kept as the bundle gave it, and a member the bundle left
 out stays out. The bundle itself is not changed.
 
+**What a comparison leaves out.** Since rule pack 15 an MCP server RailMon could not reach is one
+`entry: server` item in a `PARTIAL` `skills_inventory`. The map keeps it, since it names the server
+whose tools are unknown, but it is not a skill the agent has: a comparison that counts items asks
+`unreached_server` and skips it, or an outage reads as a new item (DR-303). That is not a rule
+`normalized` applies, so it does not move `RULES_VERSION`.
+
 **What the caller keeps.** Which shapes its rules can use (`shapes`), what it builds around the
 maps (a typed ASP, a version of its own, an identity for an unkeyed agent), and what it leaves
 out of a profile. Rail Center passes its `SHAPES`. A caller that passes none marks nothing: the
@@ -72,6 +78,7 @@ __all__ = [
     "readable",
     "steps",
     "unliftable",
+    "unreached_server",
     "unusable",
 ]
 
@@ -88,6 +95,12 @@ READ = frozenset({"ANSWERED", "PARTIAL"})
 Shapes = Mapping[str, Callable[[object], bool]]
 
 _NO_SHAPES: Shapes = MappingProxyType({})
+
+#: How RailMon says it could not list an MCP server's tools (`reachability`, rule pack 15, DR-293):
+#: no answer, or 401/403. RailMon's `MCP_UNREACHED`, written out so this module stays standalone.
+#: A stdio server RailMon does not probe (`not_probed_stdio`) or one that answered with no tools
+#: (`declares_none`) is the same item on every scan, so a comparison counts it.
+UNREACHED = frozenset({"unreachable", "auth_refused"})
 
 
 class ScopeConflict(ValueError):
@@ -131,6 +144,24 @@ def normalized_attribute(name: str, attribute: Mapping[str, Any]) -> dict[str, A
     if isinstance(window, Mapping):
         out["window"] = {key: keys if keys is None else sorted(keys) for key, keys in window.items()}
     return out
+
+
+def unreached_server(name: str, item: Any) -> bool:
+    """Whether `item` of the attribute `name` stands for an MCP server RailMon could not reach, which
+    a comparison of items leaves out.
+
+    Such a server is one `entry: server` item of `skills_inventory`, with its `reachability`, in a
+    `PARTIAL` value whose note names it (rule pack 15). Counted, it is an item a baseline sealed
+    while the server answered never held, so a reader taking `PARTIAL` as a lower bound would call
+    an outage the agent widening its tools (DR-303). Left out, the server's tools are only unknown,
+    which is what `PARTIAL` says. The item stays in the map for a reader that names such servers.
+    """
+    return (
+        name == "skills_inventory"
+        and isinstance(item, Mapping)
+        and item.get("entry") == "server"
+        and item.get("reachability") in UNREACHED
+    )
 
 
 def unusable(attribute: Mapping[str, Any]) -> bool:
