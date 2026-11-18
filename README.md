@@ -286,6 +286,15 @@ it and cannot forge a write even though a browser will happily send
 loopback requests. This is the same pattern Jupyter's notebook server uses,
 and it is why the token is a CSRF defense as well as an access control.
 
+A page on another site could still make itself same-origin with RailDash by
+pointing its own name at `127.0.0.1` (DNS rebinding), so RailDash also refuses,
+with 400, any request whose `Host` is a name other than `localhost` (or a name
+under it) or the compose service name `raildash`. An IP address is always
+accepted, since rebinding needs a name. If you reach RailDash by another name
+(a reverse proxy, `/etc/hosts`, a LAN name), list it in `RAILDASH_ALLOWED_HOSTS`
+(comma-separated, e.g. `RAILDASH_ALLOWED_HOSTS=dash.lan`; `*` turns the check
+off).
+
 `serve` still binds `127.0.0.1` by default; that has not changed. Passing
 `--host 0.0.0.0` (or any non-loopback address) is a deliberate, documented
 opt-in to reach RailDash from another host, and the token requirement still
