@@ -16,6 +16,7 @@ server used, so an existing RailMon deployment does not need reconfiguring.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -257,6 +258,80 @@ def require_local_token(
     """
     if not has_local_token(x_raildash_token):
         raise HTTPException(403, "missing or invalid X-RailDash-Token")
+
+
+# DR-317: the token above is only as private as the page that carries it. A
+# page on another site can point its own name at 127.0.0.1 (DNS rebinding);
+# the browser then treats RailDash as that site's origin, so the page can load
+# `/`, read the token and call every gated route. The browser still sends the
+# page's name in `Host`, so a request is refused unless `Host` is an IP
+# address (rebinding needs a name), `localhost` or a name under it, the
+# compose service name `raildash`, or a name the operator lists in
+# RAILDASH_ALLOWED_HOSTS (comma-separated; `*` accepts any). Jupyter checks
+# `Host` for the same reason. A request without `Host` comes from no browser
+# and is let through.
+ALLOWED_HOSTS_ENV_VAR = "RAILDASH_ALLOWED_HOSTS"
+DEFAULT_HOST_NAMES = frozenset({"localhost", "raildash"})
+
+
+def _host_name(value: str) -> str:
+    """The name in a `Host` value, without its port, lowercased."""
+    value = value.strip().lower()
+    if value.startswith("["):
+        return value[1:].split("]", 1)[0]
+    if value.count(":") == 1:
+        value = value.split(":", 1)[0]
+    return value.rstrip(".")
+
+
+def host_allowed(value: str | None, environ: Any = os.environ) -> bool:
+    if value is None:
+        return True
+    name = _host_name(value)
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name.split("%", 1)[0])
+        return True
+    except ValueError:
+        pass
+    if name in DEFAULT_HOST_NAMES or name.endswith(".localhost"):
+        return True
+    extra = {
+        _host_name(item)
+        for item in (environ.get(ALLOWED_HOSTS_ENV_VAR) or "").split(",")
+        if item.strip()
+    }
+    return "*" in extra or name in extra
+
+
+class HostCheck:
+    """Refuses, with 400, an HTTP request whose `Host` names another site."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if scope["type"] in ("http", "websocket"):
+            hosts = [v for k, v in scope.get("headers") or () if k == b"host"]
+            if len(hosts) > 1 or not host_allowed(
+                hosts[0].decode("latin-1") if hosts else None
+            ):
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                response = Response(
+                    f"Host not allowed; add it to {ALLOWED_HOSTS_ENV_VAR} if this "
+                    "is how you reach RailDash\n",
+                    status_code=400,
+                    media_type="text/plain",
+                )
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(HostCheck)
 
 
 @contextmanager

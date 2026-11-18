@@ -8,6 +8,10 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
+### Security
+
+- RailDash refuses, with 400, a request whose `Host` is a name other than `localhost`, `raildash` or one listed in the new `RAILDASH_ALLOWED_HOSTS`, so a web page that rebinds its own name to `127.0.0.1` can no longer read the write token from the dashboard page. IP addresses are always accepted. Reaching RailDash by another name now needs that name in `RAILDASH_ALLOWED_HOSTS`.
+
 ## [v0.2.0-rc.18] - 2026-11-16
 
 ### Changed

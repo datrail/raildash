@@ -125,3 +125,10 @@ a published port can reach it, but the documented `docker run` maps that port
 to host loopback only. With no authentication, anything that can reach the port
 can read every captured interaction; keep it on loopback or behind something
 that authenticates until the gaps above are closed.
+
+A web page in a browser on the same machine is kept out of the write token by
+two things: the token is only in the page RailDash serves, and RailDash refuses
+a request whose `Host` names another site, so a page that rebinds its own name
+to `127.0.0.1` gets a 400 rather than that page. Names you reach RailDash by
+are added with `RAILDASH_ALLOWED_HOSTS`; setting it to `*` removes this
+protection.
