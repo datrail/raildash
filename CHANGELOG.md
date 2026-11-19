@@ -8,9 +8,16 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
+## [v0.2.0-rc.19] - 2026-11-18
+
 ### Security
 
 - RailDash refuses, with 400, a request whose `Host` is a name other than `localhost`, `raildash` or one listed in the new `RAILDASH_ALLOWED_HOSTS`, so a web page that rebinds its own name to `127.0.0.1` can no longer read the write token from the dashboard page. IP addresses are always accepted. Reaching RailDash by another name now needs that name in `RAILDASH_ALLOWED_HOSTS`.
+
+### Changed
+
+- The image runs Python 3.15 (was 3.13); the full stack passed with RailDash built on it ([#137](https://github.com/datrail/raildash/pull/137)).
+- Dependency updates: fastapi 0.162.5 and playwright 1.65.2 ([#138](https://github.com/datrail/raildash/pull/138)).
 
 ## [v0.2.0-rc.18] - 2026-11-16
 
