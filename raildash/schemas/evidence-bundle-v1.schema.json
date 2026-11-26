@@ -176,6 +176,58 @@
               }
             }
           ]
+        },
+        "declared_ports": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/attribute"
+            },
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ANSWERED",
+                      "PARTIAL"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "$ref": "#/$defs/declared_ports_value"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "services_exposing_agent": {
+          "allOf": [
+            {
+              "$ref": "#/$defs/attribute"
+            },
+            {
+              "if": {
+                "properties": {
+                  "status": {
+                    "enum": [
+                      "ANSWERED",
+                      "PARTIAL"
+                    ]
+                  }
+                }
+              },
+              "then": {
+                "properties": {
+                  "value": {
+                    "$ref": "#/$defs/services_exposing_agent_value"
+                  }
+                }
+              }
+            }
+          ]
         }
       },
       "additionalProperties": {
@@ -362,77 +414,240 @@
         "enforcer": {
           "enum": [
             "openshell",
+            "kubernetes_network_policy",
             null
           ]
         },
         "observations": {
+          "$comment": "Docker's observations (network_mode present), else a Kubernetes pod's (RC-552).",
           "type": "object",
-          "required": [
-            "network_mode",
-            "networks",
-            "openshell_labels",
-            "privileged",
-            "runtime_socket_mounts"
-          ],
-          "additionalProperties": false,
-          "properties": {
-            "network_mode": {
-              "$comment": "a string, or null for a host process",
-              "type": [
-                "string",
-                "null"
-              ],
-              "maxLength": 256
-            },
-            "networks": {
-              "type": "array",
-              "maxItems": 64,
-              "items": {
+          "if": {
+            "required": [
+              "network_mode"
+            ]
+          },
+          "then": {
+            "type": "object",
+            "required": [
+              "network_mode",
+              "networks",
+              "openshell_labels",
+              "privileged",
+              "runtime_socket_mounts"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "network_mode": {
+                "$comment": "a string, or null for a host process",
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 256
+              },
+              "networks": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "name",
+                    "internal",
+                    "gateway_peers"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 256
+                    },
+                    "internal": {
+                      "enum": [
+                        true,
+                        false,
+                        null
+                      ]
+                    },
+                    "gateway_peers": {
+                      "type": "array",
+                      "maxItems": 64,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      }
+                    }
+                  }
+                }
+              },
+              "openshell_labels": {
+                "type": "boolean"
+              },
+              "privileged": {
+                "type": "boolean"
+              },
+              "runtime_socket_mounts": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 1024
+                }
+              }
+            }
+          },
+          "else": {
+            "$comment": "RC-552: a Kubernetes pod's (gke-scan). The NetworkPolicies that select the pod and restrict its egress, their egress rules as written (to and ports null for any), the rules that open some ports to any address (a rule with no to, or an ipBlock of 0.0.0.0/0 or ::/0, an except list notwithstanding), the policies whose podSelector couldn't be evaluated, and whether the cluster enforces policies: anetd (GKE Dataplane V2) or calico-node in kube-system, enforced null when that couldn't be checked.",
+            "type": "object",
+            "required": [
+              "host_network",
+              "enforcement",
+              "egress_policies",
+              "unevaluable_policies",
+              "allowed_egress",
+              "open_to_any_address"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "host_network": {
+                "type": "boolean"
+              },
+              "enforcement": {
                 "type": "object",
                 "required": [
-                  "name",
-                  "internal",
-                  "gateway_peers"
+                  "enforced",
+                  "by",
+                  "detail"
                 ],
                 "additionalProperties": false,
                 "properties": {
-                  "name": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256
-                  },
-                  "internal": {
+                  "enforced": {
                     "enum": [
                       true,
                       false,
                       null
                     ]
                   },
-                  "gateway_peers": {
-                    "type": "array",
-                    "maxItems": 64,
-                    "items": {
+                  "by": {
+                    "enum": [
+                      "anetd",
+                      "calico-node",
+                      null
+                    ]
+                  },
+                  "detail": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  }
+                }
+              },
+              "egress_policies": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                }
+              },
+              "unevaluable_policies": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 253
+                }
+              },
+              "allowed_egress": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "policy",
+                    "to",
+                    "ports"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "policy": {
                       "type": "string",
                       "minLength": 1,
-                      "maxLength": 256
+                      "maxLength": 253
+                    },
+                    "to": {
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "maxItems": 64,
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "ports": {
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "maxItems": 64,
+                      "items": {
+                        "type": "object"
+                      }
                     }
                   }
                 }
-              }
-            },
-            "openshell_labels": {
-              "type": "boolean"
-            },
-            "privileged": {
-              "type": "boolean"
-            },
-            "runtime_socket_mounts": {
-              "type": "array",
-              "maxItems": 64,
-              "items": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 1024
+              },
+              "open_to_any_address": {
+                "type": "array",
+                "maxItems": 64,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "policy",
+                    "ports",
+                    "cidr",
+                    "except"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "policy": {
+                      "type": "string",
+                      "minLength": 1,
+                      "maxLength": 253
+                    },
+                    "ports": {
+                      "type": [
+                        "array",
+                        "null"
+                      ],
+                      "maxItems": 64,
+                      "items": {
+                        "type": "object"
+                      }
+                    },
+                    "cidr": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "maxLength": 64
+                    },
+                    "except": {
+                      "type": "array",
+                      "maxItems": 64,
+                      "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 64
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -789,6 +1004,133 @@
           }
         }
       ]
+    },
+    "declared_ports_value": {
+      "$comment": "RC-552: a Kubernetes agent container's declared ports (gke-scan), sorted by port and protocol. Declared, not observed listening.",
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": [
+          "port",
+          "protocol"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "protocol": {
+            "enum": [
+              "TCP",
+              "UDP",
+              "SCTP"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 15
+          },
+          "host_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        }
+      }
+    },
+    "services_exposing_agent_value": {
+      "$comment": "RC-552: the Services whose selector matches the agent's pods (gke-scan), sorted by name. target_port is a number or a container port's name.",
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "type",
+          "ports"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          },
+          "type": {
+            "enum": [
+              "ClusterIP",
+              "NodePort",
+              "LoadBalancer",
+              "ExternalName"
+            ]
+          },
+          "ports": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "required": [
+                "port",
+                "target_port",
+                "protocol"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "port": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535
+                },
+                "target_port": {
+                  "type": [
+                    "integer",
+                    "string"
+                  ]
+                },
+                "protocol": {
+                  "enum": [
+                    "TCP",
+                    "UDP",
+                    "SCTP"
+                  ]
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 63
+                },
+                "node_port": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 65535
+                }
+              }
+            }
+          },
+          "load_balancer_ingress": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253
+            }
+          },
+          "external_ips": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            }
+          }
+        }
+      }
     }
   }
 }
