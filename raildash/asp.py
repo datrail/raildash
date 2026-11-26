@@ -126,6 +126,13 @@ ATTRIBUTE_FIELD_ORDER = (
     "attestation_ref",
 )
 SOURCE_FIELD_ORDER = ("attempted", "reached", "reason", "window_seconds")
+# How long a runtime source watched is not something the agent did (DR-296):
+# RailMon's window grows on every scan while the agent runs, and a list
+# marked with a `window` already reads an item a shorter window missed as
+# unseen, not removed. So a source whose window length alone changed is no
+# change. The bundle keeps it, so the full objects the drift-explained
+# route serves for a source that changed otherwise still carry it.
+SOURCE_IGNORED_FIELDS = frozenset({"window_seconds"})
 ATTESTATION_FIELD_ORDER = (
     "root",
     "claim",
@@ -670,6 +677,7 @@ def _bundle_changes(
             current["inputs_attempted"],
             "SOURCE",
             SOURCE_FIELD_ORDER,
+            ignored_fields=SOURCE_IGNORED_FIELDS,
         )
     )
     changes.extend(_attestation_changes(baseline, current))
@@ -708,6 +716,7 @@ def _scope_changes(
             current["inputs_attempted"],
             "SOURCE",
             SOURCE_FIELD_ORDER,
+            ignored_fields=SOURCE_IGNORED_FIELDS,
         )
     )
     return [{**scope, **change} for change in changes]
@@ -1048,13 +1057,19 @@ def _window_value_drift(before: Any, after: Any, window: dict[str, Any]) -> bool
     )
 
 
+def _without(entry: Any, fields: set[str] | frozenset[str]) -> Any:
+    if not fields or not isinstance(entry, dict):
+        return entry
+    return {key: value for key, value in entry.items() if key not in fields}
+
+
 def _map_changes(
     baseline: dict[str, Any],
     current: dict[str, Any],
     prefix: str,
     field_order: tuple[str, ...],
     *,
-    ignored_fields: set[str] | None = None,
+    ignored_fields: set[str] | frozenset[str] | None = None,
 ) -> list[dict[str, Any]]:
     changes: list[dict[str, Any]] = []
     ignored_fields = ignored_fields or set()
@@ -1067,8 +1082,12 @@ def _map_changes(
     for name in sorted(baseline_names & current_names):
         before = baseline[name]
         after = current[name]
-        # By canonical JSON, not `==`, which reads `1` and `true` as one value.
-        if canonical(before) == canonical(after):
+        # By canonical JSON, not `==`, which reads `1` and `true` as one value,
+        # and without the ignored fields, so a difference in them alone is no
+        # change.
+        if canonical(_without(before, ignored_fields)) == canonical(
+            _without(after, ignored_fields)
+        ):
             continue
         fields = [
             field

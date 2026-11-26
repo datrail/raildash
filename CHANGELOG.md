@@ -8,6 +8,11 @@ Each PR adds its line under `## Unreleased`.
 
 ## Unreleased
 
+### Changed
+
+- A runtime source whose `window_seconds` alone changed is no longer drift (DR-296): it's how long RailMon watched, not something the agent did, and RailMon's window grows on every scan. A source that changed otherwise lists its other fields, and its full objects still carry the window.
+- The vendored `evidence-bundle-v1.schema.json` matches RailMon's again, with gke-scan's fields (datrail/railmon#167, RC-552). Every bundle RailDash accepted before still passes, except a v1 `declared_ports` or `services_exposing_agent` that doesn't have the shape RailMon publishes for it (only gke-scan emits either).
+
 ## [v0.2.0-rc.19] - 2026-11-18
 
 ### Security
