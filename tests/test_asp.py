@@ -420,6 +420,23 @@ def test_a_source_that_changed_lists_its_fields_but_not_the_window():
     ]
 
 
+def test_a_v2_window_that_appears_or_grows_is_not_drift():
+    # RailMon's rollout: the baseline has no window, a later scan has one.
+    baseline = _v2_bundle()
+    for scope in (baseline["sandbox"], baseline["agents"][0]):
+        scope["inputs_attempted"] = copy.deepcopy(scope["inputs_attempted"])
+        scope["inputs_attempted"]["runtime"].pop("window_seconds", None)
+    current = copy.deepcopy(baseline)
+    for seconds in (60, 86_400):
+        for scope in (current["sandbox"], current["agents"][0]):
+            scope["inputs_attempted"]["runtime"]["window_seconds"] = seconds
+        assert _window_drift(baseline, current) == []
+    current["agents"][0]["inputs_attempted"]["runtime"].update(reached=False, reason="NO_SOURCE_ACCESS")
+    assert _window_drift(baseline, current) == [
+        ("executor", "SOURCE_CHANGED", "runtime", ["reached", "reason"])
+    ]
+
+
 def test_attribute_and_attestation_add_remove_change_are_sorted():
     baseline = bundle()
     baseline["attestations"] = [
