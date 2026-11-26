@@ -393,15 +393,31 @@ def test_attribute_qualifiers_and_sources_produce_stable_redacted_changes():
             "name": "tool_names",
             "fields": ["value", "status", "reason", "authored_by", "method"],
         },
-        {
-            "type": "SOURCE_CHANGED",
-            "name": "runtime",
-            "fields": ["window_seconds"],
-        },
     ]
     serialized = json.dumps(result)
     assert "shell.run" not in serialized
     assert "s3.object.get" not in serialized
+
+
+def test_a_longer_window_alone_is_not_drift():
+    # DR-296: RailMon's runtime window grows on every scan while the agent
+    # runs; how long it watched is not something the agent did.
+    current = bundle()
+    current["inputs_attempted"]["runtime"]["window_seconds"] = 86_400
+    result = compare_alignment(alignment(), BASELINE_RAW, raw(current))
+    assert result["has_drift"] is False
+    assert result["changes"] == []
+
+
+def test_a_source_that_changed_lists_its_fields_but_not_the_window():
+    current = bundle()
+    current["inputs_attempted"]["runtime"].update(
+        reached=False, reason="NO_SOURCE_ACCESS", window_seconds=600
+    )
+    result = compare_alignment(alignment(), BASELINE_RAW, raw(current))
+    assert result["changes"] == [
+        {"type": "SOURCE_CHANGED", "name": "runtime", "fields": ["reached", "reason"]}
+    ]
 
 
 def test_attribute_and_attestation_add_remove_change_are_sorted():
